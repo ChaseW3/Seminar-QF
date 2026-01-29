@@ -236,3 +236,5 @@ def run_merton_estimation(df, interest_rates_df=None):
         monthly_returns_df = monthly_app[["gvkey", "month_year", "asset_return_monthly", "asset_value", "asset_volatility"]].dropna()
         
     return df_merged, monthly_returns_df
+
+    print("Hello")
