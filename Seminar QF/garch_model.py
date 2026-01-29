@@ -7,8 +7,10 @@ from arch import arch_model
 def run_garch_estimation(monthly_returns_df):
     """
     Estimates GARCH(1,1) on the provided monthly asset returns dataframe.
+    Extracts omega, alpha, beta parameters and conditional volatility (monthly, not annualized).
     Returns:
-        pd.DataFrame: A copy of the input dataframe with a new 'garch_volatility' column.
+        pd.DataFrame: A copy of the input dataframe with 'garch_volatility', 'garch_omega', 
+                      'garch_alpha', 'garch_beta' columns (volatility is monthly).
     """
     print("Estimating GARCH(1,1) on COMPUTED MONTHLY Asset Returns...")
     
@@ -18,6 +20,9 @@ def run_garch_estimation(monthly_returns_df):
         
     df_out = monthly_returns_df.copy()
     df_out["garch_volatility"] = np.nan
+    df_out["garch_omega"] = np.nan
+    df_out["garch_alpha"] = np.nan
+    df_out["garch_beta"] = np.nan
     
     firms = df_out["gvkey"].unique()
     print(f"Processing GARCH for {len(firms)} firms (Monthly Data)...")
@@ -36,20 +41,23 @@ def run_garch_estimation(monthly_returns_df):
         try:
             am = arch_model(returns, vol='Garch', p=1, q=1, dist='Normal')
             res = am.fit(disp='off', show_warning=False)
-            print(res.optimization_result)
+            
+            # Extract GARCH(1,1) parameters
+            omega = res.params['omega']
+            alpha = res.params['alpha[1]']
+            beta = res.params['beta[1]']
             
             cond_vol = res.conditional_volatility
             
-            # Re-scale: This is monthly volatility
+            # Re-scale: This is monthly volatility (keep as monthly, don't annualize)
             monthly_garch_vol = (cond_vol / 100)
             
-            # Annualize: * sqrt(12)
-            annualized_garch_vol = monthly_garch_vol * np.sqrt(12)
-            
-            df_out.loc[firm_ts.index, "garch_volatility"] = annualized_garch_vol
+            df_out.loc[firm_ts.index, "garch_volatility"] = monthly_garch_vol
+            df_out.loc[firm_ts.index, "garch_omega"] = omega
+            df_out.loc[firm_ts.index, "garch_alpha"] = alpha
+            df_out.loc[firm_ts.index, "garch_beta"] = beta
             
         except Exception as e:
-            # print(f"GARCH failed for {gvkey}: {e}")
             continue
             
         if (i + 1) % 10 == 0:

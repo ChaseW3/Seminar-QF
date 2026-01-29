@@ -237,4 +237,3 @@ def run_merton_estimation(df, interest_rates_df=None):
         
     return df_merged, monthly_returns_df
 
-    print("Hello")

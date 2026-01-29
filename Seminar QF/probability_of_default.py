@@ -202,3 +202,38 @@ def run_pd_pipeline(data_garch, data_regime, data_msgarch):
     else:
         print("No results generated.")
         return pd.DataFrame()
+
+def calculate_merton_pd_normal(monthly_returns_file):
+    """
+    Calculate Merton PD using simple normal returns volatility (no GARCH/regime switching).
+    Benchmark model for comparison.
+    """
+    print("\nCalculating Merton PD with Normal Returns (Benchmark)...")
+    
+    # Load data
+    df = pd.read_csv(monthly_returns_file)
+    liabilities_df, rates_df = load_auxiliary_data()
+    
+    # Merge with liabilities and rates
+    df = df.merge(liabilities_df, on=['gvkey', 'month_year'], how='left')
+    df = df.merge(rates_df, on='month_year', how='left')
+    
+    # Use asset_volatility (normal returns volatility)
+    df['model_volatility'] = df['asset_volatility']
+    
+    # Calculate PD
+    time_horizon = 1.0
+    df = df.dropna(subset=['liabilities_total', 'risk_free_rate', 'model_volatility'])
+    
+    df['log_asset_debt_ratio'] = np.log(df['asset_value'] / df['liabilities_total'])
+    vol = df['model_volatility']
+    rf = df['risk_free_rate']
+    
+    numerator = (df['log_asset_debt_ratio'] + (rf - 0.5 * vol**2) * time_horizon)
+    denominator = vol * np.sqrt(time_horizon)
+    df['d2'] = numerator / denominator
+    df['merton_pd'] = norm.cdf(-df['d2'])
+    df['merton_pd'] = df['merton_pd'].clip(0, 1)
+    
+    # Return key columns
+    return df[['gvkey', 'month_year', 'asset_value', 'liabilities_total', 'merton_pd', 'd2', 'model_volatility']]

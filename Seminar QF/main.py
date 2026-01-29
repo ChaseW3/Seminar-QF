@@ -63,6 +63,38 @@ pd_results.to_csv("monthly_pd_results.csv", index=False)
 print("Saved 'monthly_pd_results.csv'")
 
 #%%
+# 6b. Calculate Probability of Default (Merton Model with Normal Returns - Benchmark)
+from probability_of_default import calculate_merton_pd_normal
+
+merton_normal_pd = calculate_merton_pd_normal('monthly_asset_returns.csv')
+merton_normal_pd.to_csv("monthly_pd_results_merton_normal.csv", index=False)
+print("Saved 'monthly_pd_results_merton_normal.csv'")
+
+#%%
+# 6c. Monte Carlo GARCH Volatility Forecast (1-year, single firm FIRST)
+from monte_carlo_garch import monte_carlo_garch_1year
+
+# Get first firm in dataset for testing
+garch_data = pd.read_csv('monthly_asset_returns_with_garch.csv')
+first_gvkey = garch_data[garch_data['garch_volatility'].notna()]['gvkey'].iloc[0]
+
+print(f"Testing with firm: {first_gvkey}")
+
+mc_results = monte_carlo_garch_1year('monthly_asset_returns_with_garch.csv', 
+                                      gvkey_selected=first_gvkey,
+                                      num_simulations=1000,
+                                      num_months=12)
+
+mc_results.to_csv("monte_carlo_garch_results.csv", index=False)
+print("Saved 'monte_carlo_garch_results.csv'")
+
+# To run for ALL firms later, just change to:
+# mc_results = monte_carlo_garch_1year('monthly_asset_returns_with_garch.csv', 
+#                                       gvkey_selected=None,
+#                                       num_simulations=1000,
+#                                       num_months=12)
+
+#%%
 # 7. Generate Summary and Plot
 import importlib
 import data_processing
