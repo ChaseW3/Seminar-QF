@@ -151,14 +151,15 @@ def run_merton_estimation(df, interest_rates_df=None):
             if len(ret_E) < 10:
                 continue
                 
-            sigma_E_init = np.std(ret_E) * np.sqrt(252)  # ← ANNUALIZED
-            if sigma_E_init < 1e-6: 
-                sigma_E_init = 0.4
+            # Compute DAILY volatility (not annualized yet)
+            sigma_E_daily = np.std(ret_E)  # ← NO √252 scaling
+            if sigma_E_daily < 1e-6: 
+                sigma_E_daily = 0.4 / np.sqrt(252)  # Daily equivalent
             
-            sigma_A = sigma_E_init  # ← Keep this ANNUALIZED for output
+            sigma_A = sigma_E_daily  # ← Keep as DAILY for N-R loop
             
-            # Params (r was already determined from interest_rates_df above)
-            T_val = T_HORIZON
+            # Params
+            T_val = 252  # ← Use daily time horizon (252 trading days = 1 year)
             tol = 1e-4
             max_iter_algo = 100
             
@@ -191,14 +192,14 @@ def run_merton_estimation(df, interest_rates_df=None):
 
                 V_A_vec = np.maximum(V_A_vec, 1e-4)
                 
-                # Outer Update: sigma_A
+                # Outer Update: sigma_A (still DAILY)
                 with np.errstate(divide='ignore', invalid='ignore'):
-                     ret_A = np.diff(np.log(V_A_vec))
+                    ret_A = np.diff(np.log(V_A_vec))
                 ret_A = ret_A[np.isfinite(ret_A)]
                 
                 if len(ret_A) < 10: break
 
-                sigma_A_new = np.std(ret_A) * np.sqrt(252)
+                sigma_A_new = np.std(ret_A)  # ← NO √252 scaling here
                 
                 if abs(sigma_A_new - sigma_A_old) < tol:
                     sigma_A = sigma_A_new
@@ -208,11 +209,14 @@ def run_merton_estimation(df, interest_rates_df=None):
             # Save Month-End Result
             V_A_final = V_A_vec[-1]
             
+            # NOW convert to annualized for storage
+            sigma_A_annualized = sigma_A * np.sqrt(252)
+            
             results_list.append({
                 "gvkey": gvkey,
                 "date": date_t,
                 "asset_value": V_A_final,
-                "asset_volatility": sigma_A,
+                "asset_volatility": sigma_A_annualized,  # ← Store annualized
             })
 
         if (i + 1) % 10 == 0:
@@ -232,24 +236,14 @@ def run_merton_estimation(df, interest_rates_df=None):
             lambda x: np.log(x / x.shift(1))
         )
         
-        # Keep asset_volatility as ANNUALIZED for reference
-        # But store both for clarity
-        monthly_app["asset_volatility_annualized"] = monthly_app["asset_volatility"]
-        monthly_app["asset_volatility_monthly"] = monthly_app["asset_volatility"] / np.sqrt(12)
+        # CRITICAL: Convert annualized volatility to MONTHLY for scale matching
+        monthly_app["asset_volatility"] = monthly_app["asset_volatility"] / np.sqrt(12)
         
         monthly_app["month_year"] = monthly_app["date"].dt.to_period("M")
         
-        # For GARCH: Use MONTHLY volatility as reference (for diagnostic purposes only)
-        # The actual GARCH will estimate its own volatility
         monthly_returns_df = monthly_app[[
-            "gvkey", "month_year", "asset_return_monthly", "asset_value", 
-            "asset_volatility_monthly", "asset_volatility_annualized"
+            "gvkey", "month_year", "asset_return_monthly", "asset_value", "asset_volatility"
         ]].dropna()
-        
-        # Rename for clarity in output
-        monthly_returns_df = monthly_returns_df.rename(columns={
-            "asset_volatility_annualized": "asset_volatility"
-        })
-    
+
     return df_merged, monthly_returns_df
 
