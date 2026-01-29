@@ -151,11 +151,11 @@ def run_merton_estimation(df, interest_rates_df=None):
             if len(ret_E) < 10:
                 continue
                 
-            sigma_E_init = np.std(ret_E) * np.sqrt(252)
+            sigma_E_init = np.std(ret_E) * np.sqrt(252)  # ← ANNUALIZED
             if sigma_E_init < 1e-6: 
                 sigma_E_init = 0.4
             
-            sigma_A = sigma_E_init
+            sigma_A = sigma_E_init  # ← Keep this ANNUALIZED for output
             
             # Params (r was already determined from interest_rates_df above)
             T_val = T_HORIZON
@@ -231,9 +231,25 @@ def run_merton_estimation(df, interest_rates_df=None):
         monthly_app["asset_return_monthly"] = monthly_app.groupby("gvkey")["asset_value"].transform(
             lambda x: np.log(x / x.shift(1))
         )
+        
+        # Keep asset_volatility as ANNUALIZED for reference
+        # But store both for clarity
+        monthly_app["asset_volatility_annualized"] = monthly_app["asset_volatility"]
+        monthly_app["asset_volatility_monthly"] = monthly_app["asset_volatility"] / np.sqrt(12)
+        
         monthly_app["month_year"] = monthly_app["date"].dt.to_period("M")
         
-        monthly_returns_df = monthly_app[["gvkey", "month_year", "asset_return_monthly", "asset_value", "asset_volatility"]].dropna()
+        # For GARCH: Use MONTHLY volatility as reference (for diagnostic purposes only)
+        # The actual GARCH will estimate its own volatility
+        monthly_returns_df = monthly_app[[
+            "gvkey", "month_year", "asset_return_monthly", "asset_value", 
+            "asset_volatility_monthly", "asset_volatility_annualized"
+        ]].dropna()
         
+        # Rename for clarity in output
+        monthly_returns_df = monthly_returns_df.rename(columns={
+            "asset_volatility_annualized": "asset_volatility"
+        })
+    
     return df_merged, monthly_returns_df
 

@@ -27,6 +27,10 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
     # Filter to rows with complete GARCH parameters
     df_complete = df.dropna(subset=['garch_volatility', 'garch_omega', 'garch_alpha', 'garch_beta']).copy()
     
+    print(f"\nDebug: Sample GARCH parameters:")
+    print(df_complete[['gvkey', 'month_year', 'garch_volatility', 'garch_omega', 'garch_alpha', 'garch_beta']].head(10))
+    print(f"Total rows with complete parameters: {len(df_complete)}")
+    
     if df_complete.empty:
         print("No complete GARCH data found.")
         return pd.DataFrame()
@@ -50,7 +54,7 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
         firm_data = df_complete[df_complete['gvkey'] == gvkey].copy()
         firm_data = firm_data.sort_values('month_year')
         
-        print(f"Firm {firm_idx + 1}/{len(firms)}: gvkey={gvkey}, months={len(firm_data)}")
+        print(f"Firm {gvkey}: {len(firm_data)} months")
         
         # Loop through each monthly date for this firm
         for idx, row in firm_data.iterrows():

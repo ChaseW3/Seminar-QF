@@ -7,12 +7,18 @@ from arch import arch_model
 def run_garch_estimation(monthly_returns_df):
     """
     Estimates GARCH(1,1) on the provided monthly asset returns dataframe.
-    Extracts omega, alpha, beta parameters and conditional volatility (monthly, not annualized).
+    
+    IMPORTANT: 
+    - Fits GARCH to monthly log returns (decimal form, e.g., -0.0054)
+    - Returns MONTHLY conditional volatility (not annualized)
+    - Parameters (omega, alpha, beta) scale with monthly data
+    
     Returns:
-        pd.DataFrame: A copy of the input dataframe with 'garch_volatility', 'garch_omega', 
-                      'garch_alpha', 'garch_beta' columns (volatility is monthly).
+        pd.DataFrame: Copy of input with 'garch_volatility', 'garch_omega', 
+                      'garch_alpha', 'garch_beta' columns
     """
-    print("Estimating GARCH(1,1) on COMPUTED MONTHLY Asset Returns...")
+    print("Estimating GARCH(1,1) on MONTHLY Asset Returns...")
+    print("Note: Returns are in decimal form (log returns), volatility will be monthly")
     
     if monthly_returns_df.empty:
         print("No monthly returns provided for GARCH.")
@@ -35,10 +41,11 @@ def run_garch_estimation(monthly_returns_df):
         if len(firm_ts) < 50:
             continue
             
-        # Scale returns
-        returns = firm_ts["asset_return_monthly"] * 100
+        # Use returns AS-IS (decimal log returns, unscaled)
+        returns = firm_ts["asset_return_monthly"].values
         
         try:
+            # Fit GARCH(1,1) to monthly returns
             am = arch_model(returns, vol='Garch', p=1, q=1, dist='Normal')
             res = am.fit(disp='off', show_warning=False)
             
@@ -47,17 +54,21 @@ def run_garch_estimation(monthly_returns_df):
             alpha = res.params['alpha[1]']
             beta = res.params['beta[1]']
             
-            cond_vol = res.conditional_volatility
+            # Conditional volatility (monthly, matches return scale)
+            cond_vol = res.conditional_volatility.values
             
-            # Re-scale: This is monthly volatility (keep as monthly, don't annualize)
-            monthly_garch_vol = (cond_vol / 100)
+            # Sanity check
+            if np.any(np.isnan(cond_vol)) or np.any(cond_vol < 0):
+                print(f"  Warning: Invalid volatility for gvkey {gvkey}")
+                continue
             
-            df_out.loc[firm_ts.index, "garch_volatility"] = monthly_garch_vol
+            df_out.loc[firm_ts.index, "garch_volatility"] = cond_vol
             df_out.loc[firm_ts.index, "garch_omega"] = omega
             df_out.loc[firm_ts.index, "garch_alpha"] = alpha
             df_out.loc[firm_ts.index, "garch_beta"] = beta
             
         except Exception as e:
+            print(f"  Error for gvkey {gvkey}: {e}")
             continue
             
         if (i + 1) % 10 == 0:

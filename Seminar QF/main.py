@@ -146,6 +146,3 @@ if 'df' in locals() and 'interest_rates_df' in locals():
 else:
     print("Error: 'df' or 'interest_rates_df' not found. Please run Step 1 (Load Data) first.")
 
-
-# %%
-print("hi")
