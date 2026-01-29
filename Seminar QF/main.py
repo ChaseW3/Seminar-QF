@@ -19,28 +19,26 @@ df = load_and_preprocess_data()
 
 #%%
 # 2. Run Merton Model (Rolling Window)
-# This generates continuous daily estimates and daily/monthly returns
-# Note: run_merton_estimation now returns (merged_daily_df, monthly_returns_df)
-df_merged, monthly_returns_df = run_merton_estimation(df, interest_rates_df)
+df_merged, daily_returns_df = run_merton_estimation(df, interest_rates_df)
 
 # Save Step 1 & 2 Results
 df_merged.to_csv("merged_data_with_merton.csv", index=False)
-monthly_returns_df.to_csv("monthly_asset_returns.csv", index=False)
+daily_returns_df.to_csv("daily_asset_returns.csv", index=False)
 
 print("Saved 'merged_data_with_merton.csv'")
-print("Saved 'monthly_asset_returns.csv'")
+print("Saved 'daily_asset_returns.csv'")
 
-#%% 
+#%%
 # 3. Run GARCH Model
-final_monthly_returns = run_garch_estimation(monthly_returns_df)
+final_daily_returns = run_garch_estimation(daily_returns_df)
 
 # Save Final Results
-final_monthly_returns.to_csv("monthly_asset_returns_with_garch.csv", index=False)
-print("Saved 'monthly_asset_returns_with_garch.csv'")
+final_daily_returns.to_csv("daily_asset_returns_with_garch.csv", index=False)
+print("Saved 'daily_asset_returns_with_garch.csv'")
 
 #%%
 # 4. Run Regime Switching Model (Hamilton Filter)
-final_monthly_returns_rs = run_regime_switching_estimation(monthly_returns_df)
+final_monthly_returns_rs = run_regime_switching_estimation(daily_returns_df)
 
 # Save Regime Switching Results
 final_monthly_returns_rs.to_csv("monthly_asset_returns_with_regime.csv", index=False)
@@ -48,7 +46,7 @@ print("Saved 'monthly_asset_returns_with_regime.csv'")
 
 #%%
 # 5. Run MS-GARCH (Markov Switching GARCH)
-final_monthly_returns_msgarch = run_ms_garch_estimation(monthly_returns_df)
+final_monthly_returns_msgarch = run_ms_garch_estimation(daily_returns_df)
 
 # Save MS-GARCH Results
 final_monthly_returns_msgarch.to_csv("monthly_asset_returns_with_msgarch.csv", index=False)

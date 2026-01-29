@@ -12,8 +12,6 @@ FILENAME_INTEREST_RATES = "ECB Data Portal_20260125170805.csv"
 SHEET_EQUITY = 0
 SHEET_LIABILITY = 1
 MIN_OBSERVATIONS = 150 # Minimum daily observations for Merton estimation
-# RISK_FREE_RATE = 0.05  # Now loaded from ECB data
-# Time horizon T is 1 year (risk horizon)
 T_HORIZON = 1.0
 
 
@@ -24,7 +22,6 @@ def load_interest_rates():
     """
     rates_df = pd.read_csv(FILENAME_INTEREST_RATES)
     
-    # Extract the Euribor rate column (the long column name with EURIBOR)
     rate_cols = [col for col in rates_df.columns if 'EURIBOR' in col.upper()]
     
     rates_df['DATE'] = pd.to_datetime(rates_df['DATE'])
@@ -83,7 +80,7 @@ def load_and_preprocess_data():
 
 def run_merton_estimation(df, interest_rates_df=None):
     """
-    Runs the rolling window iterative Merton model.
+    Runs the rolling window iterative Merton model on DAILY data.
     
     Parameters:
     -----------
@@ -95,8 +92,8 @@ def run_merton_estimation(df, interest_rates_df=None):
     
     Returns:
     --------
-    full_df (pd.DataFrame): The original dataframe with added Merton columns (filled monthly).
-    monthly_returns_df (pd.DataFrame): Dataframe containing monthly asset returns and volatilities.
+    full_df (pd.DataFrame): The original dataframe with added Merton columns (filled daily).
+    daily_returns_df (pd.DataFrame): Dataframe containing daily asset returns and volatilities.
     """
     
     # Filter valid data
@@ -117,13 +114,13 @@ def run_merton_estimation(df, interest_rates_df=None):
         firm_data = solver_df[solver_df["gvkey"] == gvkey].sort_values("date")
         if firm_data.empty:
             continue
-            
-        # Resample to find month ends present in the data.
-        month_ends = firm_data.groupby(firm_data["date"].dt.to_period("M"))["date"].max()
         
-        for date_t in month_ends:
-            # Define 12-month estimation window
-            start_date = date_t - pd.DateOffset(months=12)
+        # Process EVERY day in the dataset
+        all_dates = firm_data["date"].unique()
+        
+        for date_t in all_dates:
+            # Define 12-month estimation window (252 trading days ≈ 1 year)
+            start_date = date_t - pd.DateOffset(days=252)
             
             # Slice data
             window_mask = (firm_data["date"] > start_date) & (firm_data["date"] <= date_t)
@@ -132,8 +129,8 @@ def run_merton_estimation(df, interest_rates_df=None):
             if len(window_df) < MIN_OBSERVATIONS:
                 continue
                 
-            # Get interest rate for this month
-            month_str = date_t.strftime('%Y-%m')
+            # Get interest rate for this date's month
+            month_str = pd.Timestamp(date_t).strftime('%Y-%m')
             if interest_rates_df is not None and month_str in interest_rates_df['month_year'].values:
                 r = interest_rates_df[interest_rates_df['month_year'] == month_str]['risk_free_rate'].values[0]
             else:
@@ -152,18 +149,18 @@ def run_merton_estimation(df, interest_rates_df=None):
                 continue
                 
             # Compute DAILY volatility (not annualized yet)
-            sigma_E_daily = np.std(ret_E)  # ← NO √252 scaling
+            sigma_E_daily = np.std(ret_E)
             if sigma_E_daily < 1e-6: 
                 sigma_E_daily = 0.4 / np.sqrt(252)  # Daily equivalent
             
-            sigma_A = sigma_E_daily  # ← Keep as DAILY for N-R loop
+            sigma_A = sigma_E_daily  # Keep as DAILY for N-R loop
             
             # Params
-            T_val = 252  # ← Use daily time horizon (252 trading days = 1 year)
+            T_val = 252  # Daily time horizon (252 trading days = 1 year)
             tol = 1e-4
             max_iter_algo = 100
             
-            V_A_vec = E_vec + B_vec # Initial guess
+            V_A_vec = E_vec + B_vec  # Initial guess
             
             for k in range(max_iter_algo):
                 sigma_A_old = sigma_A
@@ -197,26 +194,27 @@ def run_merton_estimation(df, interest_rates_df=None):
                     ret_A = np.diff(np.log(V_A_vec))
                 ret_A = ret_A[np.isfinite(ret_A)]
                 
-                if len(ret_A) < 10: break
+                if len(ret_A) < 10: 
+                    break
 
-                sigma_A_new = np.std(ret_A)  # ← NO √252 scaling here
+                sigma_A_new = np.std(ret_A)
                 
                 if abs(sigma_A_new - sigma_A_old) < tol:
                     sigma_A = sigma_A_new
                     break
                 sigma_A = sigma_A_new
             
-            # Save Month-End Result
+            # Save Daily Result
             V_A_final = V_A_vec[-1]
             
-            # NOW convert to annualized for storage
+            # Convert to annualized for storage
             sigma_A_annualized = sigma_A * np.sqrt(252)
             
             results_list.append({
                 "gvkey": gvkey,
                 "date": date_t,
                 "asset_value": V_A_final,
-                "asset_volatility": sigma_A_annualized,  # ← Store annualized
+                "asset_volatility": sigma_A_annualized,  # Store annualized
             })
 
         if (i + 1) % 10 == 0:
@@ -228,22 +226,20 @@ def run_merton_estimation(df, interest_rates_df=None):
     # 1. Merge back to main DF
     df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
     
-    # 2. Compute Monthly Returns DataFrame
-    monthly_returns_df = pd.DataFrame()
+    # 2. Compute Daily Returns DataFrame
+    daily_returns_df = pd.DataFrame()
     if not merton_results.empty:
-        monthly_app = merton_results.copy().sort_values(["gvkey", "date"])
-        monthly_app["asset_return_monthly"] = monthly_app.groupby("gvkey")["asset_value"].transform(
+        daily_app = merton_results.copy().sort_values(["gvkey", "date"])
+        daily_app["asset_return_daily"] = daily_app.groupby("gvkey")["asset_value"].transform(
             lambda x: np.log(x / x.shift(1))
         )
         
-        # CRITICAL: Convert annualized volatility to MONTHLY for scale matching
-        monthly_app["asset_volatility"] = monthly_app["asset_volatility"] / np.sqrt(12)
+        # CRITICAL: Convert annualized volatility to DAILY for scale matching
+        daily_app["asset_volatility"] = daily_app["asset_volatility"] / np.sqrt(252)
         
-        monthly_app["month_year"] = monthly_app["date"].dt.to_period("M")
-        
-        monthly_returns_df = monthly_app[[
-            "gvkey", "month_year", "asset_return_monthly", "asset_value", "asset_volatility"
+        daily_returns_df = daily_app[[
+            "gvkey", "date", "asset_return_daily", "asset_value", "asset_volatility"
         ]].dropna()
 
-    return df_merged, monthly_returns_df
+    return df_merged, daily_returns_df
 
