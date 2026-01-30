@@ -357,22 +357,7 @@ class CDSSpreadCalculator:
                                         merton_file, output_file=None):
         """
         Calculate model-implied CDS spreads based on Monte Carlo GARCH volatility forecasts.
-        
-        Parameters:
-        -----------
-        mc_garch_file : str
-            Path to CSV with Monte Carlo GARCH volatility forecasts
-        daily_returns_file : str
-            Path to CSV with daily returns and asset values
-        merton_file : str
-            Path to CSV with Merton results (includes liabilities_total)
-        output_file : str, optional
-            Where to save combined results. If None, uses default.
-        
-        Returns:
-        --------
-        df_cds_spreads : pd.DataFrame
-            CDS spreads for all maturities based on MC GARCH volatility
+        Uses only mean volatility from simulations, not individual paths.
         """
         
         overall_start = time.time()
@@ -386,59 +371,62 @@ class CDSSpreadCalculator:
         # Load Monte Carlo GARCH results
         df_mc_garch = pd.read_csv(mc_garch_file)
         print(f"✓ Loaded Monte Carlo GARCH: {len(df_mc_garch):,} observations")
-        print(f"  Columns: {list(df_mc_garch.columns)}")
+        print(f"  Columns: {list(df_mc_garch.columns)}\n")
+        
+        # Identify the volatility column in MC GARCH file
+        volatility_cols = [col for col in df_mc_garch.columns if 'volatility' in col.lower() or 'vol' in col.lower()]
+        if not volatility_cols:
+            raise ValueError(f"No volatility column found. Available columns: {list(df_mc_garch.columns)}")
+        
+        volatility_column = volatility_cols[0]
+        print(f"✓ Using volatility column: '{volatility_column}'")
+        
+        # AGGREGATE: Group by gvkey and take MEAN across all simulations
+        df_mc_garch_agg = df_mc_garch.groupby('gvkey')[[volatility_column]].mean().reset_index()
+        df_mc_garch_agg.columns = ['gvkey', volatility_column]
+        print(f"✓ Aggregated to {len(df_mc_garch_agg):,} unique firms (mean across simulations)\n")
         
         # Load daily returns with asset values
         df_daily_returns = pd.read_csv(daily_returns_file)
         df_daily_returns['date'] = pd.to_datetime(df_daily_returns['date'])
         print(f"✓ Loaded daily returns: {len(df_daily_returns):,} observations")
-        print(f"  Columns: {list(df_daily_returns.columns)}")
         
         # Load Merton results with liabilities
         df_merton = pd.read_csv(merton_file)
         df_merton['date'] = pd.to_datetime(df_merton['date'])
-        print(f"✓ Loaded Merton data: {len(df_merton):,} observations")
-        print(f"  Columns: {list(df_merton.columns)}\n")
-        
-        # Identify the volatility column in MC GARCH file
-        volatility_cols = [col for col in df_mc_garch.columns if 'volatility' in col.lower() or 'vol' in col.lower()]
-        if not volatility_cols:
-            raise ValueError(f"No volatility column found in {mc_garch_file}. Available columns: {list(df_mc_garch.columns)}")
-        
-        volatility_column = volatility_cols[0]
-        print(f"✓ Using volatility column from MC GARCH: '{volatility_column}'\n")
+        print(f"✓ Loaded Merton data: {len(df_merton):,} observations\n")
         
         # Merge all data
-        # First merge daily returns with Merton data (on gvkey and date) to get liabilities
         df_merged = pd.merge(df_daily_returns, df_merton[['gvkey', 'date', 'liabilities_total']], 
                              on=['gvkey', 'date'], how='left')
-        
-        # Then merge with MC GARCH (on gvkey only, since MC GARCH is firm-level)
-        df_merged = pd.merge(df_merged, df_mc_garch[['gvkey', volatility_column]], 
+        df_merged = pd.merge(df_merged, df_mc_garch_agg[['gvkey', volatility_column]], 
                              on=['gvkey'], how='left')
         
-        # Remove rows where MC GARCH volatility or liabilities are missing
         initial_rows = len(df_merged)
-        df_merged = df_merged.dropna(subset=[volatility_column, 'liabilities_total'])
+        df_merged = df_merged.dropna(subset=[volatility_column, 'liabilities_total', 'asset_value'])
         final_rows = len(df_merged)
         
-        print(f"✓ Merged all data: {initial_rows:,} → {final_rows:,} valid observations\n")
+        print(f"✓ Merged data: {initial_rows:,} → {final_rows:,} valid observations\n")
+        print("Calculating CDS spreads (mean volatility only)...\n")
         
-        # Calculate CDS spreads using MC GARCH volatility
-        print("Calculating model-implied CDS spreads from MC GARCH volatility...\n")
+        # Extract needed columns
+        V_t = df_merged['asset_value'].values
+        K = df_merged['liabilities_total'].values * 1_000_000
+        sigma_V = df_merged[volatility_column].values
+        r_t = 0.05  # risk-free rate
         
-        df_cds_spreads = self.calculate_cds_spreads_single_model(
-            df_merged, 'GARCH (Monte Carlo)', 
-            volatility_column=volatility_column
-        )
+        # Calculate spreads for each maturity
+        results_data = {'gvkey': df_merged['gvkey'].values, 
+                        'date': df_merged['date'].values}
         
-        # Rename columns for clarity
-        df_cds_spreads = df_cds_spreads.rename(columns={
-            col: col.replace('cds_spread_', 'cds_spread_garch_mc_')
-            for col in df_cds_spreads.columns if 'cds_spread_' in col
-        })
+        for tau in self.maturity_horizons:
+            spread, spread_bps = self.credit_spread_from_put_value(V_t, K, r_t, sigma_V, tau)
+            results_data[f'cds_spread_garch_mc_{tau}y'] = spread
+            results_data[f'cds_spread_garch_mc_{tau}y_bps'] = spread_bps
         
-        print(f"✓ GARCH (MC) CDS spreads calculated\n")
+        df_cds_spreads = pd.DataFrame(results_data)
+        
+        print(f"✓ CDS spreads calculated\n")
         
         # Print summary statistics
         print(f"{'='*80}")
@@ -462,7 +450,7 @@ class CDSSpreadCalculator:
                 print(f"  Std:    {std_spread:8.2f} bps")
                 print(f"  Range:  [{min_spread:7.2f}, {max_spread:7.2f}] bps")
                 print(f"  N:      {n_obs:,}\n")
-    
+        
         # Save results
         if output_file is None:
             output_file = 'cds_spreads_garch_mc.csv'
@@ -477,9 +465,7 @@ class CDSSpreadCalculator:
         print(f"Total time: {timedelta(seconds=int(overall_time))}")
         print(f"Total observations: {len(df_cds_spreads):,}")
         print(f"Unique firms: {df_cds_spreads['gvkey'].nunique()}")
-        if 'date' in df_cds_spreads.columns:
-            print(f"Date range: {df_cds_spreads['date'].min().strftime('%Y-%m-%d')} to "
-                  f"{df_cds_spreads['date'].max().strftime('%Y-%m-%d')}")
+        print(f"File size: ~{len(df_cds_spreads) * 0.0001:.1f} MB")
         print(f"Saved to: {output_file}")
         print(f"{'='*80}\n")
         
