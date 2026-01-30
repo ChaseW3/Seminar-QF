@@ -146,3 +146,20 @@ if 'df' in locals() and 'interest_rates_df' in locals():
 else:
     print("Error: 'df' or 'interest_rates_df' not found. Please run Step 1 (Load Data) first.")
 
+#%%
+# 8. Calculate Model-Implied CDS Spreads (Section 2.4.2) - GARCH Only
+from cds_spread_calculator import CDSSpreadCalculator
+
+cds_calc = CDSSpreadCalculator(maturity_horizons=[1, 3, 5])
+
+df_cds_spreads_garch = cds_calc.calculate_cds_spreads_from_mc_garch(
+    mc_garch_file='daily_monte_carlo_garch_results.csv',
+    daily_returns_file='daily_asset_returns.csv',
+    merton_file='merged_data_with_merton.csv',
+    output_file='cds_spreads_garch_mc.csv'
+)
+
+print("Saved CDS spreads to 'cds_spreads_garch_mc.csv'")
+
+
+# %
