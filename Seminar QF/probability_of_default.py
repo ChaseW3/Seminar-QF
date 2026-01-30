@@ -4,236 +4,262 @@
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
+import warnings
+warnings.filterwarnings('ignore')
 
 def load_auxiliary_data():
     """
-    Load liabilities and interest rates (common for all models).
+    Load liabilities and interest rates from source files.
+    Works with daily data.
     """
     print("Loading auxiliary data (liabilities and interest rates)...")
     
-    # 1. Load merged data for Liabilities
-    merged_df = pd.read_csv('merged_data_with_merton.csv')
-    merged_df['date'] = pd.to_datetime(merged_df['date'])
-    merged_df['month_year'] = merged_df['date'].dt.strftime('%Y-%m')
-    
-    # Extract monthly liabilities (use the last available value per month for each firm)
-    monthly_liabilities = (merged_df.dropna(subset=['liabilities_total'])
-                          .sort_values(['gvkey', 'date'])
-                          .groupby(['gvkey', 'month_year'], as_index=False)
-                          .apply(lambda x: x.iloc[-1])
-                          [['gvkey', 'month_year', 'liabilities_total']]
-                          .reset_index(drop=True))
-    
-    # Correct Unit Mismatch: Data is in Millions, Asset Value is in Ones
-    monthly_liabilities['liabilities_total'] = monthly_liabilities['liabilities_total'] * 1_000_000
+    # 1. Load Liabilities from Excel
+    print("  Loading liabilities...")
+    try:
+        liab_df = pd.read_excel('Jan2025_Accenture_Dataset_ErasmusCase.xlsx', sheet_name=1)
+        liab_df = liab_df.rename(columns={
+            "(gvkey) Global Company Key - Company": "gvkey",
+            "(fyear) Data Year - Fiscal": "fyear",
+            "(lt) Liabilities - Total": "liabilities_total",
+        })
+        liab_df = liab_df[["gvkey", "fyear", "liabilities_total"]].drop_duplicates(subset=["gvkey", "fyear"])
+        print(f"    ✓ Loaded {len(liab_df)} liability records")
+    except Exception as e:
+        print(f"    ✗ Error loading liabilities: {e}")
+        return None, None
 
     # 2. Load Interest Rates from ECB data
-    rates_df = pd.read_csv('ECB Data Portal_20260125170805.csv')
-    rate_cols = [col for col in rates_df.columns if 'EURIBOR' in col.upper()]
-    rates_df['DATE'] = pd.to_datetime(rates_df['DATE'])
-    rates_df['month_year'] = rates_df['DATE'].dt.strftime('%Y-%m')
-    rates_df['risk_free_rate'] = pd.to_numeric(rates_df[rate_cols[0]], errors='coerce') / 100
-    rates_df = rates_df[['month_year', 'risk_free_rate']].drop_duplicates()
+    print("  Loading interest rates...")
+    try:
+        rates_df = pd.read_csv('ECB Data Portal_20260125170805.csv')
+        rate_cols = [col for col in rates_df.columns if 'EURIBOR' in col.upper()]
+        rates_df['DATE'] = pd.to_datetime(rates_df['DATE'])
+        rates_df['month_year'] = rates_df['DATE'].dt.strftime('%Y-%m')
+        rates_df['risk_free_rate'] = pd.to_numeric(rates_df[rate_cols[0]], errors='coerce') / 100
+        rates_df = rates_df[['month_year', 'risk_free_rate']].drop_duplicates()
+        print(f"    ✓ Loaded {len(rates_df)} months of interest rate data")
+    except Exception as e:
+        print(f"    ✗ Error loading rates: {e}")
+        return liab_df, None
     
-    return monthly_liabilities, rates_df
+    return liab_df, rates_df
 
 
 def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     """
-    Load model results, merge with aux data, and calculate PD.
+    Calculate Probability of Default for a given volatility model (GARCH, Regime Switching, MS-GARCH).
+    Works with DAILY data.
     """
-    print(f"Processing model: {model_name}...")
+    print(f"\n  Processing {model_name}...")
     
-    # Load model results
     try:
         df = pd.read_csv(file_path)
     except FileNotFoundError:
-        print(f"  Warning: File {file_path} not found. Skipping {model_name}.")
+        print(f"    ✗ File {file_path} not found. Skipping {model_name}.")
         return None
-        
-    # Merge with liabilities
-    df = df.merge(liabilities_df, on=['gvkey', 'month_year'], how='left')
     
-    # Merge with interest rates
-    df = df.merge(rates_df, on='month_year', how='left')
+    df['date'] = pd.to_datetime(df['date'])
     
-    # Determine Volatility based on model
+    # Extract fiscal year from date
+    df['fyear'] = df['date'].dt.year
+    
+    # Merge with liabilities (match by gvkey and fiscal year)
+    df_merged = pd.merge(df, liabilities_df, on=['gvkey', 'fyear'], how='left')
+    
+    # Merge with interest rates (match by month)
+    df_merged['month_year'] = df_merged['date'].dt.strftime('%Y-%m')
+    df_merged = pd.merge(df_merged, rates_df[['month_year', 'risk_free_rate']], 
+                         on='month_year', how='left')
+    
+    # Fill missing rates with forward/backward fill (modern pandas syntax)
+    df_merged['risk_free_rate'] = df_merged.groupby('gvkey')['risk_free_rate'].transform(
+        lambda x: x.ffill().bfill()
+    )
+    
+    # Fill remaining with default rate
+    df_merged['risk_free_rate'] = df_merged['risk_free_rate'].fillna(0.05)
+    
+    # Determine volatility column based on model
     if model_name == 'GARCH':
-        # GARCH output has 'garch_volatility'
-        if 'garch_volatility' in df.columns:
-            df['model_volatility'] = df['garch_volatility']
-        elif 'asset_volatility' in df.columns: # fallback if needed
-             df['model_volatility'] = df['asset_volatility']
-        else:
-            print(f"  Warning: 'garch_volatility' not found in {file_path}")
-            return None
-            
+        vol_col = 'garch_volatility'
     elif model_name == 'Regime Switching':
-        # RS output has probs and sigma2s
-        if 'regime_0_prob' in df.columns and 'sigma2_0' in df.columns:
-            # Expected Variance = p0*s0 + p1*s1
-            # Volatility = sqrt(Expected Variance)
-            # Ensure columns are numeric
-            for col in ['regime_0_prob', 'sigma2_0', 'regime_1_prob', 'sigma2_1']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-            expected_variance = (df['regime_0_prob'] * df['sigma2_0'] + 
-                                 df['regime_1_prob'] * df['sigma2_1'])
-            # Convert Monthly Variance to Annualized Volatility
-            # sigma_annual = sqrt(sigma2_monthly) * sqrt(12)
-            df['model_volatility'] = np.sqrt(expected_variance) * np.sqrt(12)
-        else:
-            print(f"  Warning: RS params not found in {file_path}")
-            return None
-            
+        vol_col = 'garch_volatility'
     elif model_name == 'MS-GARCH':
-        # MS-GARCH output has 'msgarch_cond_vol'
-        if 'msgarch_cond_vol' in df.columns:
-            df['model_volatility'] = df['msgarch_cond_vol']
-        else:
-            print(f"  Warning: 'msgarch_cond_vol' not found in {file_path}")
-            return None
+        vol_col = 'msgarch_volatility'
+    else:
+        vol_col = 'garch_volatility'
     
-    # Calculate PD (Merton Model)
-    # Time horizon (1 year = 1.0)
-    time_horizon = 1.0
+    # Check if volatility column exists
+    if vol_col not in df_merged.columns:
+        print(f"    ✗ Volatility column '{vol_col}' not found in {file_path}.")
+        print(f"       Available columns: {list(df_merged.columns)}")
+        return None
     
-    # Filter valid rows
-    df = df.dropna(subset=['liabilities_total', 'risk_free_rate', 'model_volatility'])
+    # Create PD column name
+    col_name = f'pd_{model_name.lower().replace(" ", "_")}'
+    df_merged[col_name] = np.nan
     
-    df['log_asset_debt_ratio'] = np.log(df['asset_value'] / df['liabilities_total'])
+    # Validity mask
+    mask_valid = (
+        (df_merged[vol_col].notna()) & 
+        (df_merged['asset_value'] > 0) & 
+        (df_merged['liabilities_total'].notna()) &
+        (df_merged['liabilities_total'] > 0)
+    )
     
-    vol = df['model_volatility']
-    rf = df['risk_free_rate']
+    if not mask_valid.any():
+        print(f"    ✗ No valid data for {model_name} PD calculation.")
+        print(f"       vol_col notna: {df_merged[vol_col].notna().sum()}")
+        print(f"       asset_value > 0: {(df_merged['asset_value'] > 0).sum()}")
+        print(f"       liabilities notna: {df_merged['liabilities_total'].notna().sum()}")
+        print(f"       liabilities > 0: {(df_merged['liabilities_total'] > 0).sum()}")
+        return None
     
-    numerator = (df['log_asset_debt_ratio'] + (rf - 0.5 * vol**2) * time_horizon)
-    denominator = vol * np.sqrt(time_horizon)
+    valid_data = df_merged.loc[mask_valid]
     
-    df['d2'] = numerator / denominator
-    df['merton_pd'] = norm.cdf(-df['d2'])
-    df['merton_pd'] = df['merton_pd'].clip(0, 1)
+    # Merton PD calculation
+    V_A = valid_data['asset_value'].values
+    B = valid_data['liabilities_total'].values * 1_000_000  # Convert to actual liability value
+    sigma_A = valid_data[vol_col].values  # Annualized volatility
+    r = valid_data['risk_free_rate'].values
+    T = 1.0
     
-    return df
-
-
-def export_pd_results(pd_df, output_filename='monthly_pd_results.csv'):
-    """
-    Export PD calculations to CSV.
-    """
-    # Simply export the whole dataframe as it's already structured correctly
-    pd_df.to_csv(output_filename, index=False)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        d2 = (np.log(V_A / B) + (r - 0.5 * sigma_A**2) * T) / (sigma_A * np.sqrt(T))
+        pd_values = norm.cdf(-d2)
+        pd_values = np.clip(pd_values, 0, 1)
     
-    print(f"Saved '{output_filename}'")
-    print(f"  - Total Records: {len(pd_df)}")
-    print(f"  - Columns: {list(pd_df.columns)}")
+    df_merged.loc[mask_valid, col_name] = pd_values
+    
+    print(f"    ✓ {model_name}: Calculated PD for {mask_valid.sum():,} observations")
+    print(f"       PD column name: '{col_name}'")
+    
+    return df_merged
 
 
 def run_pd_pipeline(data_garch, data_regime, data_msgarch):
     """
     Complete pipeline: load all 3 model results, calculate PD for each, and combine.
-    Results are merged horizontally to allow side-by-side comparison.
+    Works with daily data.
     """
     
-    print("\n" + "="*60)
-    print("STEP 6: PROBABILITY OF DEFAULT CALCULATION (Multi-Model)")
-    print("="*60)
+    print("\n" + "="*80)
+    print("PROBABILITY OF DEFAULT CALCULATION (Multi-Model, Daily Data)")
+    print("="*80)
     
     # 1. Load Auxiliary Data
-    try:
-        liabilities_df, rates_df = load_auxiliary_data()
-    except Exception as e:
-        print(f"Error loading auxiliary data: {e}")
-        return pd.DataFrame() # Return empty df on failure
+    liabilities_df, rates_df = load_auxiliary_data()
+    
+    if liabilities_df is None or rates_df is None:
+        print("✗ Critical Error: Could not load auxiliary data. Aborting.")
+        return pd.DataFrame()
     
     # 2. Process Each Model
+    print("\nCalculating PD for each model...")
     
     # GARCH (Base DataFrame)
     df_garch = calculate_pd_for_model('GARCH', data_garch, liabilities_df, rates_df)
     if df_garch is None:
-        print("Critical Error: GARCH model processing failed. Aborting.")
+        print("✗ Critical Error: GARCH model processing failed. Aborting.")
         return pd.DataFrame()
-        
-    # Rename GARCH specific columns
-    final_df = df_garch.rename(columns={
-        'merton_pd': 'merton_pd_garch',
-        'd2': 'd2_garch',
-        'model_volatility': 'volatility_garch'
-    })
     
-    # Keep only necessary columns + specific ones
-    base_cols = ['gvkey', 'month_year', 'asset_value', 'liabilities_total', 'risk_free_rate', 'log_asset_debt_ratio']
-    specific_cols_garch = ['merton_pd_garch', 'd2_garch', 'volatility_garch']
+    # Select only necessary columns from GARCH
+    final_df = df_garch[['gvkey', 'date', 'asset_value', 'liabilities_total', 
+                          'risk_free_rate', 'pd_garch']].copy()
     
-    # Filter columns if they exist (safe select)
-    final_df = final_df[[c for c in base_cols + specific_cols_garch if c in final_df.columns]]
+    # Also include garch_volatility if it exists
+    if 'garch_volatility' in df_garch.columns:
+        final_df['garch_volatility'] = df_garch['garch_volatility']
     
     # Regime Switching
     df_regime = calculate_pd_for_model('Regime Switching', data_regime, liabilities_df, rates_df)
     if df_regime is not None:
-        # Select relevant cols
-        cols_to_merge = df_regime[['gvkey', 'month_year', 'merton_pd', 'd2', 'model_volatility']]
-        cols_to_merge = cols_to_merge.rename(columns={
-            'merton_pd': 'merton_pd_regime',
-            'd2': 'd2_regime',
-            'model_volatility': 'volatility_regime'
-        })
-        # Merge
-        final_df = final_df.merge(cols_to_merge, on=['gvkey', 'month_year'], how='outer')
-        
+        # Check what PD column actually exists
+        pd_col_name = 'pd_regime_switching'
+        if pd_col_name in df_regime.columns:
+            cols_to_merge = df_regime[['gvkey', 'date', pd_col_name]].copy()
+            final_df = pd.merge(final_df, cols_to_merge, on=['gvkey', 'date'], how='left')
+            print(f"    ✓ Merged Regime Switching results")
+        else:
+            print(f"    ⚠ PD column '{pd_col_name}' not found in Regime Switching results")
+    else:
+        print("    ⚠ Regime Switching model skipped")
+    
     # MS-GARCH
     df_msgarch = calculate_pd_for_model('MS-GARCH', data_msgarch, liabilities_df, rates_df)
     if df_msgarch is not None:
-        # Select relevant cols
-        cols_to_merge = df_msgarch[['gvkey', 'month_year', 'merton_pd', 'd2', 'model_volatility']]
-        cols_to_merge = cols_to_merge.rename(columns={
-            'merton_pd': 'merton_pd_msgarch',
-            'd2': 'd2_msgarch',
-            'model_volatility': 'volatility_msgarch'
-        })
-        # Merge
-        final_df = final_df.merge(cols_to_merge, on=['gvkey', 'month_year'], how='outer')
-        
-    # 3. Export
-    if not final_df.empty:
-        export_pd_results(final_df, 'monthly_pd_results.csv')
-        
-        print("\n✓ PD pipeline complete!")
-        return final_df
+        # Check what PD column actually exists
+        pd_col_name = 'pd_ms_garch'
+        if pd_col_name in df_msgarch.columns:
+            cols_to_merge = df_msgarch[['gvkey', 'date', pd_col_name]].copy()
+            final_df = pd.merge(final_df, cols_to_merge, on=['gvkey', 'date'], how='left')
+            print(f"    ✓ Merged MS-GARCH results")
+        else:
+            # Debug: print available columns
+            available_cols = [col for col in df_msgarch.columns if 'pd_' in col]
+            print(f"    ⚠ PD column '{pd_col_name}' not found. Available PD columns: {available_cols}")
     else:
-        print("No results generated.")
-        return pd.DataFrame()
+        print("    ⚠ MS-GARCH model skipped")
+    
+    # 3. Summary and Return
+    print("\n" + "="*80)
+    print(f"✓ PD Pipeline Complete")
+    print(f"  Total records: {len(final_df):,}")
+    print(f"  Firms: {final_df['gvkey'].nunique()}")
+    if len(final_df) > 0:
+        print(f"  Date range: {final_df['date'].min().strftime('%Y-%m-%d')} to {final_df['date'].max().strftime('%Y-%m-%d')}")
+    print("="*80 + "\n")
+    
+    return final_df
 
-def calculate_merton_pd_normal(monthly_returns_file):
+
+def calculate_merton_pd_normal(daily_returns_file):
     """
-    Calculate Merton PD using simple normal returns volatility (no GARCH/regime switching).
-    Benchmark model for comparison.
+    Calculate Merton PD using asset volatility from normal returns (no GARCH).
+    Benchmark model for comparison with daily data.
     """
-    print("\nCalculating Merton PD with Normal Returns (Benchmark)...")
+    print("\nCalculating Merton PD (Normal Returns - Benchmark, Daily Data)...")
     
     # Load data
-    df = pd.read_csv(monthly_returns_file)
+    df = pd.read_csv(daily_returns_file)
+    df['date'] = pd.to_datetime(df['date'])
+    df['fyear'] = df['date'].dt.year
+    
     liabilities_df, rates_df = load_auxiliary_data()
     
+    if liabilities_df is None or rates_df is None:
+        print("✗ Could not load auxiliary data.")
+        return pd.DataFrame()
+    
     # Merge with liabilities and rates
-    df = df.merge(liabilities_df, on=['gvkey', 'month_year'], how='left')
-    df = df.merge(rates_df, on='month_year', how='left')
+    df = pd.merge(df, liabilities_df, on=['gvkey', 'fyear'], how='left')
+    df['month_year'] = df['date'].dt.strftime('%Y-%m')
+    df = pd.merge(df, rates_df, on='month_year', how='left')
     
-    # Use asset_volatility (normal returns volatility)
-    df['model_volatility'] = df['asset_volatility']
+    # Fill missing rates (modern pandas syntax)
+    df['risk_free_rate'] = df.groupby('gvkey')['risk_free_rate'].transform(
+        lambda x: x.ffill().bfill()
+    )
+    df['risk_free_rate'] = df['risk_free_rate'].fillna(0.05)
     
-    # Calculate PD
-    time_horizon = 1.0
-    df = df.dropna(subset=['liabilities_total', 'risk_free_rate', 'model_volatility'])
+    # Use asset_volatility (normal returns volatility, annualized)
+    df_clean = df.dropna(subset=['asset_value', 'liabilities_total', 'asset_volatility', 'risk_free_rate'])
+    df_clean = df_clean[(df_clean['asset_value'] > 0) & (df_clean['liabilities_total'] > 0)]
     
-    df['log_asset_debt_ratio'] = np.log(df['asset_value'] / df['liabilities_total'])
-    vol = df['model_volatility']
-    rf = df['risk_free_rate']
+    # Merton PD calculation
+    V_A = df_clean['asset_value'].values
+    B = df_clean['liabilities_total'].values * 1_000_000
+    sigma_A = df_clean['asset_volatility'].values
+    r = df_clean['risk_free_rate'].values
+    T = 1.0
     
-    numerator = (df['log_asset_debt_ratio'] + (rf - 0.5 * vol**2) * time_horizon)
-    denominator = vol * np.sqrt(time_horizon)
-    df['d2'] = numerator / denominator
-    df['merton_pd'] = norm.cdf(-df['d2'])
-    df['merton_pd'] = df['merton_pd'].clip(0, 1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        d2 = (np.log(V_A / B) + (r - 0.5 * sigma_A**2) * T) / (sigma_A * np.sqrt(T))
+        df_clean['pd_merton_normal'] = norm.cdf(-d2)
+        df_clean['pd_merton_normal'] = df_clean['pd_merton_normal'].clip(0, 1)
     
-    # Return key columns
-    return df[['gvkey', 'month_year', 'asset_value', 'liabilities_total', 'merton_pd', 'd2', 'model_volatility']]
+    print(f"✓ Merton PD (Normal): Calculated for {len(df_clean):,} observations")
+    
+    return df_clean[['gvkey', 'date', 'asset_value', 'liabilities_total', 
+                      'asset_volatility', 'pd_merton_normal']]

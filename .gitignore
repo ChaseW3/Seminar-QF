@@ -10,3 +10,12 @@ venv/
 *.txt
 *.csv
 *.csv
+# outputs / data
+output*.png
+*.png
+*.csv
+
+# python env / caches
+.venv/
+__pycache__/
+.ipynb_checkpoints/

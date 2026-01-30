@@ -38,59 +38,61 @@ print("Saved 'daily_asset_returns_with_garch.csv'")
 
 #%%
 # 4. Run Regime Switching Model (Hamilton Filter)
-final_monthly_returns_rs = run_regime_switching_estimation(daily_returns_df)
+final_daily_returns_rs = run_regime_switching_estimation(daily_returns_df)
 
 # Save Regime Switching Results
-final_monthly_returns_rs.to_csv("monthly_asset_returns_with_regime.csv", index=False)
-print("Saved 'monthly_asset_returns_with_regime.csv'")
+final_daily_returns_rs.to_csv("daily_asset_returns_with_regime.csv", index=False)
+print("Saved 'daily_asset_returns_with_regime.csv'")
 
-#%%
+#%
 # 5. Run MS-GARCH (Markov Switching GARCH)
-final_monthly_returns_msgarch = run_ms_garch_estimation(daily_returns_df)
+final_daily_returns_msgarch = run_ms_garch_estimation(daily_returns_df)
 
 # Save MS-GARCH Results
-final_monthly_returns_msgarch.to_csv("monthly_asset_returns_with_msgarch.csv", index=False)
-print("Saved 'monthly_asset_returns_with_msgarch.csv'")
+final_daily_returns_msgarch.to_csv("daily_asset_returns_with_msgarch.csv", index=False)
+print("Saved 'daily_asset_returns_with_msgarch.csv'")
 
 #%%
 # 6. Calculate Probability of Default (using MS-GARCH volatility)
-pd_results = run_pd_pipeline('monthly_asset_returns_with_garch.csv', 'monthly_asset_returns_with_regime.csv', 'monthly_asset_returns_with_msgarch.csv')
+pd_results = run_pd_pipeline('daily_asset_returns_with_garch.csv', 
+                             'daily_asset_returns_with_regime.csv', 
+                             'daily_asset_returns_with_msgarch.csv')
 
 # Save PD Results
-pd_results.to_csv("monthly_pd_results.csv", index=False)
-print("Saved 'monthly_pd_results.csv'")
+pd_results.to_csv("daily_pd_results.csv", index=False)
+print("Saved 'daily_pd_results.csv'")
 
 #%%
 # 6b. Calculate Probability of Default (Merton Model with Normal Returns - Benchmark)
 from probability_of_default import calculate_merton_pd_normal
 
-merton_normal_pd = calculate_merton_pd_normal('monthly_asset_returns.csv')
-merton_normal_pd.to_csv("monthly_pd_results_merton_normal.csv", index=False)
-print("Saved 'monthly_pd_results_merton_normal.csv'")
+merton_normal_pd = calculate_merton_pd_normal('daily_asset_returns.csv')
+merton_normal_pd.to_csv("daily_pd_results_merton_normal.csv", index=False)
+print("Saved 'daily_pd_results_merton_normal.csv'")
 
 #%%
 # 6c. Monte Carlo GARCH Volatility Forecast (1-year, single firm FIRST)
 from monte_carlo_garch import monte_carlo_garch_1year
 
 # Get first firm in dataset for testing
-garch_data = pd.read_csv('monthly_asset_returns_with_garch.csv')
+garch_data = pd.read_csv('daily_asset_returns_with_garch.csv')
 first_gvkey = garch_data[garch_data['garch_volatility'].notna()]['gvkey'].iloc[0]
 
 print(f"Testing with firm: {first_gvkey}")
 
-mc_results = monte_carlo_garch_1year('monthly_asset_returns_with_garch.csv', 
+mc_results = monte_carlo_garch_1year('daily_asset_returns_with_garch.csv', 
                                       gvkey_selected=first_gvkey,
                                       num_simulations=1000,
-                                      num_months=12)
+                                      num_days=252)
 
-mc_results.to_csv("monte_carlo_garch_results.csv", index=False)
-print("Saved 'monte_carlo_garch_results.csv'")
+mc_results.to_csv("daily_monte_carlo_garch_results.csv", index=False)
+print("Saved 'daily_monte_carlo_garch_results.csv'")
 
 # To run for ALL firms later, just change to:
-# mc_results = monte_carlo_garch_1year('monthly_asset_returns_with_garch.csv', 
+# mc_results = monte_carlo_garch_1year('daily_asset_returns_with_garch.csv', 
 #                                       gvkey_selected=None,
 #                                       num_simulations=1000,
-#                                       num_months=12)
+#                                       num_days=252)
 
 #%%
 # 7. Generate Summary and Plot
