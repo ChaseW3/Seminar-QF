@@ -71,28 +71,20 @@ merton_normal_pd.to_csv("daily_pd_results_merton_normal.csv", index=False)
 print("Saved 'daily_pd_results_merton_normal.csv'")
 
 #%%
-# 6c. Monte Carlo GARCH Volatility Forecast (1-year, single firm FIRST)
+# 6c. Monte Carlo GARCH Volatility Forecast (1-year, ALL FIRMS)
 from monte_carlo_garch import monte_carlo_garch_1year
 
-# Get first firm in dataset for testing
-garch_data = pd.read_csv('daily_asset_returns_with_garch.csv')
-first_gvkey = garch_data[garch_data['garch_volatility'].notna()]['gvkey'].iloc[0]
-
-print(f"Testing with firm: {first_gvkey}")
+print("\n" + "="*80)
+print("STEP 6c: MONTE CARLO GARCH VOLATILITY FORECASTS (ALL FIRMS)")
+print("="*80)
 
 mc_results = monte_carlo_garch_1year('daily_asset_returns_with_garch.csv', 
-                                      gvkey_selected=first_gvkey,
+                                      gvkey_selected=None,  # ALL firms
                                       num_simulations=1000,
                                       num_days=252)
 
 mc_results.to_csv("daily_monte_carlo_garch_results.csv", index=False)
 print("Saved 'daily_monte_carlo_garch_results.csv'")
-
-# To run for ALL firms later, just change to:
-# mc_results = monte_carlo_garch_1year('daily_asset_returns_with_garch.csv', 
-#                                       gvkey_selected=None,
-#                                       num_simulations=1000,
-#                                       num_days=252)
 
 #%%
 # 7. Generate Summary and Plot

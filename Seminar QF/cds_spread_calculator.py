@@ -370,21 +370,41 @@ class CDSSpreadCalculator:
         
         # Load Monte Carlo GARCH results
         df_mc_garch = pd.read_csv(mc_garch_file)
+        df_mc_garch['date'] = pd.to_datetime(df_mc_garch['date'])
         print(f"✓ Loaded Monte Carlo GARCH: {len(df_mc_garch):,} observations")
         print(f"  Columns: {list(df_mc_garch.columns)}\n")
         
-        # Identify the volatility column in MC GARCH file
-        volatility_cols = [col for col in df_mc_garch.columns if 'volatility' in col.lower() or 'vol' in col.lower()]
-        if not volatility_cols:
-            raise ValueError(f"No volatility column found. Available columns: {list(df_mc_garch.columns)}")
+        # Prefer the most appropriate volatility column (cumulative over forecast period)
+        preferred = [
+            'mc_garch_cumulative_volatility',  # ← FIRST priority: cumulative
+            'mc_garch_volatility_forecast',
+            'mc_garch_mean_daily_volatility',
+            'mc_garch_mean_volatility',
+            'mc_garch_volatility',
+            'mc_garch_mean_vol',
+        ]
+        volatility_cols = [c for c in df_mc_garch.columns if ('volatility' in c.lower() or 'vol' in c.lower())]
+        chosen = None
+        for p in preferred:
+            if p in df_mc_garch.columns:
+                chosen = p
+                break
+        if chosen is None and volatility_cols:
+            # avoid choosing a 'cumulative' column if possible
+            non_cum = [c for c in volatility_cols if 'cumul' not in c.lower()]
+            chosen = non_cum[0] if non_cum else volatility_cols[0]
         
-        volatility_column = volatility_cols[0]
-        print(f"✓ Using volatility column: '{volatility_column}'")
+        if not chosen:
+            raise ValueError(f"No volatility-like column found. Available columns: {list(df_mc_garch.columns)}")
         
-        # AGGREGATE: Group by gvkey and take MEAN across all simulations
-        df_mc_garch_agg = df_mc_garch.groupby('gvkey')[[volatility_column]].mean().reset_index()
-        df_mc_garch_agg.columns = ['gvkey', volatility_column]
-        print(f"✓ Aggregated to {len(df_mc_garch_agg):,} unique firms (mean across simulations)\n")
+        volatility_column = chosen
+        print(f"✓ Using volatility column: '{volatility_column}' (cumulative volatility over 252-day forecast)\n")
+        
+        # --- DO NOT AGGREGATE ACROSS DATES ---
+        # Keep per-(gvkey,date) forecast and merge on both keys below.
+        # If the MC file contains multiple simulation rows per (gvkey,date), take the mean per (gvkey,date).
+        df_mc_garch_daily = df_mc_garch.groupby(['gvkey', 'date'])[[volatility_column]].mean().reset_index()
+        print(f"✓ Aggregated MC simulations to {len(df_mc_garch_daily):,} unique (gvkey,date) forecast rows\n")
         
         # Load daily returns with asset values
         df_daily_returns = pd.read_csv(daily_returns_file)
@@ -396,26 +416,31 @@ class CDSSpreadCalculator:
         df_merton['date'] = pd.to_datetime(df_merton['date'])
         print(f"✓ Loaded Merton data: {len(df_merton):,} observations\n")
         
-        # Merge all data
+        # Merge all data on gvkey + date so MC forecast is date-specific
         df_merged = pd.merge(df_daily_returns, df_merton[['gvkey', 'date', 'liabilities_total']], 
                              on=['gvkey', 'date'], how='left')
-        df_merged = pd.merge(df_merged, df_mc_garch_agg[['gvkey', volatility_column]], 
-                             on=['gvkey'], how='left')
+        df_merged = pd.merge(df_merged, df_mc_garch_daily[['gvkey', 'date', volatility_column]], 
+                             on=['gvkey', 'date'], how='left')
         
         initial_rows = len(df_merged)
         df_merged = df_merged.dropna(subset=[volatility_column, 'liabilities_total', 'asset_value'])
         final_rows = len(df_merged)
         
         print(f"✓ Merged data: {initial_rows:,} → {final_rows:,} valid observations\n")
-        print("Calculating CDS spreads (mean volatility only)...\n")
+        print("Calculating CDS spreads (date-specific mean volatility)...\n")
         
         # Extract needed columns
         V_t = df_merged['asset_value'].values
         K = df_merged['liabilities_total'].values * 1_000_000
-        sigma_V = df_merged[volatility_column].values
+        sigma_cumulative = df_merged[volatility_column].values
+        # Cumulative volatility is already the sum; normalize to daily equivalent for Black-Scholes
+        # sigma_V should be annualized daily volatility
+        sigma_V = sigma_cumulative / np.sqrt(252.0)  # Convert cumulative to annualized daily vol
         r_t = 0.05  # risk-free rate
         
-        # Calculate spreads for each maturity
+        print(f"✓ Converted cumulative volatility to annualized daily volatility (÷√252)\n")
+        
+        # Calculate spreads for each maturity (vectorized)
         results_data = {'gvkey': df_merged['gvkey'].values, 
                         'date': df_merged['date'].values}
         

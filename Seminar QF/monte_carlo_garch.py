@@ -2,212 +2,196 @@
 
 import pandas as pd
 import numpy as np
-import time
+import os
 from datetime import timedelta
 import numba
-import os
 
-# Create cache directory if it doesn't exist
 os.makedirs('./intermediates/', exist_ok=True)
 
+
 @numba.jit(nopython=True, parallel=True)
-def mc_garch_vectorized(omega, alpha, beta, sigma_0, num_simulations, num_days, random_seed):
+def simulate_garch_paths_vectorized_daily(omega, alpha, beta, sigma_t, returns, 
+                                          num_simulations, num_days, num_firms):
     """
-    Vectorized GARCH(1,1) Monte Carlo using Numba JIT compilation.
-    
-    This is ~100x faster than nested loops.
-    Uses numba's parallel=True for additional speedup on multi-core.
-    """
-    np.random.seed(random_seed)
-    
-    # Generate ALL random shocks at once (not in loop)
-    shocks = np.random.normal(0, 1, (num_simulations, num_days))
-    
-    # Initialize volatility paths
-    paths = np.zeros((num_simulations, num_days + 1))
-    paths[:, 0] = sigma_0
-    
-    # Vectorized GARCH recursion
-    for day in range(1, num_days + 1):
-        prev_vols = paths[:, day - 1]
-        prev_vols_sq = prev_vols ** 2
-        
-        # Random return: shock * previous volatility
-        returns = shocks[:, day - 1] * prev_vols
-        returns_sq = returns ** 2
-        
-        # GARCH(1,1): h_t = omega + alpha * r_{t-1}^2 + beta * h_{t-1}
-        variances = omega + alpha * returns_sq + beta * prev_vols_sq
-        variances = np.maximum(variances, 1e-6)  # Ensure non-negative
-        
-        paths[:, day] = np.sqrt(variances)
-    
-    return paths
-
-
-def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=1000, num_days=252, random_seed=42):
-    """
-    Monte Carlo simulation for 1-year GARCH(1,1) volatility paths (OPTIMIZED).
-    
-    Parameters:
-    - garch_file: CSV with GARCH results (daily)
-    - gvkey_selected: Single firm or list of firms. If None, process all firms.
-    - num_simulations: Number of paths per starting date (default 1000)
-    - num_days: Forecast horizon in days (default 252 = 1 year)
-    - random_seed: Seed for reproducibility
+    Vectorized GARCH Monte Carlo simulation that returns volatility for EACH day.
     
     Returns:
-    - DataFrame with simulation results for each (gvkey, start_date) combination
+    --------
+    daily_volatilities : array, shape (num_days, num_simulations, num_firms)
+        Volatility for each day, each simulation, and each firm
     """
     
-    overall_start = time.time()
+    daily_volatilities = np.zeros((num_days, num_simulations, num_firms))
+    
+    for sim in numba.prange(num_simulations):
+        sigma = sigma_t.copy()
+        
+        for day in range(num_days):
+            z = np.random.standard_normal(num_firms)
+            r = sigma * z
+            sigma_squared = omega + alpha * (r ** 2) + beta * (sigma ** 2)
+            sigma = np.sqrt(np.maximum(sigma_squared, 1e-6))
+            
+            # Store volatility for this day and simulation
+            daily_volatilities[day, sim, :] = sigma
+    
+    return daily_volatilities
+
+
+def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=1000, num_days=252):
+    """
+    Run Monte Carlo GARCH forecast for 1 year (252 trading days).
+    
+    For each trading day and firm:
+    1. Run 1,000 simulations
+    2. Calculate mean volatility across simulations for each day
+    3. Sum the mean volatilities over the 252-day window
+    
+    Returns one row per firm per date with cumulative volatility over the rolling window.
+    """
+    
+    start_time = pd.Timestamp.now()
     
     print(f"\n{'='*80}")
-    print(f"Monte Carlo GARCH(1,1) Simulation (Vectorized, Daily Data)")
-    print(f"{'='*80}")
-    print(f"Simulations per date: {num_simulations:,}")
-    print(f"Forecast horizon: {num_days} days")
-    print(f"Random seed: {random_seed}")
-    print(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    
-    # Load GARCH data
-    print("Loading GARCH data...")
-    load_start = time.time()
-    df = pd.read_csv(garch_file)
-    df['date'] = pd.to_datetime(df['date'])
-    load_time = time.time() - load_start
-    print(f"✓ Loaded {len(df):,} rows in {load_time:.2f}s")
-    
-    # Filter to rows with complete GARCH parameters
-    print("Filtering complete GARCH parameters...")
-    df_complete = df.dropna(subset=['garch_volatility', 'garch_omega', 'garch_alpha', 'garch_beta']).copy()
-    
-    if df_complete.empty:
-        print("✗ No complete GARCH data found.")
-        return pd.DataFrame()
-    
-    print(f"✓ {len(df_complete):,} rows with complete parameters\n")
-    
-    # Handle firm selection (can be single gvkey or list)
-    if gvkey_selected is not None:
-        if isinstance(gvkey_selected, list):
-            df_complete = df_complete[df_complete['gvkey'].isin(gvkey_selected)]
-            print(f"Processing selected firms: {gvkey_selected}")
-        else:
-            df_complete = df_complete[df_complete['gvkey'] == gvkey_selected]
-            print(f"Processing selected firm: {gvkey_selected}")
-    
-    firms = sorted(df_complete['gvkey'].unique())
-    print(f"Number of firms to process: {len(firms)}\n")
-    
-    all_results = []
-    total_sims_run = 0
-    
-    # Loop through each firm
-    for firm_idx, gvkey in enumerate(firms):
-        firm_start = time.time()
-        firm_data = df_complete[df_complete['gvkey'] == gvkey].copy()
-        firm_data = firm_data.sort_values('date')
-        
-        num_dates = len(firm_data)
-        print(f"\n{'─'*80}")
-        print(f"Firm {firm_idx + 1}/{len(firms)}: gvkey={gvkey}")
-        print(f"  Daily observations: {num_dates:,}")
-        print(f"  Expected simulations: {num_dates * num_simulations:,}")
-        print(f"{'─'*80}")
-        
-        firm_sims = 0
-        firm_results_batch = []
-        
-        # Process each daily date for this firm
-        for date_idx, (idx, row) in enumerate(firm_data.iterrows()):
-            start_date = row['date']
-            start_vol = row['garch_volatility']
-            omega = row['garch_omega']
-            alpha = row['garch_alpha']
-            beta = row['garch_beta']
-            
-            # CALL VECTORIZED NUMBA FUNCTION
-            volatility_paths = mc_garch_vectorized(
-                omega=omega,
-                alpha=alpha,
-                beta=beta,
-                sigma_0=start_vol,
-                num_simulations=num_simulations,
-                num_days=num_days,
-                random_seed=random_seed + date_idx  # Different seed per date
-            )
-            
-            firm_sims += num_simulations
-            total_sims_run += num_simulations
-            
-            # Extract final volatilities and annualize
-            final_vols_daily = volatility_paths[:, num_days]
-            final_vols_annualized = final_vols_daily * np.sqrt(252)
-            
-            # Compute statistics
-            mean_final_vol = final_vols_annualized.mean()
-            std_final_vol = final_vols_annualized.std()
-            percentile_5 = np.percentile(final_vols_annualized, 5)
-            percentile_95 = np.percentile(final_vols_annualized, 95)
-            
-            # Batch append (faster than appending to all_results each time)
-            firm_results_batch.append({
-                'gvkey': gvkey,
-                'start_date': start_date,
-                'end_date': start_date + pd.DateOffset(days=num_days),
-                'initial_volatility_daily': start_vol,
-                'initial_volatility_annualized': start_vol * np.sqrt(252),
-                'garch_omega': omega,
-                'garch_alpha': alpha,
-                'garch_beta': beta,
-                'mean_final_volatility_annualized': mean_final_vol,
-                'std_final_volatility_annualized': std_final_vol,
-                'percentile_5_annualized': percentile_5,
-                'percentile_95_annualized': percentile_95,
-                'num_simulations': num_simulations
-            })
-            
-            # Progress update every 50 dates
-            if (date_idx + 1) % 50 == 0 or date_idx == num_dates - 1:
-                pct_complete = ((date_idx + 1) / num_dates) * 100
-                print(f"  Progress: {date_idx + 1:,}/{num_dates:,} dates ({pct_complete:.1f}%) | "
-                      f"Sims: {firm_sims:,}")
-        
-        # Add all firm results at once (batch append is faster)
-        all_results.extend(firm_results_batch)
-        
-        firm_time = time.time() - firm_start
-        sims_per_second = firm_sims / firm_time if firm_time > 0 else 0
-        print(f"\n✓ Firm {firm_idx + 1} complete:")
-        print(f"    Total simulations: {firm_sims:,}")
-        print(f"    Time elapsed: {timedelta(seconds=int(firm_time))}")
-        print(f"    Speed: {sims_per_second:,.0f} sims/second")
-    
-    results_df = pd.DataFrame(all_results)
-    
-    # Final summary
-    overall_time = time.time() - overall_start
-    
-    print(f"\n{'='*80}")
-    print(f"Monte Carlo Simulation Complete")
-    print(f"{'='*80}")
-    print(f"Total simulations run: {total_sims_run:,}")
-    print(f"Total time: {timedelta(seconds=int(overall_time))}")
-    print(f"Average speed: {total_sims_run / overall_time:,.0f} sims/second")
-    print(f"\nResults Summary:")
-    print(f"  Total result rows: {len(results_df):,}")
-    print(f"  Firms processed: {results_df['gvkey'].nunique()}")
-    
-    if len(results_df) > 0:
-        print(f"  Date range: {results_df['start_date'].min().strftime('%Y-%m-%d')} to {results_df['start_date'].max().strftime('%Y-%m-%d')}")
-        print(f"  Mean 252D volatility: {results_df['mean_final_volatility_annualized'].min():.4f} - {results_df['mean_final_volatility_annualized'].max():.4f}")
-    
+    print("MONTE CARLO GARCH 1-YEAR CUMULATIVE VOLATILITY FORECAST")
     print(f"{'='*80}\n")
     
-    # Cache results
-    cache_file = './intermediates/mc_garch_cache.csv'
-    results_df.to_csv(cache_file, index=False)
-    print(f"✓ Cached results to: {cache_file}\n")
+    # Load GARCH results
+    df_garch = pd.read_csv(garch_file)
+    df_garch['date'] = pd.to_datetime(df_garch['date'])
+    df_garch = df_garch.sort_values(['gvkey', 'date']).reset_index(drop=True)
+    
+    print(f"✓ Loaded {len(df_garch):,} total observations")
+    
+    # Get unique dates and firms
+    unique_dates = sorted(df_garch['date'].unique())
+    firm_list = sorted(df_garch['gvkey'].unique())
+    
+    num_dates = len(unique_dates)
+    num_firms = len(firm_list)
+    
+    print(f"✓ Unique dates: {num_dates}")
+    print(f"✓ Unique firms: {num_firms}")
+    print(f"✓ Date range: {unique_dates[0].strftime('%Y-%m-%d')} to {unique_dates[-1].strftime('%Y-%m-%d')}")
+    print(f"✓ Expected output rows: ~{num_dates * num_firms:,}\n")
+    
+    if gvkey_selected is not None:
+        firm_list = [gvkey_selected]
+        df_garch = df_garch[df_garch['gvkey'] == gvkey_selected]
+        num_firms = 1
+        print(f"⚠ Filtering to single firm: {gvkey_selected}\n")
+    
+    results_list = []
+    dates_processed = 0
+    rows_created = 0
+    
+    # Process each date
+    for date_idx, date in enumerate(unique_dates):
+        # Progress reporting every 10%
+        if date_idx % max(1, num_dates // 10) == 0:
+            print(f"Progress: {date_idx + 1}/{num_dates} ({date.strftime('%Y-%m-%d')})")
+        
+        # Get GARCH parameters for this date
+        df_date = df_garch[df_garch['date'] == date]
+        
+        if len(df_date) == 0:
+            continue
+        
+        # Get all firms that have data on this date
+        firms_on_date = df_date['gvkey'].unique()
+        
+        # Prepare arrays for vectorized simulation
+        garch_params = {}
+        for firm in firms_on_date:
+            firm_data = df_date[df_date['gvkey'] == firm].iloc[0]
+            garch_params[firm] = {
+                'omega': max(firm_data.get('garch_omega', 1e-6), 1e-8),
+                'alpha': max(firm_data.get('garch_alpha', 0.05), 1e-4),
+                'beta': max(firm_data.get('garch_beta', 0.93), 0.0),
+                'sigma': max(firm_data.get('garch_volatility', 0.2), 1e-4),
+                'return': firm_data.get('return', 0.0)
+            }
+        
+        # Reorder firms consistently
+        firms_on_date = sorted(list(firms_on_date))
+        
+        # Prepare arrays
+        omega_arr = np.array([garch_params[f]['omega'] for f in firms_on_date])
+        alpha_arr = np.array([garch_params[f]['alpha'] for f in firms_on_date])
+        beta_arr = np.array([garch_params[f]['beta'] for f in firms_on_date])
+        sigma_arr = np.array([garch_params[f]['sigma'] for f in firms_on_date])
+        returns_arr = np.array([garch_params[f]['return'] for f in firms_on_date])
+        
+        # Run vectorized Monte Carlo simulation (returns daily volatilities)
+        daily_vols = simulate_garch_paths_vectorized_daily(
+            omega_arr, alpha_arr, beta_arr, sigma_arr, returns_arr,
+            num_simulations, num_days, len(firms_on_date)
+        )
+        
+        # For each firm, calculate:
+        # 1. Mean volatility path (mean across simulations for each day)
+        # 2. Sum of mean volatilities over 252 days
+        for firm_idx, firm in enumerate(firms_on_date):
+            # daily_vols shape: (num_days, num_simulations, num_firms)
+            # Get volatilities for this firm across all days and simulations
+            firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
+            
+            # Calculate mean volatility for each day (across simulations)
+            mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
+            
+            # Calculate sum of mean volatilities over the year
+            cumulative_volatility = np.sum(mean_path)
+            
+            # Also store other statistics
+            results_list.append({
+                'gvkey': firm,
+                'date': date,
+                'mc_garch_cumulative_volatility': cumulative_volatility,
+                'mc_garch_mean_daily_volatility': np.mean(mean_path),
+                'mc_garch_std_daily_volatility': np.std(mean_path),
+                'mc_garch_min_daily_volatility': np.min(mean_path),
+                'mc_garch_max_daily_volatility': np.max(mean_path),
+                'mc_garch_volatility_forecast': np.mean(mean_path)  # For CDS (mean daily vol)
+            })
+            rows_created += 1
+        
+        dates_processed += 1
+    
+    results_df = pd.DataFrame(results_list)
+    
+    print(f"\n{'='*80}")
+    print("MONTE CARLO FORECAST COMPLETE")
+    print(f"{'='*80}\n")
+    
+    print(f"Dates processed: {dates_processed:,}")
+    print(f"Rows created: {rows_created:,}")
+    print(f"Total output rows: {len(results_df):,}")
+    print(f"Unique firms: {results_df['gvkey'].nunique()}")
+    print(f"Unique dates: {results_df['date'].nunique()}")
+    print(f"Date range: {results_df['date'].min().strftime('%Y-%m-%d')} to {results_df['date'].max().strftime('%Y-%m-%d')}")
+    
+    # Year-wise breakdown
+    results_df['year'] = results_df['date'].dt.year
+    print(f"\nRows per year:")
+    for year in sorted(results_df['year'].unique()):
+        year_count = len(results_df[results_df['year'] == year])
+        print(f"  {year}: {year_count:,} rows")
+    print()
+    
+    # Sample statistics
+    print(f"Sample statistics (first 3 firms):")
+    for firm in results_df['gvkey'].unique()[:3]:
+        firm_data = results_df[results_df['gvkey'] == firm]
+        print(f"  Firm {firm}: {len(firm_data):,} trading days")
+        print(f"    Cumulative vol: {firm_data['mc_garch_cumulative_volatility'].mean():.4f} ± {firm_data['mc_garch_cumulative_volatility'].std():.4f}")
+        print(f"    Mean daily vol: {firm_data['mc_garch_mean_daily_volatility'].mean():.6f} ± {firm_data['mc_garch_mean_daily_volatility'].std():.6f}")
+        print(f"    Range:          [{firm_data['mc_garch_cumulative_volatility'].min():.4f}, {firm_data['mc_garch_cumulative_volatility'].max():.4f}]")
+    
+    total_time = (pd.Timestamp.now() - start_time).total_seconds()
+    
+    print(f"\n{'='*80}")
+    print(f"Total time: {timedelta(seconds=int(total_time))}")
+    print(f"Rows per second: {len(results_df) / total_time:.0f}")
+    print(f"{'='*80}\n")
     
     return results_df
