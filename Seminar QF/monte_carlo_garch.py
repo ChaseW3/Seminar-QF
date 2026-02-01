@@ -5,6 +5,8 @@ import numpy as np
 import os
 from datetime import timedelta
 import numba
+from scipy import stats
+from joblib import Parallel, delayed
 
 os.makedirs('./intermediates/', exist_ok=True)
 
@@ -14,6 +16,7 @@ def simulate_garch_paths_vectorized_daily(omega, alpha, beta, sigma_t, returns,
                                           num_simulations, num_days, num_firms):
     """
     Vectorized GARCH Monte Carlo simulation that returns volatility for EACH day.
+    Uses standard normal innovations (legacy function for compatibility).
     
     Returns:
     --------
@@ -33,6 +36,53 @@ def simulate_garch_paths_vectorized_daily(omega, alpha, beta, sigma_t, returns,
             sigma = np.sqrt(np.maximum(sigma_squared, 1e-6))
             
             # Store volatility for this day and simulation
+            daily_volatilities[day, sim, :] = sigma
+    
+    return daily_volatilities
+
+
+def simulate_garch_paths_t_dist(omega, alpha, beta, sigma_t, nu, 
+                                num_simulations, num_days, num_firms):
+    """
+    GARCH Monte Carlo simulation with Student's t distributed innovations.
+    Non-numba version to support scipy distributions.
+    
+    Parameters:
+    -----------
+    omega, alpha, beta : arrays of GARCH parameters per firm
+    sigma_t : array of initial volatilities per firm
+    nu : array of degrees of freedom per firm (from t-GARCH estimation)
+    num_simulations : number of Monte Carlo paths
+    num_days : forecast horizon in days
+    num_firms : number of firms
+    
+    Returns:
+    --------
+    daily_volatilities : array, shape (num_days, num_simulations, num_firms)
+    """
+    
+    daily_volatilities = np.zeros((num_days, num_simulations, num_firms))
+    
+    for sim in range(num_simulations):
+        sigma = sigma_t.copy()
+        
+        for day in range(num_days):
+            # Generate t-distributed innovations for each firm
+            # Standardize so variance = 1: t(nu) has variance nu/(nu-2)
+            z = np.zeros(num_firms)
+            for f in range(num_firms):
+                if nu[f] > 2:
+                    # t-distribution with standardization
+                    scale = np.sqrt((nu[f] - 2) / nu[f])
+                    z[f] = stats.t.rvs(df=nu[f]) * scale
+                else:
+                    # Fallback to normal if nu <= 2 (infinite variance)
+                    z[f] = np.random.standard_normal()
+            
+            r = sigma * z
+            sigma_squared = omega + alpha * (r ** 2) + beta * (sigma ** 2)
+            sigma = np.sqrt(np.maximum(sigma_squared, 1e-6))
+            
             daily_volatilities[day, sim, :] = sigma
     
     return daily_volatilities
@@ -109,7 +159,8 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
                 'alpha': max(firm_data.get('garch_alpha', 0.05), 1e-4),
                 'beta': max(firm_data.get('garch_beta', 0.93), 0.0),
                 'sigma': max(firm_data.get('garch_volatility', 0.2), 1e-4),
-                'return': firm_data.get('return', 0.0)
+                'return': firm_data.get('return', 0.0),
+                'nu': firm_data.get('garch_nu', 30.0)  # Degrees of freedom for t-dist
             }
         
         # Reorder firms consistently
@@ -120,11 +171,11 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
         alpha_arr = np.array([garch_params[f]['alpha'] for f in firms_on_date])
         beta_arr = np.array([garch_params[f]['beta'] for f in firms_on_date])
         sigma_arr = np.array([garch_params[f]['sigma'] for f in firms_on_date])
-        returns_arr = np.array([garch_params[f]['return'] for f in firms_on_date])
+        nu_arr = np.array([garch_params[f]['nu'] for f in firms_on_date])
         
-        # Run vectorized Monte Carlo simulation (returns daily volatilities)
-        daily_vols = simulate_garch_paths_vectorized_daily(
-            omega_arr, alpha_arr, beta_arr, sigma_arr, returns_arr,
+        # Run Monte Carlo simulation with t-distribution innovations
+        daily_vols = simulate_garch_paths_t_dist(
+            omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr,
             num_simulations, num_days, len(firms_on_date)
         )
         
@@ -197,6 +248,159 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
     print(f"\n{'='*80}")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
     print(f"Rows per second: {len(results_df) / total_time:.0f}")
+    print(f"{'='*80}\n")
+    
+    return results_df
+
+
+def _process_single_date_garch_mc(date_data, num_simulations, num_days):
+    """
+    Process Monte Carlo GARCH simulation for a single date (for parallelization).
+    
+    Parameters:
+    -----------
+    date_data : tuple
+        (date, df_date) where df_date contains firms data for that date
+    num_simulations : int
+        Number of Monte Carlo paths
+    num_days : int
+        Forecast horizon in days
+        
+    Returns:
+    --------
+    list : Results for all firms on this date
+    """
+    date, df_date = date_data
+    results_list = []
+    
+    if df_date.empty:
+        return results_list
+    
+    firms_on_date = df_date['gvkey'].unique()
+    
+    # Prepare arrays for vectorized simulation
+    garch_params = {}
+    for firm in firms_on_date:
+        firm_data = df_date[df_date['gvkey'] == firm].iloc[0]
+        garch_params[firm] = {
+            'omega': max(firm_data.get('garch_omega', 1e-6), 1e-8),
+            'alpha': max(firm_data.get('garch_alpha', 0.05), 1e-4),
+            'beta': max(firm_data.get('garch_beta', 0.93), 0.0),
+            'sigma': max(firm_data.get('garch_volatility', 0.2), 1e-4),
+            'return': firm_data.get('return', 0.0),
+            'nu': firm_data.get('garch_nu', 30.0)  # Degrees of freedom for t-dist
+        }
+    
+    # Reorder firms consistently
+    firms_on_date = sorted(list(firms_on_date))
+    
+    # Prepare arrays
+    omega_arr = np.array([garch_params[f]['omega'] for f in firms_on_date])
+    alpha_arr = np.array([garch_params[f]['alpha'] for f in firms_on_date])
+    beta_arr = np.array([garch_params[f]['beta'] for f in firms_on_date])
+    sigma_arr = np.array([garch_params[f]['sigma'] for f in firms_on_date])
+    nu_arr = np.array([garch_params[f]['nu'] for f in firms_on_date])
+    
+    # Run Monte Carlo simulation with t-distribution innovations
+    daily_vols = simulate_garch_paths_t_dist(
+        omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr,
+        num_simulations, num_days, len(firms_on_date)
+    )
+    
+    # For each firm, calculate statistics
+    for firm_idx, firm in enumerate(firms_on_date):
+        firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
+        mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
+        cumulative_volatility = np.sum(mean_path)
+        
+        results_list.append({
+            'gvkey': firm,
+            'date': date,
+            'mc_garch_cumulative_volatility': cumulative_volatility,
+            'mc_garch_mean_daily_volatility': np.mean(mean_path),
+            'mc_garch_std_daily_volatility': np.std(mean_path),
+            'mc_garch_max_daily_volatility': np.max(mean_path),
+            'mc_garch_min_daily_volatility': np.min(mean_path),
+            'mc_garch_p95_daily_volatility': np.percentile(mean_path, 95),
+            'mc_garch_p05_daily_volatility': np.percentile(mean_path, 5)
+        })
+    
+    return results_list
+
+
+def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simulations=1000, num_days=252, n_jobs=-1):
+    """
+    Parallelized Monte Carlo GARCH forecast for 1 year (252 trading days).
+    
+    This version processes different dates in parallel for significant speedup.
+    
+    Parameters:
+    -----------
+    garch_file : str
+        CSV file with GARCH parameters and volatilities
+    gvkey_selected : list or None
+        List of gvkeys to process, or None for all firms
+    num_simulations : int
+        Number of Monte Carlo paths per firm per date
+    num_days : int
+        Forecast horizon in trading days (252 = 1 year)
+    n_jobs : int
+        Number of parallel jobs (-1 = use all cores)
+        
+    Returns:
+    --------
+    pd.DataFrame
+        Results with Monte Carlo volatility statistics per firm per date
+    """
+    print(f"Loading GARCH data from {garch_file}...")
+    df = pd.read_csv(garch_file)
+    
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+    
+    # Filter firms if specified
+    if gvkey_selected is not None:
+        df = df[df['gvkey'].isin(gvkey_selected)]
+    
+    print(f"Running PARALLELIZED Monte Carlo GARCH simulation:")
+    print(f"  Firms: {df['gvkey'].nunique()}")
+    print(f"  Dates: {df['date'].nunique() if 'date' in df.columns else 1}")
+    print(f"  Simulations per firm: {num_simulations:,}")
+    print(f"  Forecast horizon: {num_days} days")
+    print(f"  Parallel jobs: {n_jobs}")
+    print(f"  Innovation distribution: Student's t")
+    
+    start_time = pd.Timestamp.now()
+    
+    # Prepare date groups for parallel processing
+    if 'date' in df.columns:
+        date_groups = [(date, group) for date, group in df.groupby('date')]
+    else:
+        # Single date case
+        date_groups = [(pd.Timestamp.now().date(), df)]
+    
+    print(f"\nProcessing {len(date_groups)} dates in parallel...")
+    
+    # Parallel processing across dates
+    results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
+        delayed(_process_single_date_garch_mc)(date_data, num_simulations, num_days) 
+        for date_data in date_groups
+    )
+    
+    # Flatten results
+    results_list = []
+    for date_results in results_nested:
+        results_list.extend(date_results)
+    
+    results_df = pd.DataFrame(results_list)
+    
+    total_time = (pd.Timestamp.now() - start_time).total_seconds()
+    
+    print(f"\n{'='*80}")
+    print(f"PARALLELIZED MONTE CARLO GARCH COMPLETE")
+    print(f"Total time: {timedelta(seconds=int(total_time))}")
+    print(f"Rows per second: {len(results_df) / total_time:.0f}")
+    print(f"Speedup: ~{n_jobs}x expected on {n_jobs}-core system")
     print(f"{'='*80}\n")
     
     return results_df
