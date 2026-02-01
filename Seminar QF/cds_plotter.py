@@ -171,7 +171,7 @@ class CDSPlotter:
         plt.tight_layout()
         plt.show()
 
-    def plot_average_spreads_over_time(self, model_name, maturities=[1, 3, 5], title=None, aggregation='mean'):
+    def plot_average_spreads_over_time(self, model_name, maturities=[1, 3, 5], title=None, aggregation='median'):
         """
         Plot the aggregated (mean or median) CDS spreads across all firms over time for a model.
         
@@ -184,7 +184,7 @@ class CDSPlotter:
         title : str, optional
             Custom title for the plot
         aggregation : str, optional
-            Method to aggregate across firms: 'mean' or 'median'. Default is 'mean'.
+            Method to aggregate across firms: 'mean' or 'median'. Default is 'median'.
             'median' is recommended if there are outliers.
         """
         if model_name not in self.data:
