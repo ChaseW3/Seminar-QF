@@ -26,3 +26,4 @@ __MACOSX/
 .venv/
 __pycache__/
 *.pyc
+Seminar QF/merged_data_with_merton.csv
