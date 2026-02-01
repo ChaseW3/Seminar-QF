@@ -19,3 +19,10 @@ output*.png
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+
+.DS_Store
+__MACOSX/
+
+.venv/
+__pycache__/
+*.pyc
