@@ -111,6 +111,29 @@ mc_results.to_csv("daily_monte_carlo_garch_results.csv", index=False)
 print("Saved 'daily_monte_carlo_garch_results.csv'")
 
 #%%
+# 6c.1 VOLATILITY DIAGNOSTICS - Identify problematic firms BEFORE CDS calculation
+from volatility_diagnostics import run_volatility_diagnostics
+
+print("\n" + "="*80)
+print("STEP 6c.1: VOLATILITY DIAGNOSTICS - IDENTIFYING PROBLEMATIC FIRMS")
+print("="*80)
+
+diagnostics_results = run_volatility_diagnostics(
+    garch_file='daily_asset_returns_with_garch.csv',
+    mc_garch_file='daily_monte_carlo_garch_results.csv',
+    output_dir='./diagnostics/'
+)
+
+# Store problematic firms for later use
+PROBLEMATIC_FIRMS = diagnostics_results['problematic_firms']
+CLEAN_FIRMS = diagnostics_results['clean_firms']
+
+print(f"\n⚠️  PROBLEMATIC FIRMS IDENTIFIED: {len(PROBLEMATIC_FIRMS)}")
+print(f"    These firms have extreme volatility and will distort CDS spread calculations.")
+print(f"    Review ./diagnostics/problematic_firms.csv for details.")
+print(f"✓  CLEAN FIRMS: {len(CLEAN_FIRMS)}")
+
+#%%
 # 6d. Monte Carlo Regime-Switching Volatility Forecast (1-year, ALL FIRMS)
 from monte_carlo_regime_switching import monte_carlo_regime_switching_1year
 
@@ -132,42 +155,64 @@ print("Saved 'daily_monte_carlo_regime_switching_results.csv'")
 #%%
 # 8. Calculate Model-Implied CDS Spreads (Section 2.4.2)
 from cds_spread_calculator import CDSSpreadCalculator
+from volatility_diagnostics import filter_problematic_firms
 
 cds_calc = CDSSpreadCalculator(maturity_horizons=[1, 3, 5])
 
-# 8a. CDS Spreads from GARCH Monte Carlo
+# 8a. CDS Spreads from GARCH Monte Carlo (ALL FIRMS - for comparison)
 print("\n" + "="*80)
-print("STEP 8a: CDS SPREADS FROM GARCH MONTE CARLO")
+print("STEP 8a: CDS SPREADS FROM GARCH MONTE CARLO (ALL FIRMS)")
 print("="*80)
 
-df_cds_spreads_garch = cds_calc.calculate_cds_spreads_from_mc_garch(
+df_cds_spreads_garch_all = cds_calc.calculate_cds_spreads_from_mc_garch(
     mc_garch_file='daily_monte_carlo_garch_results.csv',
     daily_returns_file='daily_asset_returns.csv',
     merton_file='merged_data_with_merton.csv',
-    output_file='cds_spreads_garch_mc.csv'
+    output_file='cds_spreads_garch_mc_all_firms.csv'
 )
-print("Saved CDS spreads to 'cds_spreads_garch_mc.csv'")
+print("Saved CDS spreads to 'cds_spreads_garch_mc_all_firms.csv'")
 
-# 8b. CDS Spreads from Regime-Switching Monte Carlo
+# 8a.1 CDS Spreads from GARCH Monte Carlo (CLEAN FIRMS ONLY)
 print("\n" + "="*80)
-print("STEP 8b: CDS SPREADS FROM REGIME-SWITCHING MONTE CARLO")
+print("STEP 8a.1: CDS SPREADS FROM GARCH MONTE CARLO (CLEAN FIRMS ONLY)")
 print("="*80)
 
-df_cds_spreads_rs = cds_calc.calculate_cds_spreads_from_mc_garch(
+# Filter to clean firms only
+df_cds_spreads_garch = filter_problematic_firms(df_cds_spreads_garch_all, PROBLEMATIC_FIRMS)
+df_cds_spreads_garch.to_csv('cds_spreads_garch_mc.csv', index=False)
+print("Saved CDS spreads to 'cds_spreads_garch_mc.csv' (clean firms only)")
+
+# 8b. CDS Spreads from Regime-Switching Monte Carlo (ALL FIRMS)
+print("\n" + "="*80)
+print("STEP 8b: CDS SPREADS FROM REGIME-SWITCHING MONTE CARLO (ALL FIRMS)")
+print("="*80)
+
+df_cds_spreads_rs_all = cds_calc.calculate_cds_spreads_from_mc_garch(
     mc_garch_file='daily_monte_carlo_regime_switching_results.csv',
     daily_returns_file='daily_asset_returns.csv',
     merton_file='merged_data_with_merton.csv',
-    output_file='cds_spreads_regime_switching_mc.csv'
+    output_file='cds_spreads_regime_switching_mc_all_firms.csv'
 )
-print("Saved CDS spreads to 'cds_spreads_regime_switching_mc.csv'")
+print("Saved CDS spreads to 'cds_spreads_regime_switching_mc_all_firms.csv'")
+
+# 8b.1 CDS Spreads from Regime-Switching Monte Carlo (CLEAN FIRMS ONLY)
+print("\n" + "="*80)
+print("STEP 8b.1: CDS SPREADS FROM REGIME-SWITCHING MC (CLEAN FIRMS ONLY)")
+print("="*80)
+
+df_cds_spreads_rs = filter_problematic_firms(df_cds_spreads_rs_all, PROBLEMATIC_FIRMS)
+df_cds_spreads_rs.to_csv('cds_spreads_regime_switching_mc.csv', index=False)
+print("Saved CDS spreads to 'cds_spreads_regime_switching_mc.csv' (clean firms only)")
 
 #%%
-# 9. Compare CDS Spreads: GARCH vs Regime-Switching
+# 9. Compare CDS Spreads: GARCH vs Regime-Switching (CLEAN FIRMS ONLY)
 print("\n" + "="*80)
-print("STEP 9: CDS SPREAD COMPARISON (GARCH vs REGIME-SWITCHING)")
+print("STEP 9: CDS SPREAD COMPARISON (GARCH vs REGIME-SWITCHING) - CLEAN FIRMS ONLY")
 print("="*80 + "\n")
 
-# Merge the two CDS spread datasets
+print(f"Note: Comparison excludes {len(PROBLEMATIC_FIRMS)} problematic firms with extreme volatility.\n")
+
+# Merge the two CDS spread datasets (clean firms only)
 df_cds_garch = pd.read_csv('cds_spreads_garch_mc.csv')
 df_cds_rs = pd.read_csv('cds_spreads_regime_switching_mc.csv')
 
@@ -227,6 +272,43 @@ firm_summary = df_comparison.groupby('gvkey').agg({
     'diff_5y_bps': 'mean'
 }).round(2)
 print(firm_summary.head(10))
+
+#%%
+# 10. FINAL SUMMARY - Problematic Firms Report
+print("\n" + "="*80)
+print("STEP 10: FINAL SUMMARY - PROBLEMATIC FIRMS REPORT")
+print("="*80 + "\n")
+
+print(f"ANALYSIS COMPLETE")
+print(f"-" * 40)
+print(f"Total firms in dataset: {len(PROBLEMATIC_FIRMS) + len(CLEAN_FIRMS)}")
+print(f"Problematic firms (excluded from final comparison): {len(PROBLEMATIC_FIRMS)}")
+print(f"Clean firms (used in final comparison): {len(CLEAN_FIRMS)}")
+
+if len(PROBLEMATIC_FIRMS) > 0:
+    print(f"\n⚠️  PROBLEMATIC FIRM GVKEYs:")
+    print(f"    {PROBLEMATIC_FIRMS}")
+    print(f"\n    These firms have extreme volatility estimates that cause unrealistic CDS spreads.")
+    print(f"    To investigate root causes, see:")
+    print(f"      - ./diagnostics/firm_volatility_diagnostics.csv (full firm-level analysis)")
+    print(f"      - ./diagnostics/problematic_firms.csv (detailed issue breakdown)")
+    print(f"      - ./diagnostics/diagnostics_summary.txt (summary report)")
+    
+    print(f"\n    Potential causes:")
+    print(f"      1. GARCH parameter instability (α + β ≈ 1, near-IGARCH)")
+    print(f"      2. Extreme return outliers in underlying data")
+    print(f"      3. Fat-tailed return distributions (high kurtosis)")
+    print(f"      4. Missing or insufficient data for GARCH estimation")
+else:
+    print(f"\n✓ No problematic firms detected - all firms have reasonable volatility estimates.")
+
+print(f"\nOUTPUT FILES:")
+print(f"  - cds_spreads_garch_mc.csv (clean firms only)")
+print(f"  - cds_spreads_regime_switching_mc.csv (clean firms only)")
+print(f"  - cds_spreads_garch_mc_all_firms.csv (includes problematic)")
+print(f"  - cds_spreads_regime_switching_mc_all_firms.csv (includes problematic)")
+print(f"  - cds_spreads_comparison.csv (clean firms comparison)")
+print(f"  - ./diagnostics/ (volatility diagnostics reports)")
 
 print("\n" + "="*80)
 print("PIPELINE COMPLETE")

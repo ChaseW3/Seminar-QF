@@ -433,6 +433,7 @@ class CDSSpreadCalculator:
         V_t = df_merged['asset_value'].values.astype(np.float64)
         K = df_merged['liabilities_total'].values.astype(np.float64) * 1_000_000
         sigma_cumulative = df_merged[volatility_column].values.astype(np.float64)
+        gvkeys = df_merged['gvkey'].values
         
         # CORRECT CONVERSION: 
         # mc_garch_cumulative_volatility = Σ σ_i over 252 days (sum of daily volatilities)
@@ -442,12 +443,6 @@ class CDSSpreadCalculator:
         # To get annualized volatility:
         #   Mean daily volatility = Σσ_i / 252
         #   Annualized volatility = mean_daily × √252 = (Σσ_i / 252) × √252 = Σσ_i / √252
-        #
-        # BUT: If daily vols are already around 0.01, cumulative would be ~2.5
-        # And annualized = 2.5 / 15.87 = 0.157 = 15.7% which is reasonable
-        #
-        # HOWEVER: Looking at the data, cumulative seems too high. Let's check if
-        # the Monte Carlo is outputting daily vols or something else.
         
         # First, let's see what the mean daily volatility would be
         mean_daily_vol = sigma_cumulative / 252
@@ -455,13 +450,18 @@ class CDSSpreadCalculator:
         # Annualized using standard formula
         sigma_V = mean_daily_vol * np.sqrt(252)
         
-        # Cap at reasonable values (max 100% annual vol = 1.0)
-        # This prevents extreme outliers from distorting results
-        sigma_V_capped = np.clip(sigma_V, 0.01, 1.0)
+        # NO CAPPING - Instead, identify and report problematic observations
+        n_extreme_high = np.sum(sigma_V > 1.0)
+        n_extreme_low = np.sum(sigma_V < 0.01)
         
-        # Count how many were capped
-        n_capped_high = np.sum(sigma_V > 1.0)
-        n_capped_low = np.sum(sigma_V < 0.01)
+        # Identify which firms have extreme volatility
+        extreme_high_mask = sigma_V > 1.0
+        if np.any(extreme_high_mask):
+            extreme_firms = np.unique(gvkeys[extreme_high_mask])
+            print(f"⚠️  WARNING: {len(extreme_firms)} firms have annualized volatility > 100%:")
+            print(f"    Firms: {extreme_firms.tolist()}")
+            print(f"    Total extreme observations: {n_extreme_high:,}")
+            print(f"    These firms should be investigated via volatility_diagnostics.py\n")
         
         print("VOLATILITY CONVERSION CHECK:")
         print(f"  Cumulative (Σσ_i over 252 days):")
@@ -473,21 +473,15 @@ class CDSSpreadCalculator:
         print(f"    Min: {mean_daily_vol.min():.6f}")
         print(f"    Max: {mean_daily_vol.max():.6f}")
         print(f"    Mean: {mean_daily_vol.mean():.6f}")
-        print(f"  Annualized BEFORE cap (mean_daily × √252):")
+        print(f"  Annualized volatility (mean_daily × √252):")
         print(f"    Min: {sigma_V.min():.4f} ({sigma_V.min()*100:.2f}%)")
         print(f"    Max: {sigma_V.max():.4f} ({sigma_V.max()*100:.2f}%)")
         print(f"    Mean: {sigma_V.mean():.4f} ({sigma_V.mean()*100:.2f}%)")
         print(f"    Median: {np.median(sigma_V):.4f} ({np.median(sigma_V)*100:.2f}%)")
-        print(f"  Annualized AFTER cap [0.01, 1.0]:")
-        print(f"    Min: {sigma_V_capped.min():.4f} ({sigma_V_capped.min()*100:.2f}%)")
-        print(f"    Max: {sigma_V_capped.max():.4f} ({sigma_V_capped.max()*100:.2f}%)")
-        print(f"    Mean: {sigma_V_capped.mean():.4f} ({sigma_V_capped.mean()*100:.2f}%)")
-        print(f"    Median: {np.median(sigma_V_capped):.4f} ({np.median(sigma_V_capped)*100:.2f}%)")
-        print(f"  Observations capped: {n_capped_high:,} high, {n_capped_low:,} low")
+        print(f"  Observations with extreme volatility: {n_extreme_high:,} high (>100%), {n_extreme_low:,} low (<1%)")
         print(f"  [Typical equity volatility: 20-50% annually]\n")
         
-        # Use the capped values
-        sigma_V = sigma_V_capped
+        # NOTE: No capping applied - use volatility_diagnostics.py to filter problematic firms
         
         # TRIPLE CHECK: Asset values and liabilities
         print("ASSET/LIABILITY CHECK:")
