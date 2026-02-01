@@ -258,17 +258,17 @@ df_cds_spreads_msgarch.to_csv('cds_spreads_ms_garch_mc.csv', index=False)
 print("Saved CDS spreads to 'cds_spreads_ms_garch_mc.csv' (clean firms only)")
 
 #%%
-# 9. Compare CDS Spreads: GARCH vs Regime-Switching vs MS-GARCH (CLEAN FIRMS ONLY)
+# 9. Compare CDS Spreads: GARCH vs Regime-Switching vs MS-GARCH (ALL FIRMS)
 print("\n" + "="*80)
-print("STEP 9: CDS SPREAD COMPARISON (GARCH vs RS vs MS-GARCH) - CLEAN FIRMS ONLY")
+print("STEP 9: CDS SPREAD COMPARISON (GARCH vs RS vs MS-GARCH) - ALL FIRMS")
 print("="*80 + "\n")
 
-print(f"Note: Comparison excludes {len(PROBLEMATIC_FIRMS)} problematic firms with extreme volatility.\n")
+print(f"Note: Using ALL firms for comparison (including {len(PROBLEMATIC_FIRMS)} with high volatility).\n")
 
-# Merge the three CDS spread datasets (clean firms only)
-df_cds_garch = pd.read_csv('cds_spreads_garch_mc.csv')
-df_cds_rs = pd.read_csv('cds_spreads_regime_switching_mc.csv')
-df_cds_msgarch = pd.read_csv('cds_spreads_ms_garch_mc.csv')
+# Merge the three CDS spread datasets (ALL firms)
+df_cds_garch = pd.read_csv('cds_spreads_garch_mc_all_firms.csv')
+df_cds_rs = pd.read_csv('cds_spreads_regime_switching_mc_all_firms.csv')
+df_cds_msgarch = pd.read_csv('cds_spreads_ms_garch_mc_all_firms.csv')
 
 df_cds_garch['date'] = pd.to_datetime(df_cds_garch['date'])
 df_cds_rs['date'] = pd.to_datetime(df_cds_rs['date'])

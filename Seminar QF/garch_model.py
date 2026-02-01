@@ -8,8 +8,10 @@ def run_garch_estimation(daily_returns_df):
     """
     Estimates GARCH(1,1) on DAILY asset returns.
     Scales returns for numerical stability, then rescales parameters back.
+    Uses Student's t distribution to handle fat tails (excess kurtosis) 
+    commonly found in financial returns data.
     """
-    print("Estimating GARCH(1,1) on DAILY Asset Returns...")
+    print("Estimating GARCH(1,1) with t-distribution on DAILY Asset Returns...")
     
     if daily_returns_df.empty:
         print("No daily returns provided for GARCH.")
@@ -20,6 +22,7 @@ def run_garch_estimation(daily_returns_df):
     df_out["garch_omega"] = np.nan
     df_out["garch_alpha"] = np.nan
     df_out["garch_beta"] = np.nan
+    df_out["garch_nu"] = np.nan  # Degrees of freedom for t-distribution
     
     firms = df_out["gvkey"].unique()
     print(f"Processing GARCH for {len(firms)} firms (Daily Data)...")
@@ -37,13 +40,15 @@ def run_garch_estimation(daily_returns_df):
         returns = firm_ts["asset_return_daily"].values * SCALE_FACTOR
         
         try:
-            am = arch_model(returns, vol='Garch', p=1, q=1, dist='Normal', rescale=False)
+            # Use Student's t distribution to handle fat tails
+            am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
             res = am.fit(disp='off', show_warning=False)
             
             # Extract parameters (scaled)
             omega = res.params['omega']
             alpha = res.params['alpha[1]']
             beta = res.params['beta[1]']
+            nu = res.params.get('nu', np.nan)  # Degrees of freedom for t-distribution
             
             # Get conditional volatility (scaled)
             cond_vol_scaled = np.asarray(res.conditional_volatility)
@@ -61,6 +66,7 @@ def run_garch_estimation(daily_returns_df):
             df_out.loc[firm_ts.index, "garch_omega"] = omega
             df_out.loc[firm_ts.index, "garch_alpha"] = alpha
             df_out.loc[firm_ts.index, "garch_beta"] = beta
+            df_out.loc[firm_ts.index, "garch_nu"] = nu  # Save degrees of freedom
             
         except Exception as e:
             continue
