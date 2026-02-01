@@ -358,44 +358,65 @@ class CDSSpreadCalculator:
         return df_cds_all
     
     def calculate_cds_spreads_from_mc_garch(self, mc_garch_file, daily_returns_file, 
-                                        merton_file, output_file=None):
+                                        merton_file, output_file=None, volatility_column=None):
         """
         Calculate model-implied CDS spreads based on Monte Carlo GARCH volatility forecasts.
         
         CORRECTED: Uses sqrt(sum of squared daily volatilities) for proper annualization.
         
-        Annualized volatility = sqrt(Σ σ_i^2) where σ_i are daily volatilities over 252-day window
+        Parameters:
+        -----------
+        mc_garch_file : str
+            Path to Monte Carlo results file
+        daily_returns_file : str
+            Path to daily returns with asset values
+        merton_file : str
+            Path to Merton results with liabilities
+        output_file : str, optional
+            Path to save output
+        volatility_column : str, optional
+            Override column name for cumulative volatility. If None, auto-detect.
+        
+        Returns:
+        --------
+        DataFrame with CDS spreads
         """
         
         overall_start = time.time()
         
         print(f"\n{'='*80}")
-        print("MODEL-IMPLIED CDS SPREADS FROM MONTE CARLO GARCH (Section 2.4.2)")
+        print("MODEL-IMPLIED CDS SPREADS FROM MONTE CARLO (Section 2.4.2)")
         print(f"{'='*80}\n")
         
         print("Loading data files...\n")
         
-        # Load Monte Carlo GARCH results
+        # Load Monte Carlo results
         df_mc_garch = pd.read_csv(mc_garch_file)
         df_mc_garch['date'] = pd.to_datetime(df_mc_garch['date'])
-        print(f"✓ Loaded Monte Carlo GARCH: {len(df_mc_garch):,} observations")
+        print(f"✓ Loaded Monte Carlo results: {len(df_mc_garch):,} observations")
         print(f"  Columns: {list(df_mc_garch.columns)}\n")
         
-        # Use cumulative volatility (which is sum of squared daily vols)
-        # Try GARCH column first, then regime-switching column
-        if 'mc_garch_cumulative_volatility' in df_mc_garch.columns:
-            volatility_column = 'mc_garch_cumulative_volatility'
-        elif 'rs_cumulative_volatility' in df_mc_garch.columns:
-            volatility_column = 'rs_cumulative_volatility'
+        # Determine volatility column
+        if volatility_column is not None:
+            if volatility_column not in df_mc_garch.columns:
+                raise ValueError(f"Column '{volatility_column}' not found! Available: {list(df_mc_garch.columns)}")
         else:
-            # Fallback: find any cumulative volatility column
-            vol_cols = [c for c in df_mc_garch.columns if 'cumulative' in c.lower() and 'vol' in c.lower()]
-            if vol_cols:
-                volatility_column = vol_cols[0]
+            # Auto-detect: try common column names
+            if 'mc_garch_cumulative_volatility' in df_mc_garch.columns:
+                volatility_column = 'mc_garch_cumulative_volatility'
+            elif 'rs_cumulative_volatility' in df_mc_garch.columns:
+                volatility_column = 'rs_cumulative_volatility'
+            elif 'mc_msgarch_cumulative_volatility' in df_mc_garch.columns:
+                volatility_column = 'mc_msgarch_cumulative_volatility'
             else:
-                raise ValueError(f"No cumulative volatility column found! Available: {list(df_mc_garch.columns)}")
+                # Fallback: find any cumulative volatility column
+                vol_cols = [c for c in df_mc_garch.columns if 'cumulative' in c.lower() and 'vol' in c.lower()]
+                if vol_cols:
+                    volatility_column = vol_cols[0]
+                else:
+                    raise ValueError(f"No cumulative volatility column found! Available: {list(df_mc_garch.columns)}")
         
-        print(f"✓ Using: '{volatility_column}' (sum of squared daily volatilities)\n")
+        print(f"✓ Using volatility column: '{volatility_column}'\n")
         
         # Aggregate MC simulations to mean per (gvkey,date)
         df_mc_garch_daily = df_mc_garch.groupby(['gvkey', 'date'])[[volatility_column]].mean().reset_index()
