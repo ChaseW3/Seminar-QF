@@ -19,3 +19,11 @@ output*.png
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+
+.DS_Store
+__MACOSX/
+
+.venv/
+__pycache__/
+*.pyc
+Seminar QF/merged_data_with_merton.csv
