@@ -121,7 +121,12 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     # Merton PD calculation
     V_A = valid_data['asset_value'].values
     B = valid_data['liabilities_total'].values * 1_000_000  # Convert to actual liability value
-    sigma_A = valid_data[vol_col].values  # Annualized volatility
+    
+    # CRITICAL: Volatility in the CSVs is DAILY (sigma_daily).
+    # Merton formula requires ANNUALIZED volatility for T=1.
+    sigma_A_daily = valid_data[vol_col].values
+    sigma_A = sigma_A_daily * np.sqrt(252) # Convert to annualized
+    
     r = valid_data['risk_free_rate'].values
     T = 1.0
     

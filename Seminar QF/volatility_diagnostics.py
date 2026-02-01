@@ -184,16 +184,31 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         
         print(f"✓ Loaded MC data: {len(df_mc):,} observations")
         
-        # Calculate MC volatility statistics per firm
-        mc_stats = df_mc.groupby('gvkey').agg({
-            'mc_garch_cumulative_volatility': ['mean', 'std', 'min', 'max', 'median']
-        }).reset_index()
-        mc_stats.columns = ['gvkey', 'mc_cumvol_mean', 'mc_cumvol_std', 
-                           'mc_cumvol_min', 'mc_cumvol_max', 'mc_cumvol_median']
+        # Calculate MC volatility statistics per firm (Using Integrated Variance)
+        # Note: If reusing old files without integrated variance, fallback to cumulative
         
-        # Annualized from cumulative: σ_annual = (cumulative / 252) * √252 = cumulative / √252
-        mc_stats['mc_annualized_vol_mean'] = mc_stats['mc_cumvol_mean'] / np.sqrt(252)
-        mc_stats['mc_annualized_vol_max'] = mc_stats['mc_cumvol_max'] / np.sqrt(252)
+        if 'mc_garch_integrated_variance' in df_mc.columns:
+            target_col = 'mc_garch_integrated_variance'
+            is_variance = True
+        else:
+            target_col = 'mc_garch_cumulative_volatility'
+            is_variance = False
+            
+        mc_stats = df_mc.groupby('gvkey').agg({
+            target_col: ['mean', 'std', 'min', 'max', 'median']
+        }).reset_index()
+        
+        mc_stats.columns = ['gvkey', 'mc_raw_mean', 'mc_raw_std', 
+                           'mc_raw_min', 'mc_raw_max', 'mc_raw_median']
+        
+        if is_variance:
+            # Annualized from Integrated Variance: σ_annual = √IV
+            mc_stats['mc_annualized_vol_mean'] = np.sqrt(mc_stats['mc_raw_mean'])
+            mc_stats['mc_annualized_vol_max'] = np.sqrt(mc_stats['mc_raw_max'])
+        else:
+            # Annualized from cumulative: σ_annual = (cumulative / 252) * √252 = cumulative / √252
+            mc_stats['mc_annualized_vol_mean'] = mc_stats['mc_raw_mean'] / np.sqrt(252)
+            mc_stats['mc_annualized_vol_max'] = mc_stats['mc_raw_max'] / np.sqrt(252)
         
         # Merge with firm stats
         df_firm_stats = df_firm_stats.merge(mc_stats, on='gvkey', how='left')

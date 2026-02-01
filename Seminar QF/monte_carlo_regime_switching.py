@@ -233,13 +233,19 @@ def monte_carlo_regime_switching_1year(
         
         # CALCULATE STATISTICS
         # daily_vols shape: (num_days, num_simulations, num_firms)
-        mean_paths = np.mean(daily_vols, axis=1)  # (num_days, num_firms)
         
-        cumulative_vols = np.sum(mean_paths, axis=0)  # (num_firms,)
-        mean_daily_vols = np.mean(mean_paths, axis=0)
-        std_daily_vols = np.std(mean_paths, axis=0)
-        min_daily_vols = np.min(mean_paths, axis=0)
-        max_daily_vols = np.max(mean_paths, axis=0)
+        # MEAN VARIANCE CALCULATION
+        # 1. Square to get variances
+        daily_variances = daily_vols ** 2
+        
+        # 2. Mean across simulations (Expected Conditional Variance)
+        mean_variance_paths = np.mean(daily_variances, axis=1)  # (num_days, num_firms)
+        
+        # 3. Sum over horizon (Integrated Variance)
+        integrated_variances = np.sum(mean_variance_paths, axis=0)  # (num_firms,)
+        
+        # Other stats
+        mean_daily_vols = np.mean(daily_vols, axis=(0,1)) # overall mean
         
         # Calculate regime statistics
         mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))  # Fraction time in regime 0
@@ -250,12 +256,8 @@ def monte_carlo_regime_switching_1year(
             results_list.append({
                 'gvkey': firm,
                 'date': date,
-                'rs_cumulative_volatility': cumulative_vols[firm_idx],
+                'rs_integrated_variance': integrated_variances[firm_idx],
                 'rs_mean_daily_volatility': mean_daily_vols[firm_idx],
-                'rs_std_daily_volatility': std_daily_vols[firm_idx],
-                'rs_min_daily_volatility': min_daily_vols[firm_idx],
-                'rs_max_daily_volatility': max_daily_vols[firm_idx],
-                'rs_volatility_forecast': mean_daily_vols[firm_idx],
                 'rs_fraction_regime_0': mean_regime_0[firm_idx],
                 'rs_fraction_regime_1': mean_regime_1[firm_idx],
             })
@@ -283,7 +285,7 @@ def monte_carlo_regime_switching_1year(
     for firm in results_df['gvkey'].unique()[:3]:
         firm_data = results_df[results_df['gvkey'] == firm]
         print(f"  Firm {firm}: {len(firm_data):,} trading days")
-        print(f"    Cumulative vol: {firm_data['rs_cumulative_volatility'].mean():.4f}")
+        print(f"    Integrated Variance: {firm_data['rs_integrated_variance'].mean():.4f}")
         print(f"    Regime 0 fraction: {firm_data['rs_fraction_regime_0'].mean():.3f}")
         print(f"    Regime 1 fraction: {firm_data['rs_fraction_regime_1'].mean():.3f}")
     

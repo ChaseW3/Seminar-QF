@@ -129,29 +129,34 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
         )
         
         # For each firm, calculate:
-        # 1. Mean volatility path (mean across simulations for each day)
-        # 2. Sum of mean volatilities over 252 days
+        # 1. Mean variance path (mean across simulations for each day)
+        # 2. Sum of mean variances over 252 days (Integrated Variance)
         for firm_idx, firm in enumerate(firms_on_date):
             # daily_vols shape: (num_days, num_simulations, num_firms)
             # Get volatilities for this firm across all days and simulations
             firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
             
-            # Calculate mean volatility for each day (across simulations)
-            mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
+            # MEAN VARIANCE CALCULATION (Corrected per request)
+            # 1. Square the volatilities to get variances
+            firm_daily_variances = firm_daily_vols ** 2
             
-            # Calculate sum of mean volatilities over the year
-            cumulative_volatility = np.sum(mean_path)
+            # 2. Average variances across simulations (Expected Conditional Variance)
+            # \bar{\sigma}^2_{t+h} = \frac{1}{M} \sum \sigma^{2,(m)}_{t+h}
+            mean_variance_path = np.mean(firm_daily_variances, axis=1)  # shape: (num_days,)
+            
+            # 3. Sum expected variances over horizon (Integrated Variance)
+            # IV_{t,T} = \sum \bar{\sigma}^2_{t+h}
+            integrated_variance = np.sum(mean_variance_path)
             
             # Also store other statistics
             results_list.append({
                 'gvkey': firm,
                 'date': date,
-                'mc_garch_cumulative_volatility': cumulative_volatility,
-                'mc_garch_mean_daily_volatility': np.mean(mean_path),
-                'mc_garch_std_daily_volatility': np.std(mean_path),
-                'mc_garch_min_daily_volatility': np.min(mean_path),
-                'mc_garch_max_daily_volatility': np.max(mean_path),
-                'mc_garch_volatility_forecast': np.mean(mean_path)  # For CDS (mean daily vol)
+                'mc_garch_integrated_variance': integrated_variance,
+                'mc_garch_mean_daily_volatility': np.mean(mean_variance_path) ** 0.5, # approx
+                'mc_garch_std_daily_volatility': np.std(firm_daily_vols),
+                'mc_garch_min_daily_volatility': np.min(firm_daily_vols),
+                'mc_garch_max_daily_volatility': np.max(firm_daily_vols),
             })
             rows_created += 1
         
@@ -183,9 +188,9 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
     for firm in results_df['gvkey'].unique()[:3]:
         firm_data = results_df[results_df['gvkey'] == firm]
         print(f"  Firm {firm}: {len(firm_data):,} trading days")
-        print(f"    Cumulative vol: {firm_data['mc_garch_cumulative_volatility'].mean():.4f} ± {firm_data['mc_garch_cumulative_volatility'].std():.4f}")
-        print(f"    Mean daily vol: {firm_data['mc_garch_mean_daily_volatility'].mean():.6f} ± {firm_data['mc_garch_mean_daily_volatility'].std():.6f}")
-        print(f"    Range:          [{firm_data['mc_garch_cumulative_volatility'].min():.4f}, {firm_data['mc_garch_cumulative_volatility'].max():.4f}]")
+        print(f"    Integrated Variance: {firm_data['mc_garch_integrated_variance'].mean():.4f} ± {firm_data['mc_garch_integrated_variance'].std():.4f}")
+        print(f"    Implied Annual Vol:  {np.mean(np.sqrt(firm_data['mc_garch_integrated_variance'])):.4f}")
+        print(f"    Range (IV):          [{firm_data['mc_garch_integrated_variance'].min():.4f}, {firm_data['mc_garch_integrated_variance'].max():.4f}]")
     
     total_time = (pd.Timestamp.now() - start_time).total_seconds()
     

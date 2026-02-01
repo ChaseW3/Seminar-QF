@@ -291,13 +291,29 @@ def monte_carlo_ms_garch_1year(
         # CALCULATE STATISTICS
         # daily_vols shape: (num_days, num_simulations, num_firms)
         
-        # Mean across simulations for each day
-        mean_paths = np.mean(daily_vols, axis=1)  # (num_days, num_firms)
+        # MEAN VARIANCE CALCULATION
+        # 1. Square to get variances
+        daily_variances = daily_vols ** 2
         
-        # Cumulative volatility (sum of mean daily vols)
-        cumulative_vols = np.sum(mean_paths, axis=0)  # (num_firms,)
+        # 2. Mean across simulations (Expected Conditional Variance)
+        mean_variance_paths = np.mean(daily_variances, axis=1) # (num_days, num_firms)
         
-        # Other statistics
+        # 3. Sum over horizon (Integrated Variance)
+        integrated_variances = np.sum(mean_variance_paths, axis=0) # (num_firms,)
+        
+        # Calculate regime statistics
+        mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
+        mean_regime_1 = np.mean(regime_paths == 1, axis=(0, 1))
+        
+        # APPEND RESULTS
+        for firm_idx, firm in enumerate(firms_on_date):
+            results_list.append({
+                'gvkey': firm,
+                'date': date,
+                'mc_msgarch_integrated_variance': integrated_variances[firm_idx],
+                'mc_msgarch_fraction_regime_0': mean_regime_0[firm_idx], 
+                'mc_msgarch_fraction_regime_1': mean_regime_1[firm_idx]
+            })
         mean_daily_vols = np.mean(mean_paths, axis=0)
         std_daily_vols = np.std(mean_paths, axis=0)
         min_daily_vols = np.min(mean_paths, axis=0)
@@ -333,15 +349,15 @@ def monte_carlo_ms_garch_1year(
     print(f"Unique dates: {results_df['date'].nunique()}")
     
     # Volatility statistics
-    print(f"\nCumulative Volatility Statistics:")
-    print(f"  Min: {results_df['mc_msgarch_cumulative_volatility'].min():.4f}")
-    print(f"  Max: {results_df['mc_msgarch_cumulative_volatility'].max():.4f}")
-    print(f"  Mean: {results_df['mc_msgarch_cumulative_volatility'].mean():.4f}")
-    print(f"  Median: {results_df['mc_msgarch_cumulative_volatility'].median():.4f}")
+    print(f"\nIntegrated Variance Statistics:")
+    print(f"  Min: {results_df['mc_msgarch_integrated_variance'].min():.4f}")
+    print(f"  Max: {results_df['mc_msgarch_integrated_variance'].max():.4f}")
+    print(f"  Mean: {results_df['mc_msgarch_integrated_variance'].mean():.4f}")
+    print(f"  Median: {results_df['mc_msgarch_integrated_variance'].median():.4f}")
     
     # Annualized volatility check
-    annualized = results_df['mc_msgarch_cumulative_volatility'] / np.sqrt(252)
-    print(f"\nAnnualized Volatility (cumulative/√252):")
+    annualized = np.sqrt(results_df['mc_msgarch_integrated_variance'])
+    print(f"\nAnnualized Volatility (sqrt(IV)):")
     print(f"  Min: {annualized.min()*100:.2f}%")
     print(f"  Max: {annualized.max()*100:.2f}%")
     print(f"  Mean: {annualized.mean()*100:.2f}%")

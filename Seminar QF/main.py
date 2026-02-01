@@ -244,7 +244,7 @@ df_cds_spreads_msgarch_all = cds_calc.calculate_cds_spreads_from_mc_garch(
     daily_returns_file='daily_asset_returns.csv',
     merton_file='merged_data_with_merton.csv',
     output_file='cds_spreads_ms_garch_mc_all_firms.csv',
-    volatility_column='mc_msgarch_cumulative_volatility'
+    volatility_column='mc_msgarch_integrated_variance'
 )
 print("Saved CDS spreads to 'cds_spreads_ms_garch_mc_all_firms.csv'")
 

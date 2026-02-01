@@ -360,9 +360,9 @@ class CDSSpreadCalculator:
     def calculate_cds_spreads_from_mc_garch(self, mc_garch_file, daily_returns_file, 
                                         merton_file, output_file=None, volatility_column=None):
         """
-        Calculate model-implied CDS spreads based on Monte Carlo GARCH volatility forecasts.
+        Calculate model-implied CDS spreads based on Monte Carlo Integrated Variance forecasts.
         
-        CORRECTED: Uses sqrt(sum of squared daily volatilities) for proper annualization.
+        Uses annualized volatility = sqrt(Integrated Variance).
         
         Parameters:
         -----------
@@ -375,7 +375,7 @@ class CDSSpreadCalculator:
         output_file : str, optional
             Path to save output
         volatility_column : str, optional
-            Override column name for cumulative volatility. If None, auto-detect.
+            Override column name for integrated variance. If None, auto-detect.
         
         Returns:
         --------
@@ -401,20 +401,24 @@ class CDSSpreadCalculator:
             if volatility_column not in df_mc_garch.columns:
                 raise ValueError(f"Column '{volatility_column}' not found! Available: {list(df_mc_garch.columns)}")
         else:
-            # Auto-detect: try common column names
-            if 'mc_garch_cumulative_volatility' in df_mc_garch.columns:
-                volatility_column = 'mc_garch_cumulative_volatility'
-            elif 'rs_cumulative_volatility' in df_mc_garch.columns:
-                volatility_column = 'rs_cumulative_volatility'
-            elif 'mc_msgarch_cumulative_volatility' in df_mc_garch.columns:
-                volatility_column = 'mc_msgarch_cumulative_volatility'
+            # Auto-detect: prioritize Integrated Variance columns
+            if 'mc_garch_integrated_variance' in df_mc_garch.columns:
+                volatility_column = 'mc_garch_integrated_variance'
+            elif 'rs_integrated_variance' in df_mc_garch.columns:
+                volatility_column = 'rs_integrated_variance'
+            elif 'mc_msgarch_integrated_variance' in df_mc_garch.columns:
+                volatility_column = 'mc_msgarch_integrated_variance'
+            # Legacy fallback
+            elif 'mc_garch_cumulative_volatility' in df_mc_garch.columns:
+                 volatility_column = 'mc_garch_cumulative_volatility'
+                 print("⚠ Using LEGACY cumulative volatility column (Sum of Sigma).")
             else:
-                # Fallback: find any cumulative volatility column
-                vol_cols = [c for c in df_mc_garch.columns if 'cumulative' in c.lower() and 'vol' in c.lower()]
+                # Fallback: find any variance column
+                vol_cols = [c for c in df_mc_garch.columns if 'integrated' in c.lower() and 'variance' in c.lower()]
                 if vol_cols:
                     volatility_column = vol_cols[0]
                 else:
-                    raise ValueError(f"No cumulative volatility column found! Available: {list(df_mc_garch.columns)}")
+                    raise ValueError(f"No integrated variance column found! Available: {list(df_mc_garch.columns)}")
         
         print(f"✓ Using volatility column: '{volatility_column}'\n")
         
@@ -453,23 +457,23 @@ class CDSSpreadCalculator:
         # Extract needed columns
         V_t = df_merged['asset_value'].values.astype(np.float64)
         K = df_merged['liabilities_total'].values.astype(np.float64) * 1_000_000
-        sigma_cumulative = df_merged[volatility_column].values.astype(np.float64)
+        integrated_variance = df_merged[volatility_column].values.astype(np.float64)
         gvkeys = df_merged['gvkey'].values
         
         # CORRECT CONVERSION: 
-        # mc_garch_cumulative_volatility = Σ σ_i over 252 days (sum of daily volatilities)
-        # Daily volatilities are typically 0.01-0.03 (1-3%)
-        # Sum over 252 days gives ~2.5-7.5
-        # 
-        # To get annualized volatility:
-        #   Mean daily volatility = Σσ_i / 252
-        #   Annualized volatility = mean_daily × √252 = (Σσ_i / 252) × √252 = Σσ_i / √252
-        
-        # First, let's see what the mean daily volatility would be
-        mean_daily_vol = sigma_cumulative / 252
-        
-        # Annualized using standard formula
-        sigma_V = mean_daily_vol * np.sqrt(252)
+        # Volatility = sqrt(Integrated Variance)
+        # Handle legacy "cumulative volatility" if detected (backward compatibility)
+        if 'cumulative' in volatility_column:
+             # Legacy approximation: sigma_annual approx sum_sigma / sqrt(252)
+             # But let's assume if the column is cumulative (Sum Sigma), user knows what they are doing.
+             # However, since we updated the code to produce Integrated Variance, we standard path is:
+             sigma_V = integrated_variance / np.sqrt(252) # Just for legacy fallback (Sum Sigma / sqrt(T))
+             print("⚠ Applying LEGACY conversion: Sigma = Sum(Sigma_Daily) / sqrt(252)")
+        else:
+             # STANDARD PATH for Integrated Variance
+             # IV = Sum(E[Sigma^2])
+             # Annualized Volatility = sqrt(IV)
+             sigma_V = np.sqrt(integrated_variance)
         
         # NO CAPPING - Instead, identify and report problematic observations
         n_extreme_high = np.sum(sigma_V > 1.0)
@@ -482,19 +486,15 @@ class CDSSpreadCalculator:
             print(f"⚠️  WARNING: {len(extreme_firms)} firms have annualized volatility > 100%:")
             print(f"    Firms: {extreme_firms.tolist()}")
             print(f"    Total extreme observations: {n_extreme_high:,}")
-            print(f"    These firms should be investigated via volatility_diagnostics.py\n")
+            # print(f"    These firms should be investigated via volatility_diagnostics.py\n")
         
         print("VOLATILITY CONVERSION CHECK:")
-        print(f"  Cumulative (Σσ_i over 252 days):")
-        print(f"    Min: {sigma_cumulative.min():.6f}")
-        print(f"    Max: {sigma_cumulative.max():.6f}")
-        print(f"    Mean: {sigma_cumulative.mean():.6f}")
-        print(f"    Median: {np.median(sigma_cumulative):.6f}")
-        print(f"  Mean daily (Σσ_i / 252):")
-        print(f"    Min: {mean_daily_vol.min():.6f}")
-        print(f"    Max: {mean_daily_vol.max():.6f}")
-        print(f"    Mean: {mean_daily_vol.mean():.6f}")
-        print(f"  Annualized volatility (mean_daily × √252):")
+        print(f"  Input Metric ({volatility_column}):")
+        print(f"    Min: {integrated_variance.min():.6f}")
+        print(f"    Max: {integrated_variance.max():.6f}")
+        print(f"    Mean: {integrated_variance.mean():.6f}")
+        print(f"    Median: {np.median(integrated_variance):.6f}")
+        print(f"  Annualized volatility (sqrt(IV)):")
         print(f"    Min: {sigma_V.min():.4f} ({sigma_V.min()*100:.2f}%)")
         print(f"    Max: {sigma_V.max():.4f} ({sigma_V.max()*100:.2f}%)")
         print(f"    Mean: {sigma_V.mean():.4f} ({sigma_V.mean()*100:.2f}%)")
