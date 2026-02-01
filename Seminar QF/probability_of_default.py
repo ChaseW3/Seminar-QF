@@ -263,3 +263,45 @@ def calculate_merton_pd_normal(daily_returns_file):
     
     return df_clean[['gvkey', 'date', 'asset_value', 'liabilities_total', 
                       'asset_volatility', 'pd_merton_normal']]
+
+
+# For regime switching, we need to calculate volatility from regime-specific parameters
+# The file has: regime_state, regime_probability_0, regime_probability_1
+# But no direct volatility column - we need to compute it from the regime states
+
+def get_regime_volatility(df_regime):
+    """
+    Calculate volatility for regime-switching model.
+    
+    Uses the regime state to assign high/low volatility.
+    If regime parameters are available, use those. Otherwise estimate from data.
+    """
+    import os
+    
+    # Try to load regime parameters
+    params_file = 'regime_switching_parameters.csv'
+    if os.path.exists(params_file):
+        params_df = pd.read_csv(params_file)
+        
+        # Merge parameters with data
+        df_merged = pd.merge(
+            df_regime, 
+            params_df[['gvkey', 'regime_0_vol', 'regime_1_vol']], 
+            on='gvkey', 
+            how='left'
+        )
+        
+        # Calculate volatility based on regime state and probabilities
+        # Weighted average: σ = p0*σ0 + p1*σ1
+        df_merged['regime_volatility'] = (
+            df_merged['regime_probability_0'] * df_merged['regime_0_vol'] +
+            df_merged['regime_probability_1'] * df_merged['regime_1_vol']
+        )
+        
+        return df_merged['regime_volatility']
+    else:
+        # Fallback: use asset_volatility if available
+        if 'asset_volatility' in df_regime.columns:
+            return df_regime['asset_volatility']
+        else:
+            return pd.Series([0.3] * len(df_regime))  # Default 30% vol

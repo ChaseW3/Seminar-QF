@@ -1,12 +1,36 @@
 # main.py
 #%% 
 import pandas as pd
+import os
+import shutil
 from data_processing import load_and_preprocess_data, run_merton_estimation, load_interest_rates
 from garch_model import run_garch_estimation
 from regime_switching import run_regime_switching_estimation
 from ms_garch import run_ms_garch_estimation
 from probability_of_default import run_pd_pipeline
 from result_summary import generate_results_summary
+
+#%%
+# CACHE CLEANUP: Delete cached Merton results to force reprocessing with updated firm list
+print("Cleaning up cache files...\n")
+cache_dir = './intermediates/'
+cache_files = [
+    'merton_results_cache.pkl',
+    'mc_garch_cache.csv'
+]
+
+for cache_file in cache_files:
+    cache_path = os.path.join(cache_dir, cache_file)
+    if os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+            print(f"✓ Deleted: {cache_path}")
+        except Exception as e:
+            print(f"⚠ Could not delete {cache_path}: {e}")
+    else:
+        print(f"  (No cached file: {cache_path})")
+
+print("Cache cleanup complete.\n")
 
 #%% 
 # 0. Load Interest Rates (needed for all steps)
