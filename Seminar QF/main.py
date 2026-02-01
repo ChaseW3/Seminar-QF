@@ -69,16 +69,17 @@ final_daily_returns_rs.to_csv("daily_asset_returns_with_regime.csv", index=False
 print("Saved 'daily_asset_returns_with_regime.csv'")
 
 #%%
-# 5. Run PROPER MS-GARCH (Markov Switching GARCH with GARCH dynamics per regime)
-from ms_garch_proper import run_ms_garch_estimation
+# 5. Run OPTIMIZED MS-GARCH (Markov Switching GARCH with GARCH dynamics per regime)
+from ms_garch_optimized import run_ms_garch_estimation_optimized
 
 print("\n" + "="*80)
-print("STEP 5: PROPER MS-GARCH ESTIMATION")
+print("STEP 5: OPTIMIZED MS-GARCH ESTIMATION")
 print("="*80)
 print("Note: This is a TRUE MS-GARCH with GARCH(1,1) dynamics in each regime,")
-print("      estimated via MLE with Hamilton filter.\n")
+print("      estimated via MLE with Hamilton filter.")
+print("Optimizations: GARCH warm start, JIT Hamilton filter, L-BFGS-B optimizer\n")
 
-final_daily_returns_msgarch = run_ms_garch_estimation(daily_returns_df)
+final_daily_returns_msgarch = run_ms_garch_estimation_optimized(daily_returns_df)
 
 # Save MS-GARCH Results
 final_daily_returns_msgarch.to_csv("daily_asset_returns_with_msgarch.csv", index=False)
