@@ -510,7 +510,56 @@ class CDSSpreadCalculator:
         print(f"  Liabilities (×10^6): {(K/1e6).min():.2e} to {(K/1e6).max():.2e}")
         print(f"  Leverage (K/V): {(K/V_t).min():.4f} to {(K/V_t).max():.4f}\n")
         
-        r_t = 0.05  # risk-free rate
+        # Load Risk-Free Rates (Euribor 1Y)
+        rf_file = os.path.join(os.path.dirname(__file__), 'ECB Data Portal_20260125170805.csv')
+        
+        if os.path.exists(rf_file):
+            print(f"Loading risk-free rates from {os.path.basename(rf_file)}...")
+            df_rf = pd.read_csv(rf_file)
+            
+            # Identify rate column (looks for 'Euribor' or uses 3rd column)
+            rate_col = [c for c in df_rf.columns if 'Euribor' in c]
+            if not rate_col:
+                rate_col = df_rf.columns[2] # Fallback
+            else:
+                rate_col = rate_col[0]
+                
+            df_rf = df_rf.rename(columns={'DATE': 'date', rate_col: 'risk_free_rate'})
+            
+            # Process dates and rates
+            df_rf['date'] = pd.to_datetime(df_rf['date'])
+            # Convert % to decimal (e.g. 6.34 -> 0.0634)
+            df_rf['risk_free_rate'] = pd.to_numeric(df_rf['risk_free_rate'], errors='coerce') / 100.0
+            
+            # Prepare for merge - drop incomplete rows and sort
+            df_rf = df_rf[['date', 'risk_free_rate']].dropna().sort_values('date')
+            
+            # Map rates to the existing data (df_merged) while preserving order
+            # 1. Create mapping helper
+            df_mapping = df_merged[['date']].copy()
+            df_mapping['orig_idx'] = df_mapping.index
+            df_mapping = df_mapping.sort_values('date')
+            
+            # 2. Merge asof (backward: finds latest rate <= current date)
+            df_rates = pd.merge_asof(
+                df_mapping, 
+                df_rf, 
+                on='date', 
+                direction='backward'
+            )
+            
+            # 3. Restore original order to match V_t, sigma_V
+            df_rates = df_rates.sort_values('orig_idx')
+            
+            # 4. Extract aligned rates (fill gaps with ffill or default)
+            r_t = df_rates['risk_free_rate'].ffill().fillna(0.05).values
+            
+            print(f"✓ Loaded dynamic risk-free rates:")
+            print(f"    Mean: {np.mean(r_t)*100:.2f}% | Min: {np.min(r_t)*100:.2f}% | Max: {np.max(r_t)*100:.2f}%")
+            
+        else:
+            print(f"⚠ Risk-free rate file not found. Defaulting to 5%.")
+            r_t = 0.05
         
         print("Calculating CDS spreads...\n")
         
