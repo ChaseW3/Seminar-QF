@@ -45,6 +45,7 @@ def load_and_preprocess_data():
     print("Loading equity data...")
     df = pd.read_excel(FILENAME_EQUITY_DATA, sheet_name=SHEET_EQUITY)
     
+    # RENAME COLUMNS FIRST so that 'gvkey' exists
     df = df.rename(columns={
         "(fic) Current ISO Country Code - Incorporation": "country",
         "(isin) International Security Identification Number": "isin",
@@ -55,6 +56,19 @@ def load_and_preprocess_data():
         "(prccd) Price - Close - Daily": "close",
         "Market Capitalization (# Shares * Close Price)": "mkt_cap",
     })
+    
+    # NOW REMOVE FLAGGED COMPANIES (after column renaming)
+    gvkeys_to_remove = [
+        101248, 25466, 203053, 245663, 19349, 243774, 17828, 333645,
+        101305, 61214, 15181, 14140, 100312, 101276, 100737, 214881
+    ]
+    
+    initial_firms = df['gvkey'].nunique()
+    df = df[~df['gvkey'].isin(gvkeys_to_remove)]
+    removed_firms = initial_firms - df['gvkey'].nunique()
+    
+    print(f"Removed {removed_firms} flagged companies (gvkeys: {gvkeys_to_remove})")
+    print(f"Remaining firms: {df['gvkey'].nunique()}\n")
     
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     df = df.sort_values(["isin", "date"])
