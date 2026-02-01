@@ -14,28 +14,6 @@ env/
 .idea/
 .DS_Store
 
-# Data & Outputs
-# Ignore all data by default
-data/
-*.csv
-*.xlsx
-*.xls
-*.png
-*.jpg
-*.pdf
-
-# Exception: Keep the directory structure (optional, if using .gitkeep)
-!data/input/.gitkeep
-!data/output/.gitkeep
-!data/intermediates/.gitkeep
-!data/diagnostics/.gitkeep
-.ipynb_checkpoints/
-
+# Mac
 .DS_Store
 __MACOSX/
-
-.venv/
-__pycache__/
-*.pyc
-Seminar QF/merged_data_with_merton.csv
-Seminar QF/merged_data_with_merton.csv
