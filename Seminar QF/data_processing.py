@@ -164,7 +164,8 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=1
         # Filter valid returns
         valid_mask = np.isfinite(ret_A)
         if np.sum(valid_mask) >= 10:
-            sigma_A_new = np.std(ret_A[valid_mask])
+            # Calculate annualized volatility from daily returns (assuming 252 trading days)
+            sigma_A_new = np.std(ret_A[valid_mask]) * np.sqrt(252)
             
             # Check convergence
             if abs(sigma_A_new - sigma_A_old) < tol:
@@ -200,7 +201,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         
         # Get interest rate
         month_str = pd.Timestamp(date_t).strftime('%Y-%m')
-        r = interest_rates_dict.get(month_str, 0.05)
+        r_annual = interest_rates_dict.get(month_str, 0.05)
         
         # Inputs
         E_vec = window_df["mkt_cap"].values.astype(np.float64)
@@ -221,12 +222,15 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         sigma_E_daily = np.std(ret_E)
         if sigma_E_daily < 1e-6:
             sigma_E_daily = 0.4 / np.sqrt(252)  # Daily equivalent fallback
+            
+        sigma_E_annual = sigma_E_daily * np.sqrt(252)
         
         # CALL VECTORIZED FUNCTION (NO NUMBA)
-        T_val = 252.0
+        # Use T = 365/360 consistent with ACT/360 money market convention for rates
+        T_val = 1
         try:
             V_A_vec, sigma_A = merton_newton_raphson_vectorized(
-                E_vec, B_vec, sigma_E_daily, r, T_val, max_iter=100, tol=1e-4
+                E_vec, B_vec, sigma_E_annual, r_annual, T_val, max_iter=100, tol=1e-4
             )
         except Exception as e:
             print(f"    ⚠ Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
@@ -234,7 +238,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         
         # Save result
         V_A_final = V_A_vec[-1]
-        sigma_A_annualized = sigma_A * np.sqrt(252)
+        sigma_A_annualized = sigma_A  # Already annualized
         
         results.append({
             "gvkey": gvkey,
