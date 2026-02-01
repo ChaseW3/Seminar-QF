@@ -1,23 +1,34 @@
+# Python
 __pycache__/
-**/__pycache__/
 *.py[cod]
+*.so
+.ipynb_checkpoints/
+
+# Virtual Env
 .venv/
 venv/
-.ipynb_checkpoints/
-.DS_Store
-.vscode/
-*.png
-*.txt
-*.csv
-*.csv
-# outputs / data
-output*.png
-*.png
-*.csv
+env/
 
-# python env / caches
-.venv/
-__pycache__/
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Data & Outputs
+# Ignore all data by default
+data/
+*.csv
+*.xlsx
+*.xls
+*.png
+*.jpg
+*.pdf
+
+# Exception: Keep the directory structure (optional, if using .gitkeep)
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/intermediates/.gitkeep
+!data/diagnostics/.gitkeep
 .ipynb_checkpoints/
 
 .DS_Store
