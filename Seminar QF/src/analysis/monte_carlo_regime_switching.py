@@ -298,3 +298,168 @@ def monte_carlo_regime_switching_1year(
     print(f"{'='*80}\n")
     
     return results_df
+
+
+def _process_single_date_rs_mc(date_data, num_simulations, num_days):
+    """
+    Process Monte Carlo regime-switching simulation for a single date (for parallelization).
+    """
+    date, df_date, regime_params_dict, firms_on_date = date_data
+    results_list = []
+    
+    if len(firms_on_date) == 0:
+        return results_list
+    
+    # Prepare arrays for vectorized simulation
+    n_firms = len(firms_on_date)
+    mu_0_arr = np.zeros(n_firms)
+    mu_1_arr = np.zeros(n_firms)
+    ar_0_arr = np.zeros(n_firms)
+    ar_1_arr = np.zeros(n_firms)
+    sigma_0_arr = np.zeros(n_firms)
+    sigma_1_arr = np.zeros(n_firms)
+    trans_00_arr = np.zeros(n_firms)
+    trans_01_arr = np.zeros(n_firms)
+    trans_10_arr = np.zeros(n_firms)
+    trans_11_arr = np.zeros(n_firms)
+    
+    valid_firms = []
+    for f_idx, firm in enumerate(firms_on_date):
+        if firm not in regime_params_dict:
+            continue
+        params = regime_params_dict[firm]
+        mu_0_arr[f_idx] = params['regime_0_mean']
+        mu_1_arr[f_idx] = params['regime_1_mean']
+        ar_0_arr[f_idx] = params['regime_0_ar']
+        ar_1_arr[f_idx] = params['regime_1_ar']
+        sigma_0_arr[f_idx] = params['regime_0_vol']
+        sigma_1_arr[f_idx] = params['regime_1_vol']
+        trans_00_arr[f_idx] = params['transition_prob_00']
+        trans_01_arr[f_idx] = params['transition_prob_01']
+        trans_10_arr[f_idx] = params['transition_prob_10']
+        trans_11_arr[f_idx] = params['transition_prob_11']
+        valid_firms.append((f_idx, firm))
+    
+    if len(valid_firms) == 0:
+        return results_list
+    
+    # Initial regime probabilities
+    initial_regime_probs = np.full(n_firms, 0.5)
+    
+    # Run vectorized Monte Carlo
+    daily_vols, regime_paths = simulate_regime_switching_paths_vectorized(
+        mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr,
+        trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
+        num_simulations, num_days, n_firms, initial_regime_probs
+    )
+    
+    # Calculate statistics
+    daily_variances = daily_vols ** 2
+    mean_variance_paths = np.mean(daily_variances, axis=1)
+    integrated_variances = np.sum(mean_variance_paths, axis=0)
+    mean_daily_vols = np.mean(daily_vols, axis=(0, 1))
+    mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
+    mean_regime_1 = np.mean(regime_paths == 1, axis=(0, 1))
+    
+    # Append results for valid firms
+    for f_idx, firm in valid_firms:
+        results_list.append({
+            'gvkey': firm,
+            'date': date,
+            'rs_integrated_variance': integrated_variances[f_idx],
+            'rs_mean_daily_volatility': mean_daily_vols[f_idx],
+            'rs_fraction_regime_0': mean_regime_0[f_idx],
+            'rs_fraction_regime_1': mean_regime_1[f_idx],
+        })
+    
+    return results_list
+
+
+def monte_carlo_regime_switching_1year_parallel(
+    garch_file, 
+    regime_params_file,
+    gvkey_selected=None, 
+    num_simulations=1000, 
+    num_days=252,
+    n_jobs=-1
+):
+    """
+    PARALLELIZED Monte Carlo regime-switching forecast for 1 year.
+    
+    This version processes different dates in parallel for significant speedup.
+    """
+    start_time = pd.Timestamp.now()
+    
+    print(f"\n{'='*80}")
+    print("PARALLELIZED MONTE CARLO REGIME-SWITCHING 1-YEAR FORECAST")
+    print(f"{'='*80}\n")
+    
+    # Load regime parameters
+    try:
+        regime_params = pd.read_csv(regime_params_file)
+        print(f"✓ Loaded regime-switching parameters for {len(regime_params)} firms")
+    except FileNotFoundError:
+        print(f"✗ File '{regime_params_file}' not found!")
+        return pd.DataFrame()
+    
+    # Create parameters dictionary for faster lookup
+    regime_params_dict = {}
+    for _, row in regime_params.iterrows():
+        regime_params_dict[row['gvkey']] = {
+            'regime_0_mean': row['regime_0_mean'],
+            'regime_1_mean': row['regime_1_mean'],
+            'regime_0_ar': row['regime_0_ar'],
+            'regime_1_ar': row['regime_1_ar'],
+            'regime_0_vol': row['regime_0_vol'],
+            'regime_1_vol': row['regime_1_vol'],
+            'transition_prob_00': row['transition_prob_00'],
+            'transition_prob_01': row['transition_prob_01'],
+            'transition_prob_10': row['transition_prob_10'],
+            'transition_prob_11': row['transition_prob_11'],
+        }
+    
+    # Load GARCH base data
+    df_garch = pd.read_csv(garch_file)
+    df_garch['date'] = pd.to_datetime(df_garch['date'])
+    
+    if gvkey_selected is not None:
+        df_garch = df_garch[df_garch['gvkey'].isin(gvkey_selected)]
+    
+    print(f"✓ Loaded {len(df_garch):,} observations")
+    print(f"  Firms: {df_garch['gvkey'].nunique()}")
+    print(f"  Dates: {df_garch['date'].nunique()}")
+    print(f"  Simulations: {num_simulations:,}")
+    print(f"  Horizon: {num_days} days")
+    print(f"  Parallel jobs: {n_jobs}")
+    
+    # Prepare date groups
+    date_groups = []
+    for date, group in df_garch.groupby('date'):
+        firms_on_date = list(group['gvkey'].unique())
+        date_groups.append((date, group, regime_params_dict, firms_on_date))
+    
+    print(f"\nProcessing {len(date_groups)} dates in parallel...")
+    
+    # Parallel processing
+    results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
+        delayed(_process_single_date_rs_mc)(date_data, num_simulations, num_days)
+        for date_data in date_groups
+    )
+    
+    # Flatten results
+    results_list = []
+    for date_results in results_nested:
+        results_list.extend(date_results)
+    
+    results_df = pd.DataFrame(results_list)
+    
+    total_time = (pd.Timestamp.now() - start_time).total_seconds()
+    
+    print(f"\n{'='*80}")
+    print("PARALLELIZED REGIME-SWITCHING MC COMPLETE")
+    print(f"Total rows: {len(results_df):,}")
+    print(f"Total time: {timedelta(seconds=int(total_time))}")
+    print(f"Rows per second: {len(results_df) / total_time:.0f}")
+    print(f"{'='*80}\n")
+    
+    return results_df

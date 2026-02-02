@@ -75,6 +75,14 @@ def load_and_preprocess_data():
     print(f"Remaining firms: {df['gvkey'].nunique()}\n")
     
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    
+    # Filter out 2025 data - liabilities only available until 2024
+    # so we exclude 2025 equity data to avoid using stale liability values
+    initial_rows = len(df)
+    df = df[df["date"].dt.year <= 2024]
+    removed_rows = initial_rows - len(df)
+    print(f"Filtered out {removed_rows} rows from 2025 (keeping data up to and including 2024)")
+    
     df = df.sort_values(["isin", "date"])
     
     # Fill missing prices/shares

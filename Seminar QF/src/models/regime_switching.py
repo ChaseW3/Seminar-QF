@@ -2,7 +2,15 @@
 
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+
+# Import config for output paths
+try:
+    from src.utils import config
+    OUTPUT_DIR = config.OUTPUT_DIR
+except ImportError:
+    OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output"
 
 def run_regime_switching_estimation(daily_returns_df):
     """
@@ -138,8 +146,9 @@ def run_regime_switching_estimation(daily_returns_df):
     # Save parameters for Monte Carlo
     if params_list:
         params_df = pd.DataFrame(params_list)
-        params_df.to_csv('regime_switching_parameters.csv', index=False)
-        print(f"\n✓ Saved regime-switching parameters to 'regime_switching_parameters.csv'")
+        output_path = OUTPUT_DIR / 'regime_switching_parameters.csv'
+        params_df.to_csv(output_path, index=False)
+        print(f"\n✓ Saved regime-switching parameters to '{output_path}'")
         print(f"  Successfully estimated {len(params_list)} firms")
     
     return df_out
