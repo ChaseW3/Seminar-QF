@@ -62,16 +62,22 @@ def load_and_preprocess_data():
     })
     
     # NOW REMOVE FLAGGED COMPANIES (after column renaming)
+    # Original flags (data issues, non-Euro stocks, etc.)
     gvkeys_to_remove = [
         101248, 25466, 203053, 245663, 19349, 243774, 17828, 333645,
         101305, 61214, 15181, 14140, 100312, 101276, 100737, 214881
     ]
     
+    # NOTE: Financial institutions (banks/insurance) are now INCLUDED in the analysis
+    # Previously excluded: UniCredit, BNP, ING, Intesa, AXA (gvkeys: 15549, 15532, 15617, 16348, 63120)
+    # They are kept as the user requested, but note that Merton model may have limitations
+    # for highly leveraged financial institutions during crisis periods.
+    
     initial_firms = df['gvkey'].nunique()
     df = df[~df['gvkey'].isin(gvkeys_to_remove)]
     removed_firms = initial_firms - df['gvkey'].nunique()
     
-    print(f"Removed {removed_firms} flagged companies (gvkeys: {gvkeys_to_remove})")
+    print(f"Removed {removed_firms} flagged companies (data quality issues)")
     print(f"Remaining firms: {df['gvkey'].nunique()}\n")
     
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
@@ -107,6 +113,11 @@ def load_and_preprocess_data():
     # Preprocess Liabilities: Use fdate for Point-In-Time updates
     df2["fdate"] = pd.to_datetime(df2["fdate"], errors="coerce")
     df2 = df2.dropna(subset=["fdate"]) # Drop rows without availability date
+    
+    # CRITICAL: Liabilities in the data are in MILLIONS - convert to actual currency units
+    # to match asset values (which are in full units from market cap * shares)
+    df2["liabilities_total"] = df2["liabilities_total"] * 1_000_000
+    print(f"Scaled liabilities from millions to actual currency units (×1,000,000)")
     
     # Sort for merge_asof (must be sorted by key)
     df = df.sort_values("date")
@@ -234,9 +245,9 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         month_str = pd.Timestamp(date_t).strftime('%Y-%m')
         r_annual = interest_rates_dict.get(month_str, 0.05)
         
-        # Inputs
+        # Inputs - liabilities already scaled in load_data()
         E_vec = window_df["mkt_cap"].values.astype(np.float64)
-        B_vec = window_df["liabilities_total"].values.astype(np.float64) * 1_000_000
+        B_vec = window_df["liabilities_total"].values.astype(np.float64)
         
         # Check validity
         if len(E_vec) < 10 or np.any(E_vec <= 0) or np.any(B_vec <= 0):

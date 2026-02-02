@@ -7,6 +7,70 @@ from scipy.stats import norm
 import warnings
 warnings.filterwarnings('ignore')
 
+
+def _add_regime_weighted_volatility(df):
+    """
+    Add regime-weighted volatility column for Regime Switching model.
+    
+    Loads regime parameters (regime_0_vol, regime_1_vol) from saved file
+    and computes: sigma_t = P(regime=0) * sigma_0 + P(regime=1) * sigma_1
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with regime_probability_0, regime_probability_1 columns
+    
+    Returns:
+    --------
+    pd.DataFrame with 'regime_volatility' column added
+    """
+    try:
+        from src.utils import config
+        params_file = config.OUTPUT_DIR / 'regime_switching_parameters.csv'
+    except ImportError:
+        from pathlib import Path
+        params_file = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "regime_switching_parameters.csv"
+    
+    # Load regime parameters
+    try:
+        params_df = pd.read_csv(params_file)
+        print(f"    ✓ Loaded regime parameters from {params_file.name}")
+    except FileNotFoundError:
+        print(f"    ✗ Regime parameters file not found: {params_file}")
+        # Fallback: use asset_volatility if available
+        if 'asset_volatility' in df.columns:
+            df['regime_volatility'] = df['asset_volatility']
+            print("    ⚠ Using asset_volatility as fallback")
+        return df
+    
+    # Create a mapping of gvkey -> (sigma_0, sigma_1)
+    params_dict = {}
+    for _, row in params_df.iterrows():
+        gvkey = row['gvkey']
+        params_dict[gvkey] = (row['regime_0_vol'], row['regime_1_vol'])
+    
+    # Compute regime-weighted volatility
+    def compute_regime_vol(row):
+        gvkey = row['gvkey']
+        if gvkey not in params_dict:
+            return np.nan
+        sigma_0, sigma_1 = params_dict[gvkey]
+        prob_0 = row.get('regime_probability_0', 0.5)
+        prob_1 = row.get('regime_probability_1', 0.5)
+        # Handle NaN probabilities
+        if pd.isna(prob_0) or pd.isna(prob_1):
+            return np.nan
+        # Weighted average volatility
+        return prob_0 * sigma_0 + prob_1 * sigma_1
+    
+    df['regime_volatility'] = df.apply(compute_regime_vol, axis=1)
+    
+    valid_count = df['regime_volatility'].notna().sum()
+    print(f"    ✓ Computed regime-weighted volatility for {valid_count:,} observations")
+    
+    return df
+
+
 def load_auxiliary_data():
     """
     Load liabilities and interest rates from source files.
@@ -89,9 +153,11 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     if model_name == 'GARCH':
         vol_col = 'garch_volatility'
     elif model_name == 'Regime Switching':
-        vol_col = 'garch_volatility'
+        # Regime switching needs special handling - compute regime-weighted volatility
+        vol_col = 'regime_volatility'
+        df_merged = _add_regime_weighted_volatility(df_merged)
     elif model_name == 'MS-GARCH':
-        vol_col = 'msgarch_volatility'
+        vol_col = 'ms_garch_volatility'  # Correct column name
     else:
         vol_col = 'garch_volatility'
     
@@ -101,8 +167,8 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
         print(f"       Available columns: {list(df_merged.columns)}")
         return None
     
-    # Create PD column name
-    col_name = f'pd_{model_name.lower().replace(" ", "_")}'
+    # Create PD column name (replace spaces and hyphens with underscores)
+    col_name = f'pd_{model_name.lower().replace(" ", "_").replace("-", "_")}'
     df_merged[col_name] = np.nan
     
     # Validity mask
@@ -125,7 +191,7 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     
     # Merton PD calculation
     V_A = valid_data['asset_value'].values
-    B = valid_data['liabilities_total'].values * 1_000_000  # Convert to actual liability value
+    B = valid_data['liabilities_total'].values  # Already scaled in data_processing.py
     
     # CRITICAL: Volatility in the CSVs is DAILY (sigma_daily).
     # Merton formula requires ANNUALIZED volatility for T=1.
@@ -259,7 +325,7 @@ def calculate_merton_pd_normal(daily_returns_file):
     
     # Merton PD calculation
     V_A = df_clean['asset_value'].values
-    B = df_clean['liabilities_total'].values * 1_000_000
+    B = df_clean['liabilities_total'].values  # Already scaled in data_processing.py
     sigma_A = df_clean['asset_volatility'].values
     r = df_clean['risk_free_rate'].values
     T = 1.0

@@ -24,17 +24,18 @@ except ImportError:
 
 
 # Company name mapping between model and CDS data
+# NOTE: Financial institutions are now INCLUDED in the analysis
 COMPANY_MAPPING = {
     # Model company name -> CDS data company name
     'ADIDAS AG': 'ADIDAS AG',
     'AIRBUS SE': 'AIRBUS SE',
     'ALLIANZ SE': 'ALLIANZ SE',
     'ANHEUSER-BUSCH INBEV': 'ANHEUSER-BUSCH',
-    'AXA SA': 'AXA',
+    'AXA SA': 'AXA',  # Financial institution - included
     'BASF SE': 'BASF SE',
     'BAYER AG': 'BAYER AG',
     'BAYERISCHE MOTOREN WERKE AKT': 'BAYER MOTOREN WERKE',
-    'BNP PARIBAS': 'BNP PARIBAS SA',
+    'BNP PARIBAS': 'BNP PARIBAS SA',  # Financial institution - included
     'DANONE SA': 'DANONE SA',
     'DEUTSCHE POST AG': 'DEUTSCHE POST AG',
     'DEUTSCHE TELEKOM': 'DEUTSCHE TELEKOM AG',
@@ -42,8 +43,8 @@ COMPANY_MAPPING = {
     'ENI SPA': 'ENI S.P.A.',
     'IBERDROLA SA': 'IBERDROLA, S.A.',
     'INFINEON TECHNOLOGIES AG': 'INFINEON TECS',
-    'ING GROEP NV': 'ING GROEP N.V.',
-    'INTESA SANPAOLO SPA': 'INTESA SANPAOLO',
+    'ING GROEP NV': 'ING GROEP N.V.',  # Financial institution - included
+    'INTESA SANPAOLO SPA': 'INTESA SANPAOLO',  # Financial institution - included
     'KERING SA': 'KERING SA',
     'KONINKLIJKE AHOLD DELHAIZE': 'KON AHOLD DELHAIZE',
     "L'AIR LIQUIDE SA": 'AIR LIQUIDE SA',
@@ -57,7 +58,7 @@ COMPANY_MAPPING = {
     'SCHNEIDER ELECTRIC S E': 'SCHNEIDER ELECTRIC',
     # 'SIEMENS ENERGY AG': 'SIEMENS AG',  # Different company - exclude
     'TOTALENERGIES SE': 'TOTALENERGIES SE',
-    'UNICREDIT SPA': 'UNICREDIT SPA',
+    'UNICREDIT SPA': 'UNICREDIT SPA',  # Financial institution - included
     'VINCI SA': 'VINCI',
     'WOLTERS KLUWER NV': 'WOLTERS KLUWER NV',
 }
@@ -339,6 +340,19 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     results = {}
     
+    # Classical Merton (Analytical - no Monte Carlo)
+    merton_cds_file = output_dir / 'cds_spreads_merton_analytical.csv'
+    if merton_cds_file.exists():
+        results['Merton'] = calculate_cds_correlations(
+            model_cds_file=merton_cds_file,
+            merton_file=merton_file,
+            cds_market_df=cds_market,
+            model_name='Classical Merton',
+            col_prefix='cds_spread_merton'
+        )
+    else:
+        print(f"⚠ Warning: {merton_cds_file} not found. Run analytical Merton CDS calculation first.")
+    
     # GARCH
     results['GARCH'] = calculate_cds_correlations(
         model_cds_file=output_dir / 'cds_spreads_garch_mc_all_firms.csv',
@@ -374,7 +388,14 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Build summary DataFrame with all metrics
     summary_df = results['GARCH'][2][['company', 'gvkey', 'n_obs']].copy()
     
-    for model_key, model_short in [('GARCH', 'GARCH'), ('RS', 'RS'), ('MSGARCH', 'MSGARCH')]:
+    # Include Merton if available
+    model_list = [('GARCH', 'GARCH'), ('RS', 'RS'), ('MSGARCH', 'MSGARCH')]
+    if 'Merton' in results:
+        model_list = [('Merton', 'Merton')] + model_list
+    
+    for model_key, model_short in model_list:
+        if model_key not in results:
+            continue
         firm_df = results[model_key][2]
         summary_df = summary_df.merge(
             firm_df[['company', 'rmse_5y', 'corr_levels_5y', 'corr_changes_5y']].rename(columns={
@@ -396,7 +417,14 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     print("OVERALL SUMMARY STATISTICS (5-Year Maturity)")
     print("="*80)
     
-    for model_key, model_name in [('GARCH', 'GARCH'), ('RS', 'Regime-Switching'), ('MSGARCH', 'MS-GARCH')]:
+    # Include Merton if available
+    model_display_list = [('GARCH', 'GARCH'), ('RS', 'Regime-Switching'), ('MSGARCH', 'MS-GARCH')]
+    if 'Merton' in results:
+        model_display_list = [('Merton', 'Classical Merton')] + model_display_list
+    
+    for model_key, model_name in model_display_list:
+        if model_key not in results:
+            continue
         metrics = results[model_key][1]
         firm_df = results[model_key][2]
         
@@ -437,7 +465,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     return results
 
 
-def plot_cds_correlations(results, output_dir=None, maturity=5):
+def plot_cds_correlations(results, output_dir=None, maturity=5, axis_limit=None):
     """
     Create scatter plots of model vs market CDS spreads.
     
@@ -449,18 +477,38 @@ def plot_cds_correlations(results, output_dir=None, maturity=5):
         Directory to save plot. Defaults to config.OUTPUT_DIR
     maturity : int
         Maturity to plot (1, 3, or 5)
+    axis_limit : float, optional
+        Maximum value for both axes (to zoom in and exclude extreme outliers).
+        If None, uses data maximum. Recommended: 500-1000 for better visualization.
     """
     if output_dir is None:
         output_dir = config.OUTPUT_DIR
     output_dir = Path(output_dir)
     
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
-    for ax, (model_key, model_name) in zip(axes, [
+    # Determine which models are available
+    available_models = []
+    if 'Merton' in results:
+        available_models.append(('Merton', 'Classical Merton'))
+    available_models.extend([
         ('GARCH', 'GARCH'),
         ('RS', 'Regime-Switching'),
         ('MSGARCH', 'MS-GARCH')
-    ]):
+    ])
+    
+    # Filter to only models that are actually in results
+    available_models = [(k, n) for k, n in available_models if k in results]
+    n_models = len(available_models)
+    
+    # Create subplot grid (2x2 if 4 models, 1x3 if 3 models)
+    if n_models == 4:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        axes = axes.flatten()
+    else:
+        fig, axes = plt.subplots(1, n_models, figsize=(5*n_models, 5))
+        if n_models == 1:
+            axes = [axes]
+    
+    for ax, (model_key, model_name) in zip(axes, available_models):
         merged_df = results[model_key][0]
         model_col = f'cds_model_{maturity}y_bps'
         market_col = f'cds_market_{maturity}y_bps'
@@ -468,18 +516,35 @@ def plot_cds_correlations(results, output_dir=None, maturity=5):
         valid = merged_df[[model_col, market_col]].dropna()
         
         if len(valid) > 0:
-            ax.scatter(valid[market_col], valid[model_col], alpha=0.3, s=5)
+            # Filter data if axis_limit is specified (for better visualization)
+            if axis_limit is not None:
+                valid_filtered = valid[(valid[market_col] <= axis_limit) & (valid[model_col] <= axis_limit)]
+                n_excluded = len(valid) - len(valid_filtered)
+                label_suffix = f' ({n_excluded} outliers excluded)' if n_excluded > 0 else ''
+            else:
+                valid_filtered = valid
+                label_suffix = ''
+            
+            ax.scatter(valid_filtered[market_col], valid_filtered[model_col], alpha=0.3, s=5)
             
             # Add 45-degree line
-            max_val = max(valid[market_col].max(), valid[model_col].max())
-            ax.plot([0, max_val], [0, max_val], 'r--', label='Perfect correlation')
+            if axis_limit is not None:
+                max_val = axis_limit
+            else:
+                max_val = max(valid[market_col].max(), valid[model_col].max())
+            ax.plot([0, max_val], [0, max_val], 'r--', linewidth=1, label='Perfect correlation')
             
-            # Calculate correlation
+            # Calculate correlation (using ALL data, not filtered)
             corr = valid[model_col].corr(valid[market_col])
-            ax.set_title(f'{model_name}\nCorrelation: {corr:.4f}')
+            ax.set_title(f'{model_name}\nCorrelation: {corr:.4f}{label_suffix}', fontsize=10)
             ax.set_xlabel('Market CDS Spread (bps)')
             ax.set_ylabel('Model CDS Spread (bps)')
-            ax.legend()
+            ax.legend(fontsize=8)
+            
+            # Set axis limits
+            ax.set_xlim(0, max_val)
+            ax.set_ylim(0, max_val)
+            ax.grid(True, alpha=0.3)
     
     plt.suptitle(f'Model-Implied vs Market CDS Spreads ({maturity}-Year Maturity)', fontsize=14)
     plt.tight_layout()

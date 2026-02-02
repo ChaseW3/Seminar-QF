@@ -58,6 +58,73 @@ class CDSSpreadCalculator:
         print(f"  Methodology: Malone et al. (2009) - Risk-neutral valuation\n")
     
     
+    def _add_regime_weighted_volatility_for_cds(self, df_base, df_regime):
+        """
+        Add regime-weighted volatility for Regime Switching model CDS calculation.
+        
+        Loads regime parameters and computes:
+            sigma_t = P(regime=0) * sigma_0 + P(regime=1) * sigma_1
+        
+        Parameters:
+        -----------
+        df_base : pd.DataFrame
+            Base DataFrame with gvkey, date, asset_value, liabilities_total
+        df_regime : pd.DataFrame
+            Regime switching results with regime_probability_0, regime_probability_1
+            
+        Returns:
+        --------
+        pd.DataFrame with 'regime_volatility' column
+        """
+        # Try to load regime parameters
+        try:
+            from src.utils import config
+            params_file = config.OUTPUT_DIR / 'regime_switching_parameters.csv'
+        except ImportError:
+            params_file = os.path.join(os.path.dirname(__file__), '..', '..', 
+                                       'data', 'output', 'regime_switching_parameters.csv')
+        
+        # Merge base with regime data
+        regime_cols = ['gvkey', 'date', 'regime_probability_0', 'regime_probability_1']
+        available_cols = [c for c in regime_cols if c in df_regime.columns]
+        df_merged = pd.merge(df_base, df_regime[available_cols], on=['gvkey', 'date'], how='left')
+        
+        # Load parameters
+        try:
+            params_df = pd.read_csv(params_file)
+            print(f"    ✓ Loaded regime parameters from {os.path.basename(str(params_file))}")
+            
+            # Create mapping
+            params_dict = {}
+            for _, row in params_df.iterrows():
+                params_dict[row['gvkey']] = (row['regime_0_vol'], row['regime_1_vol'])
+            
+            # Compute regime-weighted volatility
+            def compute_vol(row):
+                gvkey = row['gvkey']
+                if gvkey not in params_dict:
+                    return np.nan
+                sigma_0, sigma_1 = params_dict[gvkey]
+                prob_0 = row.get('regime_probability_0', 0.5)
+                prob_1 = row.get('regime_probability_1', 0.5)
+                if pd.isna(prob_0) or pd.isna(prob_1):
+                    return np.nan
+                return prob_0 * sigma_0 + prob_1 * sigma_1
+            
+            df_merged['regime_volatility'] = df_merged.apply(compute_vol, axis=1)
+            
+        except FileNotFoundError:
+            print(f"    ⚠ Regime parameters file not found, using asset_volatility as fallback")
+            if 'asset_volatility' in df_regime.columns:
+                df_merged = pd.merge(df_merged, df_regime[['gvkey', 'date', 'asset_volatility']], 
+                                    on=['gvkey', 'date'], how='left', suffixes=('', '_regime'))
+                df_merged['regime_volatility'] = df_merged['asset_volatility']
+            else:
+                df_merged['regime_volatility'] = np.nan
+        
+        return df_merged
+    
+    
     def black_scholes_put_value(self, V_t, K, r, sigma_V, tau):
         """
         Compute Black-Scholes put option value on firm assets.
@@ -197,7 +264,7 @@ class CDSSpreadCalculator:
         
         # Get asset values and debt
         V_t = df_model['asset_value'].values
-        K = df_model['liabilities_total'].values * 1_000_000  # Convert to actual values
+        K = df_model['liabilities_total'].values  # Already scaled in data_processing.py
         sigma_V = df_model[volatility_column].values
         
         # Calculate spreads for each maturity
@@ -264,17 +331,17 @@ class CDSSpreadCalculator:
         # Load Regime Switching results
         df_regime = pd.read_csv(pd_regime_file)
         df_regime['date'] = pd.to_datetime(df_regime['date'])
-        df_regime_merged = pd.merge(df_base, df_regime[['gvkey', 'date', 'garch_volatility']], 
-                                    on=['gvkey', 'date'], how='left')
-        df_regime_merged = df_regime_merged.rename(columns={'garch_volatility': 'regime_volatility'})
+        
+        # For Regime Switching: compute regime-weighted volatility from parameters
+        df_regime_merged = self._add_regime_weighted_volatility_for_cds(df_base, df_regime)
         print(f"✓ Loaded Regime Switching volatility: {df_regime_merged['regime_volatility'].notna().sum():,} observations")
         
-        # Load MS-GARCH results
+        # Load MS-GARCH results (correct column name: ms_garch_volatility)
         df_msgarch = pd.read_csv(pd_msgarch_file)
         df_msgarch['date'] = pd.to_datetime(df_msgarch['date'])
-        df_msgarch_merged = pd.merge(df_base, df_msgarch[['gvkey', 'date', 'msgarch_volatility']], 
+        df_msgarch_merged = pd.merge(df_base, df_msgarch[['gvkey', 'date', 'ms_garch_volatility']], 
                                      on=['gvkey', 'date'], how='left')
-        print(f"✓ Loaded MS-GARCH volatility: {df_msgarch_merged['msgarch_volatility'].notna().sum():,} observations\n")
+        print(f"✓ Loaded MS-GARCH volatility: {df_msgarch_merged['ms_garch_volatility'].notna().sum():,} observations\n")
         
         # Calculate CDS spreads for each model
         print("Calculating model-implied CDS spreads...\n")
@@ -298,7 +365,7 @@ class CDSSpreadCalculator:
         print(f"✓ Regime Switching CDS spreads calculated")
         
         df_spreads_msgarch = self.calculate_cds_spreads_single_model(
-            df_msgarch_merged, 'MS-GARCH', volatility_column='msgarch_volatility'
+            df_msgarch_merged, 'MS-GARCH', volatility_column='ms_garch_volatility'
         )
         df_spreads_msgarch = df_spreads_msgarch.rename(columns={
             col: col.replace('cds_spread_', 'cds_spread_msgarch_')
@@ -456,7 +523,7 @@ class CDSSpreadCalculator:
         
         # Extract needed columns
         V_t = df_merged['asset_value'].values.astype(np.float64)
-        K = df_merged['liabilities_total'].values.astype(np.float64) * 1_000_000
+        K = df_merged['liabilities_total'].values.astype(np.float64)  # Already scaled in data_processing.py
         integrated_variance = df_merged[volatility_column].values.astype(np.float64)
         gvkeys = df_merged['gvkey'].values
         
@@ -702,6 +769,14 @@ class CDSSpreadCalculator:
             model_name='Merton',
             volatility_column=vol_col
         )
+        
+        # Rename columns to match the MC-based models format for consistency in correlation analysis
+        # From: cds_spread_1y_bps -> To: cds_spread_merton_1y_bps
+        rename_map = {}
+        for tau in self.maturity_horizons:
+            rename_map[f'cds_spread_{tau}y'] = f'cds_spread_merton_{tau}y'
+            rename_map[f'cds_spread_{tau}y_bps'] = f'cds_spread_merton_{tau}y_bps'
+        df_spreads = df_spreads.rename(columns=rename_map)
         
         # Save Results
         if output_file:
