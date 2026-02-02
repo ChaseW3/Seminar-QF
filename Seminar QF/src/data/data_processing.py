@@ -92,14 +92,33 @@ def load_and_preprocess_data():
         "(gvkey) Global Company Key - Company": "gvkey",
         "(fyear) Data Year - Fiscal": "fyear",
         "(lt) Liabilities - Total": "liabilities_total",
-        "(datadate) Data Date": "date", 
+        "(fdate) Final Date": "fdate",
+        "(datadate) Data Date": "datadate" 
     })
     
-    # Merge strategy: Match by Fiscal Year
-    df["fyear"] = df["date"].dt.year
-    df2_subset = df2[["gvkey", "fyear", "liabilities_total"]].drop_duplicates(subset=["gvkey", "fyear"])
+    # Preprocess Liabilities: Use fdate for Point-In-Time updates
+    df2["fdate"] = pd.to_datetime(df2["fdate"], errors="coerce")
+    df2 = df2.dropna(subset=["fdate"]) # Drop rows without availability date
     
-    df = pd.merge(df, df2_subset, on=["gvkey", "fyear"], how="left")
+    # Sort for merge_asof (must be sorted by key)
+    df = df.sort_values("date")
+    df2 = df2.sort_values("fdate")
+    
+    # Merge strategy: Point-in-Time (PIT) using fdate
+    # forward fill liabilities from the most recent fdate (direction='backward' means exact or previous)
+    print("Merging liabilities using Point-in-Time (fdate) logic...")
+    
+    df = pd.merge_asof(
+        df, 
+        df2[["gvkey", "fdate", "liabilities_total"]], 
+        left_on="date", 
+        right_on="fdate", 
+        by="gvkey", 
+        direction="backward"
+    )
+    
+    # Sort back by firm and date
+    df = df.sort_values(["gvkey", "date"])
 
     print("Loaded liability data")
     
