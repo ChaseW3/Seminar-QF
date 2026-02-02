@@ -625,3 +625,90 @@ class CDSSpreadCalculator:
         print(f"{'='*80}\n")
         
         return df_cds_spreads
+
+    def calculate_cds_spreads_analytical_merton(self, merton_file, output_file=None):
+        """
+        Calculate analytical Merton CDS spreads from Merton model results.
+        
+        Parameters:
+        -----------
+        merton_file : str
+            Path to merged_data_with_merton.csv
+        output_file : str, optional
+            Path to save output.
+        
+        Returns:
+        --------
+        df_spreads : pd.DataFrame
+            DataFrame with CDS spreads
+        """
+        from src.data.data_processing import load_interest_rates
+        
+        print(f"\n{'='*80}")
+        print("ANALYTICAL MERTON CDS SPREADS")
+        print(f"{'='*80}\n")
+        
+        if not os.path.exists(merton_file):
+            print(f"Error: {merton_file} not found.")
+            return None
+
+        print(f"Loading Merton results from {merton_file}...")
+        df_merton = pd.read_csv(merton_file)
+        if 'date' in df_merton.columns:
+            df_merton['date'] = pd.to_datetime(df_merton['date'])
+        
+        # Filter valid rows
+        initial_rows = len(df_merton)
+        # We need asset_volatility which comes from the Merton estimation (annualized)
+        required_cols = ['asset_value', 'liabilities_total', 'asset_volatility']
+        missing_cols = [c for c in required_cols if c not in df_merton.columns]
+        if missing_cols:
+             # Try fallback column names if needed
+             pass
+
+        df_merton = df_merton.dropna(subset=required_cols)
+        print(f"Filtered {initial_rows - len(df_merton)} rows with missing values.")
+
+        if df_merton.empty:
+            print("No valid data points found.")
+            return pd.DataFrame()
+
+        # Add Interest Rates
+        print("Loading Interest Rates...")
+        try:
+            df_rates = load_interest_rates()
+            df_merton['month_year'] = df_merton['date'].dt.strftime('%Y-%m')
+            
+            # Merge
+            print("Merging Interest Rates...")
+            df_model = pd.merge(df_merton, df_rates, on='month_year', how='left')
+            
+            # Handle missing rates
+            if df_model['risk_free_rate'].isna().any():
+                print("Warning: Missing interest rates found. Forward filling...")
+                df_model['risk_free_rate'] = df_model['risk_free_rate'].ffill().bfill().fillna(0.05)
+        except Exception as e:
+            print(f"Warning: Could not load interest rates ({e}). Using default 0.05.")
+            df_model = df_merton.copy()
+            df_model['risk_free_rate'] = 0.05
+
+        # Calculate CDS Spreads
+        print("Calculating CDS Spreads (Analytical Merton)...")
+        
+        vol_col = 'asset_volatility'
+        
+        df_spreads = self.calculate_cds_spreads_single_model(
+            df_model=df_model,
+            model_name='Merton',
+            volatility_column=vol_col
+        )
+        
+        # Save Results
+        if output_file:
+            print(f"Saving results to {output_file}...")
+            df_spreads.to_csv(output_file, index=False)
+            
+        print("Done calculation.\n")
+        
+        return df_spreads
+
