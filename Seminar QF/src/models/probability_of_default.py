@@ -93,7 +93,11 @@ def load_auxiliary_data():
             "(lt) Liabilities - Total": "liabilities_total",
         })
         liab_df = liab_df[["gvkey", "fyear", "liabilities_total"]].drop_duplicates(subset=["gvkey", "fyear"])
-        print(f"    ✓ Loaded {len(liab_df)} liability records")
+        
+        # CRITICAL: Liabilities in the data are in MILLIONS - convert to actual currency units
+        # to match asset values (which are in full units from market cap * shares)
+        liab_df["liabilities_total"] = liab_df["liabilities_total"] * 1_000_000
+        print(f"    ✓ Loaded {len(liab_df)} liability records (scaled from millions to full units)")
     except Exception as e:
         print(f"    ✗ Error loading liabilities: {e}")
         return None, None
