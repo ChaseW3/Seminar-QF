@@ -3,6 +3,14 @@
 import pandas as pd
 import numpy as np
 from arch import arch_model
+from pathlib import Path
+
+# Import config for output paths
+try:
+    from src.utils import config
+    OUTPUT_DIR = config.OUTPUT_DIR
+except ImportError:
+    OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output"
 
 def run_garch_estimation(daily_returns_df):
     """
@@ -28,6 +36,9 @@ def run_garch_estimation(daily_returns_df):
     print(f"Processing GARCH for {len(firms)} firms (Daily Data)...")
     
     SCALE_FACTOR = 100  # Scale returns to percentage form
+    
+    # Initialize list to store parameters for each firm
+    params_list = []
     
     for i, gvkey in enumerate(firms):
         mask = df_out["gvkey"] == gvkey
@@ -68,6 +79,22 @@ def run_garch_estimation(daily_returns_df):
             df_out.loc[firm_ts.index, "garch_beta"] = beta
             df_out.loc[firm_ts.index, "garch_nu"] = nu  # Save degrees of freedom
             
+            # Store parameters for this firm
+            params_row = {
+                'gvkey': gvkey,
+                'omega': omega,
+                'alpha': alpha,
+                'beta': beta,
+                'nu': nu,
+                'persistence': alpha + beta,
+                'unconditional_variance': omega / (1 - alpha - beta) if (alpha + beta) < 1 else np.nan,
+                'log_likelihood': float(res.llf) if hasattr(res, 'llf') else np.nan,
+                'aic': float(res.aic) if hasattr(res, 'aic') else np.nan,
+                'bic': float(res.bic) if hasattr(res, 'bic') else np.nan,
+                'num_observations': len(returns)
+            }
+            params_list.append(params_row)
+            
         except Exception as e:
             continue
             
@@ -75,4 +102,15 @@ def run_garch_estimation(daily_returns_df):
             print(f"Processed GARCH for {i+1} firms...")
 
     print("GARCH estimation complete.")
+    
+    # Save parameters for Monte Carlo and reference
+    if params_list:
+        params_df = pd.DataFrame(params_list)
+        output_path = OUTPUT_DIR / 'garch_parameters.csv'
+        params_df.to_csv(output_path, index=False)
+        print(f"\n✓ Saved GARCH parameters to '{output_path}'")
+        print(f"  Successfully estimated {len(params_list)} firms")
+        print(f"  Mean persistence (α+β): {params_df['persistence'].mean():.4f}")
+        print(f"  Mean degrees of freedom (ν): {params_df['nu'].mean():.2f}")
+    
     return df_out
