@@ -393,25 +393,46 @@ class MSGARCHOptimized:
         nu_base = garch_params['nu']
         mu_base = garch_params['mu']
         
-        # Regime 0 (low vol): slightly lower omega
-        # Regime 1 (high vol): slightly higher omega
-        omega_0_init = omega_base * 0.7
-        omega_1_init = omega_base * 1.5
+        # IMPROVED: Create more distinct initial regimes
+        # Regime 0 (low vol): Lower omega, higher persistence (lower alpha, higher beta)
+        # Regime 1 (high vol): Higher omega, lower persistence (higher alpha, lower beta)
+        omega_0_init = omega_base * 0.4  # Lower base volatility
+        omega_1_init = omega_base * 2.5  # Higher base volatility
+        
+        # More differentiated GARCH parameters
+        alpha_0_init = max(alpha_base * 0.5, 0.02)   # Lower alpha for low-vol regime
+        alpha_1_init = min(alpha_base * 1.8, 0.25)   # Higher alpha for high-vol regime
+        beta_0_init = min(beta_base * 1.05, 0.97)    # Higher beta for low-vol regime
+        beta_1_init = max(beta_base * 0.85, 0.55)    # Lower beta for high-vol regime
+        
+        # Different means for regimes
+        mu_0_init = mu_base + 0.0002  # Slight positive bias for low-vol
+        mu_1_init = mu_base - 0.0003  # Slight negative bias for high-vol
+        
+        # CRITICAL: Different degrees of freedom for each regime
+        # Regime 0 (low vol, calm): Higher ν → thinner tails (closer to normal)
+        # Regime 1 (high vol, stress): Lower ν → fatter tails (more extreme events)
+        nu_0_init = max(min(nu_base * 2.0, 25.0), 12.0)  # High ν: 12-25 range
+        nu_1_init = max(min(nu_base * 0.4, 8.0), 2.5)     # Low ν: 2.5-8 range
+        
+        if verbose:
+            print(f"    → Initial degrees of freedom: ν₀={nu_0_init:.1f} (low-vol), "
+                  f"ν₁={nu_1_init:.1f} (high-vol)")
         
         # Transform initial values for unconstrained optimization
         x0 = np.array([
             np.log(max(omega_0_init, 1e-10)),  # log(omega_0)
-            self._alpha_to_unconstrained(alpha_base * 0.8),  # alpha_0
-            self._beta_to_unconstrained(beta_base),  # beta_0
+            self._alpha_to_unconstrained(alpha_0_init),  # alpha_0
+            self._beta_to_unconstrained(beta_0_init),  # beta_0
             np.log(max(omega_1_init, 1e-10)),  # log(omega_1)
-            self._alpha_to_unconstrained(alpha_base * 1.2),  # alpha_1
-            self._beta_to_unconstrained(beta_base * 0.95),  # beta_1
-            mu_base,  # mu_0
-            mu_base,  # mu_1
-            2.5,  # logit(p00) - high persistence
-            2.5,  # logit(p11) - high persistence
-            self._nu_to_unconstrained(nu_base),  # nu_0
-            self._nu_to_unconstrained(nu_base)   # nu_1
+            self._alpha_to_unconstrained(alpha_1_init),  # alpha_1
+            self._beta_to_unconstrained(beta_1_init),  # beta_1
+            mu_0_init,  # mu_0
+            mu_1_init,  # mu_1
+            0.0,  # logit(p00) - lower regime persistence (was 2.2)
+            0.0,  # logit(p11) - lower regime persistence (was 2.2)
+            self._nu_to_unconstrained(nu_0_init),  # nu_0 - HIGH df (thin tails)
+            self._nu_to_unconstrained(nu_1_init)   # nu_1 - LOW df (fat tails)
         ])
         
         # =====================================================================
@@ -436,8 +457,9 @@ class MSGARCHOptimized:
                 mu_0 = params[6]
                 mu_1 = params[7]
                 
-                p00 = 0.5 + 0.49 * expit(params[8])
-                p11 = 0.5 + 0.49 * expit(params[9])
+                # Natural range for transition probabilities [0, 1]
+                p00 = expit(params[8])  # Range: 0 to 1 (natural sigmoid)
+                p11 = expit(params[9])  # Range: 0 to 1 (natural sigmoid)
                 
                 nu_0 = self._unconstrained_to_nu(params[10])
                 nu_1 = self._unconstrained_to_nu(params[11])
@@ -462,23 +484,70 @@ class MSGARCHOptimized:
                 return 1e10
         
         # =====================================================================
-        # OPTIMIZATION 4: Better Optimizer Settings
+        # OPTIMIZATION 4: Better Optimizer Settings with Multi-Start
         # =====================================================================
         
         if verbose:
-            print("    → Running L-BFGS-B optimization...")
+            print("    → Running L-BFGS-B optimization with multi-start...")
         
+        # Try main initialization
         result = minimize(
             neg_log_likelihood,
             x0,
             method='L-BFGS-B',
             options={
-                'maxiter': 300,  # Reduced iterations (warm start helps)
-                'ftol': 1e-6,    # Function tolerance
-                'gtol': 1e-5,    # Gradient tolerance
+                'maxiter': 500,      # Increased for better convergence
+                'ftol': 1e-8,        # Tighter function tolerance
+                'gtol': 1e-6,        # Tighter gradient tolerance
+                'maxfun': 1000,      # Allow more function evaluations
                 'disp': False
             }
         )
+        
+        best_result = result
+        best_nll = result.fun
+        
+        # Try alternative initialization with swapped regimes (helps avoid labeling issue)
+        if best_nll > 1e9:  # If first attempt failed badly, try alternatives
+            if verbose:
+                print("    → First attempt suboptimal, trying alternative initialization...")
+            
+            # Alternative 1: More extreme regime differentiation
+            x0_alt = np.array([
+                np.log(max(omega_base * 0.3, 1e-10)),
+                self._alpha_to_unconstrained(0.03),
+                self._beta_to_unconstrained(0.95),
+                np.log(max(omega_base * 3.0, 1e-10)),
+                self._alpha_to_unconstrained(0.20),
+                self._beta_to_unconstrained(0.65),
+                mu_base + 0.0005,
+                mu_base - 0.0005,
+                -0.5,  # Lower p00 initialization
+                -0.5,  # Lower p11 initialization
+                self._nu_to_unconstrained(20.0),  # HIGH df for low-vol regime
+                self._nu_to_unconstrained(3.0)    # LOW df for high-vol regime
+            ])
+            
+            result_alt = minimize(
+                neg_log_likelihood,
+                x0_alt,
+                method='L-BFGS-B',
+                options={
+                    'maxiter': 500,
+                    'ftol': 1e-8,
+                    'gtol': 1e-6,
+                    'maxfun': 1000,
+                    'disp': False
+                }
+            )
+            
+            if result_alt.fun < best_nll:
+                best_result = result_alt
+                best_nll = result_alt.fun
+                if verbose:
+                    print("    → Alternative initialization improved fit")
+        
+        result = best_result
         
         # Extract final parameters
         params_opt = result.x
@@ -490,10 +559,42 @@ class MSGARCHOptimized:
         beta_1 = self._unconstrained_to_beta(params_opt[5])
         mu_0 = params_opt[6]
         mu_1 = params_opt[7]
-        p00 = 0.5 + 0.49 * expit(params_opt[8])
-        p11 = 0.5 + 0.49 * expit(params_opt[9])
+        p00 = expit(params_opt[8])  # Range: 0 to 1 (natural sigmoid)
+        p11 = expit(params_opt[9])  # Range: 0 to 1 (natural sigmoid)
         nu_0 = self._unconstrained_to_nu(params_opt[10])
         nu_1 = self._unconstrained_to_nu(params_opt[11])
+        
+        # Check regime differentiation
+        # Calculate unconditional volatilities for each regime
+        uncond_vol_0 = np.sqrt(omega_0 / max(1 - alpha_0 - beta_0, 0.01))
+        uncond_vol_1 = np.sqrt(omega_1 / max(1 - alpha_1 - beta_1, 0.01))
+        persistence_0 = alpha_0 + beta_0
+        persistence_1 = alpha_1 + beta_1
+        
+        # Ensure regime 0 is low volatility, regime 1 is high volatility
+        # Label switching correction: Check BOTH volatility and degrees of freedom
+        # Low-vol regime should have: lower uncond_vol AND higher nu (thinner tails)
+        # Use composite score: lower volatility + higher df = more "calm"
+        
+        # Normalize metrics for comparison (lower score = more calm regime)
+        vol_ratio = uncond_vol_0 / (uncond_vol_0 + uncond_vol_1)  # 0 to 1
+        nu_ratio = nu_1 / (nu_0 + nu_1)  # 0 to 1 (inverted: high nu_0 → low ratio)
+        
+        # Composite "calm score" for regime 0 (lower is calmer)
+        calm_score_0 = vol_ratio + nu_ratio  # Should be < 1 if regime 0 is calm
+        
+        # If score > 1, regime 0 is actually the high-vol regime → swap
+        if calm_score_0 > 1.0:
+            if verbose:
+                print("    → Swapping regime labels (regime 0 should be low-vol/high-nu)")
+            omega_0, omega_1 = omega_1, omega_0
+            alpha_0, alpha_1 = alpha_1, alpha_0
+            beta_0, beta_1 = beta_1, beta_0
+            mu_0, mu_1 = mu_1, mu_0
+            p00, p11 = p11, p00
+            nu_0, nu_1 = nu_1, nu_0
+            uncond_vol_0, uncond_vol_1 = uncond_vol_1, uncond_vol_0
+            persistence_0, persistence_1 = persistence_1, persistence_0
         
         # Store parameters
         self.params = {
@@ -525,10 +626,11 @@ class MSGARCHOptimized:
             print(f"  MLE converged: {result.success}")
             print(f"  Log-likelihood: {self.log_likelihood:.2f}")
             print(f"  Regime 0 (low vol): omega={omega_0:.6f}, alpha={alpha_0:.4f}, "
-                  f"beta={beta_0:.4f}, nu={nu_0:.2f}")
+                  f"beta={beta_0:.4f}, persist={persistence_0:.4f}, uncond_vol={uncond_vol_0:.4f}, ν={nu_0:.2f}")
             print(f"  Regime 1 (high vol): omega={omega_1:.6f}, alpha={alpha_1:.4f}, "
-                  f"beta={beta_1:.4f}, nu={nu_1:.2f}")
-            print(f"  Persistence: p00={p00:.4f}, p11={p11:.4f}")
+                  f"beta={beta_1:.4f}, persist={persistence_1:.4f}, uncond_vol={uncond_vol_1:.4f}, ν={nu_1:.2f}")
+            print(f"  Transition probs: p00={p00:.4f}, p11={p11:.4f}")
+            print(f"  Volatility ratio: {uncond_vol_1/uncond_vol_0:.2f}x, ν ratio: {nu_0/nu_1:.2f}x")
         
         return self.params
     
@@ -538,30 +640,33 @@ class MSGARCHOptimized:
     
     def _alpha_to_unconstrained(self, alpha):
         """Transform alpha to unconstrained space."""
-        alpha = min(max(alpha, 0.01), 0.29)
-        return np.log(alpha / (0.3 - alpha))
+        # Natural bound: (0, 1) but practically (0.001, 0.99)
+        alpha = min(max(alpha, 0.001), 0.99)
+        return np.log(alpha / (1 - alpha))
     
     def _unconstrained_to_alpha(self, x):
-        """Transform back to alpha (bounded 0, 0.3)."""
-        return 0.3 * expit(x)
+        """Transform back to alpha (bounded 0, 1 via sigmoid)."""
+        return expit(x)  # Natural sigmoid: 0 to 1
     
     def _beta_to_unconstrained(self, beta):
         """Transform beta to unconstrained space."""
-        beta = min(max(beta, 0.51), 0.98)
-        return np.log((beta - 0.5) / (0.99 - beta))
+        # Natural bound: (0, 1) but practically (0.001, 0.999)
+        beta = min(max(beta, 0.001), 0.999)
+        return np.log(beta / (1 - beta))
     
     def _unconstrained_to_beta(self, x):
-        """Transform back to beta (bounded 0.5, 0.99)."""
-        return 0.5 + 0.49 * expit(x)
+        """Transform back to beta (bounded 0, 1 via sigmoid)."""
+        return expit(x)  # Natural sigmoid: 0 to 1
     
     def _nu_to_unconstrained(self, nu):
         """Transform nu to unconstrained space."""
-        nu = min(max(nu, 2.2), 29)
-        return np.log((nu - 2.1) / (30 - nu))
+        # Natural bound: (2, ∞) - keep sensible upper limit for numerical stability
+        nu = min(max(nu, 2.1), 100)
+        return np.log(nu - 2)
     
     def _unconstrained_to_nu(self, x):
-        """Transform back to nu (bounded 2.1, 30)."""
-        return 2.1 + 27.9 * expit(x)
+        """Transform back to nu (bounded 2+, no artificial upper cap)."""
+        return 2 + np.exp(x)  # Range: (2, ∞) in practice capped by exp limit
     
     # =========================================================================
     # Accessor methods

@@ -70,7 +70,7 @@ def load_and_preprocess_data():
     
     # NOTE: Financial institutions (banks/insurance) are now INCLUDED in the analysis
     # Previously excluded: UniCredit, BNP, ING, Intesa, AXA (gvkeys: 15549, 15532, 15617, 16348, 63120)
-    # They are kept as the user requested, but note that Merton model may have limitations
+    # note that Merton model may have limitations
     # for highly leveraged financial institutions during crisis periods.
     
     initial_firms = df['gvkey'].nunique()
@@ -124,8 +124,11 @@ def load_and_preprocess_data():
     df2 = df2.sort_values("fdate")
     
     # Merge strategy: Point-in-Time (PIT) using fdate
-    # forward fill liabilities from the most recent fdate (direction='backward' means exact or previous)
-    print("Merging liabilities using Point-in-Time (fdate) logic...")
+    # CRITICAL FIX: fdate represents when liability data becomes AVAILABLE
+    # The liability value should apply to the period BEFORE that fdate
+    # direction='forward' means: use the NEXT available fdate's liability value
+    # This ensures liability from fdate 2011-12-31 applies to dates BEFORE 2011-12-31
+    print("Merging liabilities using Point-in-Time (fdate) logic (backward-looking)...")
     
     df = pd.merge_asof(
         df, 
@@ -133,7 +136,7 @@ def load_and_preprocess_data():
         left_on="date", 
         right_on="fdate", 
         by="gvkey", 
-        direction="backward"
+        direction="forward"  # Use NEXT fdate (so liability applies to period before fdate)
     )
     
     # Sort back by firm and date
@@ -267,7 +270,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
             
         sigma_E_annual = sigma_E_daily * np.sqrt(252)
         
-        # CALL VECTORIZED FUNCTION (NO NUMBA)
+        # CALL VECTORIZED FUNCTION 
         # Use T = 365/360 consistent with ACT/360 money market convention for rates
         T_val = 1
         try:
