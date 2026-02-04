@@ -14,9 +14,12 @@ Market value of risky debt:
 where K_i(τ) is promised debt repayment and P^(m)_i,t(τ) is the value of the 
 implicit put option on firm assets (Black-Scholes form).
 
-Model-implied credit spread (risk-neutral):
+Model-implied credit spread (risk-neutral) with recovery rate R:
     s^(m)_i,t(τ) = y^(m)_i,t(τ) - r_t
-                 = -(1/τ) ln(1 - P^(m)_i,t(τ) / (K_i(τ) e^(-r_t τ)))
+                 = -(1/τ) ln(1 - (1-R) × P^(m)_i,t(τ) / (K_i(τ) e^(-r_t τ)))
+
+where R is the recovery rate (default: 25% for senior unsecured debt).
+The loss given default (LGD) = 1 - R scales the expected loss.
 """
 
 import pandas as pd
@@ -42,7 +45,7 @@ class CDSSpreadCalculator:
         CDS maturities τ in years. Default: [1, 3, 5]
     """
     
-    def __init__(self, maturity_horizons=[1, 3, 5]):
+    def __init__(self, maturity_horizons=[1, 3, 5], recovery_rate=0.25):
         """
         Initialize CDS Spread Calculator.
         
@@ -50,11 +53,16 @@ class CDSSpreadCalculator:
         -----------
         maturity_horizons : list
             CDS maturities in years (1Y, 3Y, 5Y per Section 2.4.2)
+        recovery_rate : float
+            Recovery rate on defaulted debt (default: 0.25 or 25%)
+            Typical market convention: 25-40% for senior unsecured debt
         """
         self.maturity_horizons = maturity_horizons
+        self.recovery_rate = recovery_rate
         
         print(f"\nCDS Spread Calculator initialized (Section 2.4.2):")
         print(f"  CDS Maturities: {self.maturity_horizons} years")
+        print(f"  Recovery Rate: {self.recovery_rate*100:.0f}% (Loss Given Default: {(1-self.recovery_rate)*100:.0f}%)")
         print(f"  Methodology: Malone et al. (2009) - Risk-neutral valuation\n")
     
     
@@ -178,17 +186,27 @@ class CDSSpreadCalculator:
     
     def credit_spread_from_put_value(self, V_t, K, r, sigma_V, tau):
         """
-        Compute model-implied credit spread (risk-neutral).
+        Compute model-implied credit spread (risk-neutral) with recovery rate.
         
-        From Black-Scholes put option value P:
-            s^(m)_i,t(τ) = -(1/τ) ln(1 - P / (K e^(-r τ)))
+        From Black-Scholes put option value P and recovery rate R:
+            s^(m)_i,t(τ) = -(1/τ) ln(1 - (1-R) × P / (K e^(-r τ)))
+        
+        The recovery rate R reduces the loss given default (LGD = 1-R), which
+        reduces the expected loss and therefore the credit spread.
+        
+        Market conventions:
+        - Senior unsecured debt: R ≈ 25-40%
+        - Subordinated debt: R ≈ 10-25%
+        - Our default: R = 25% (LGD = 75%)
         
         This is directly comparable to observed CDS spreads.
         
         IMPORTANT NUMERICAL ISSUE:
         -------------------------
-        When P/(K*e^(-rτ)) approaches 1 (extreme insolvency: V << K, high volatility),
+        When (1-R)×P/(K*e^(-rτ)) approaches 1 (extreme insolvency: V << K, high volatility),
         the logarithm explodes: ln(1 - 0.9999) = -9.21 → CDS spread = 9,210 bps (1Y)
+        
+        With R=25% (LGD=75%), the effective put value is 0.75×P, which reduces extreme spreads.
         
         Clipping P_ratio to 0.9999 prevents crashes but:
         - Caps spreads at ~9,210 bps (1Y), ~3,070 bps (3Y), ~1,842 bps (5Y)
@@ -224,8 +242,13 @@ class CDSSpreadCalculator:
         # Denominator: K e^(-rτ)
         denominator = K * np.exp(-r * tau)
         
-        # Calculate P_ratio (should theoretically be < 1)
-        P_ratio = P / np.maximum(denominator, 1e-6)
+        # Apply recovery rate: effective loss = (1 - R) × P
+        # This is the key adjustment for CDS spreads
+        LGD = 1 - self.recovery_rate  # Loss Given Default
+        effective_put = LGD * P
+        
+        # Calculate P_ratio with recovery adjustment
+        P_ratio = effective_put / np.maximum(denominator, 1e-6)
         
         # CRITICAL: Identify problematic observations where P ≥ K*e^(-rτ)
         # This indicates extreme insolvency (V << K) and/or unrealistic volatility
@@ -239,8 +262,9 @@ class CDSSpreadCalculator:
             if isinstance(V_t, np.ndarray) and isinstance(K, np.ndarray):
                 leverage_problematic = K[problematic_mask] / V_t[problematic_mask]
                 mean_leverage = np.mean(leverage_problematic)
-                print(f"\n⚠️  WARNING: {n_problematic} observations ({pct_problematic:.1f}%) have P/(K*e^(-rτ)) ≥ 0.95")
+                print(f"\n⚠️  WARNING: {n_problematic} observations ({pct_problematic:.1f}%) have (1-R)×P/(K*e^(-rτ)) ≥ 0.95")
                 print(f"    This indicates severe insolvency or model breakdown")
+                print(f"    Recovery rate R = {self.recovery_rate*100:.0f}%, LGD = {LGD*100:.0f}%")
                 print(f"    Mean leverage (K/V) for these cases: {mean_leverage:.2f}x")
                 print(f"    These observations will have capped CDS spreads (~{-(1.0/tau)*np.log(0.05):.0f} bps for {tau}Y)")
                 print(f"    Recommendation: Filter firms with extreme leverage or volatility\n")
@@ -249,7 +273,7 @@ class CDSSpreadCalculator:
         # BUT: This caps CDS spreads at ~9,210 bps (1Y), ~3,070 bps (3Y), ~1,842 bps (5Y)
         P_ratio_capped = np.clip(P_ratio, 0, 0.9999)
         
-        # Credit spread formula: s = -(1/τ) ln(1 - P/(K e^(-rτ)))
+        # Credit spread formula with recovery: s = -(1/τ) ln(1 - (1-R) × P/(K e^(-rτ)))
         spread = -(1.0 / tau) * np.log(np.maximum(1 - P_ratio_capped, 1e-6))
         
         # Convert to basis points
