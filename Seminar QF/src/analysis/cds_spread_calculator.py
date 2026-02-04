@@ -185,6 +185,18 @@ class CDSSpreadCalculator:
         
         This is directly comparable to observed CDS spreads.
         
+        IMPORTANT NUMERICAL ISSUE:
+        -------------------------
+        When P/(K*e^(-rτ)) approaches 1 (extreme insolvency: V << K, high volatility),
+        the logarithm explodes: ln(1 - 0.9999) = -9.21 → CDS spread = 9,210 bps (1Y)
+        
+        Clipping P_ratio to 0.9999 prevents crashes but:
+        - Caps spreads at ~9,210 bps (1Y), ~3,070 bps (3Y), ~1,842 bps (5Y)
+        - Hides model breakdown (unrealistic leverage or volatility)
+        - Makes all extreme cases look identical
+        
+        Solution: Flag problematic observations for manual review/filtering.
+        
         Parameters:
         -----------
         V_t : float or array
@@ -212,15 +224,40 @@ class CDSSpreadCalculator:
         # Denominator: K e^(-rτ)
         denominator = K * np.exp(-r * tau)
         
-        # Avoid division by zero and log of negative/zero
+        # Calculate P_ratio (should theoretically be < 1)
         P_ratio = P / np.maximum(denominator, 1e-6)
-        P_ratio = np.clip(P_ratio, 0, 0.9999)  # Ensure valid range for ln
+        
+        # CRITICAL: Identify problematic observations where P ≥ K*e^(-rτ)
+        # This indicates extreme insolvency (V << K) and/or unrealistic volatility
+        problematic_mask = P_ratio >= 0.95  # Flag observations approaching or exceeding theoretical limit
+        
+        if np.any(problematic_mask):
+            n_problematic = np.sum(problematic_mask)
+            pct_problematic = 100 * n_problematic / len(P_ratio)
+            
+            # Calculate leverage for problematic cases (if arrays)
+            if isinstance(V_t, np.ndarray) and isinstance(K, np.ndarray):
+                leverage_problematic = K[problematic_mask] / V_t[problematic_mask]
+                mean_leverage = np.mean(leverage_problematic)
+                print(f"\n⚠️  WARNING: {n_problematic} observations ({pct_problematic:.1f}%) have P/(K*e^(-rτ)) ≥ 0.95")
+                print(f"    This indicates severe insolvency or model breakdown")
+                print(f"    Mean leverage (K/V) for these cases: {mean_leverage:.2f}x")
+                print(f"    These observations will have capped CDS spreads (~{-(1.0/tau)*np.log(0.05):.0f} bps for {tau}Y)")
+                print(f"    Recommendation: Filter firms with extreme leverage or volatility\n")
+        
+        # Cap P_ratio to prevent mathematical errors (ln of negative/zero)
+        # BUT: This caps CDS spreads at ~9,210 bps (1Y), ~3,070 bps (3Y), ~1,842 bps (5Y)
+        P_ratio_capped = np.clip(P_ratio, 0, 0.9999)
         
         # Credit spread formula: s = -(1/τ) ln(1 - P/(K e^(-rτ)))
-        spread = -(1.0 / tau) * np.log(np.maximum(1 - P_ratio, 1e-6))
+        spread = -(1.0 / tau) * np.log(np.maximum(1 - P_ratio_capped, 1e-6))
         
         # Convert to basis points
         spread_bps = spread * 10000
+        
+        # Mark capped observations with NaN (optional - uncomment to exclude from analysis)
+        # spread[problematic_mask] = np.nan
+        # spread_bps[problematic_mask] = np.nan
         
         return spread, spread_bps
     
