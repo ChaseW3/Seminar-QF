@@ -394,30 +394,37 @@ class MSGARCHOptimized:
         mu_base = garch_params['mu']
         
         # IMPROVED: Create more distinct initial regimes
+        # CONVENTION: Regime 0 = LOW volatility, Regime 1 = HIGH volatility
         # Regime 0 (low vol): Lower omega, higher persistence (lower alpha, higher beta)
         # Regime 1 (high vol): Higher omega, lower persistence (higher alpha, lower beta)
-        omega_0_init = omega_base * 0.4  # Lower base volatility
-        omega_1_init = omega_base * 2.5  # Higher base volatility
+        omega_0_init = omega_base * 0.4  # Lower base volatility (LOW-VOL REGIME)
+        omega_1_init = omega_base * 2.5  # Higher base volatility (HIGH-VOL REGIME)
         
         # More differentiated GARCH parameters
-        alpha_0_init = max(alpha_base * 0.5, 0.02)   # Lower alpha for low-vol regime
-        alpha_1_init = min(alpha_base * 1.8, 0.25)   # Higher alpha for high-vol regime
-        beta_0_init = min(beta_base * 1.05, 0.97)    # Higher beta for low-vol regime
-        beta_1_init = max(beta_base * 0.85, 0.55)    # Lower beta for high-vol regime
+        alpha_0_init = max(alpha_base * 0.5, 0.02)   # Lower alpha for LOW-VOL regime
+        alpha_1_init = min(alpha_base * 1.8, 0.25)   # Higher alpha for HIGH-VOL regime
+        beta_0_init = min(beta_base * 1.05, 0.97)    # Higher beta for LOW-VOL regime
+        beta_1_init = max(beta_base * 0.85, 0.55)    # Lower beta for HIGH-VOL regime
         
         # Different means for regimes
-        mu_0_init = mu_base + 0.0002  # Slight positive bias for low-vol
-        mu_1_init = mu_base - 0.0003  # Slight negative bias for high-vol
+        mu_0_init = mu_base + 0.0002  # Slight positive bias for LOW-VOL
+        mu_1_init = mu_base - 0.0003  # Slight negative bias for HIGH-VOL (crisis)
         
         # CRITICAL: Different degrees of freedom for each regime
-        # Regime 0 (low vol, calm): Higher ν → thinner tails (closer to normal)
-        # Regime 1 (high vol, stress): Lower ν → fatter tails (more extreme events)
-        nu_0_init = max(min(nu_base * 2.0, 25.0), 12.0)  # High ν: 12-25 range
-        nu_1_init = max(min(nu_base * 0.4, 8.0), 2.5)     # Low ν: 2.5-8 range
+        # Regime 0 (LOW vol, calm): Higher ν → thinner tails (closer to normal)
+        # Regime 1 (HIGH vol, stress): Lower ν → fatter tails (more extreme events)
+        nu_0_init = max(min(nu_base * 2.0, 25.0), 12.0)  # High ν: 12-25 range (LOW-VOL)
+        nu_1_init = max(min(nu_base * 0.4, 8.0), 2.5)     # Low ν: 2.5-8 range (HIGH-VOL)
         
         if verbose:
             print(f"    → Initial degrees of freedom: ν₀={nu_0_init:.1f} (low-vol), "
                   f"ν₁={nu_1_init:.1f} (high-vol)")
+        
+        # CRITICAL: Initialize transition probabilities with HIGH persistence
+        # expit(2.5) ≈ 0.92 - regimes should be persistent, not random
+        # Without this, optimizer converges to p00=p11=0.5 (no regime structure)
+        p00_init_logit = 2.5  # → p00 ≈ 0.92 (stay in regime 0)
+        p11_init_logit = 2.5  # → p11 ≈ 0.92 (stay in regime 1)
         
         # Transform initial values for unconstrained optimization
         x0 = np.array([
@@ -429,8 +436,8 @@ class MSGARCHOptimized:
             self._beta_to_unconstrained(beta_1_init),  # beta_1
             mu_0_init,  # mu_0
             mu_1_init,  # mu_1
-            0.0,  # logit(p00) - lower regime persistence (was 2.2)
-            0.0,  # logit(p11) - lower regime persistence (was 2.2)
+            p00_init_logit,  # logit(p00) - HIGH regime persistence
+            p11_init_logit,  # logit(p11) - HIGH regime persistence
             self._nu_to_unconstrained(nu_0_init),  # nu_0 - HIGH df (thin tails)
             self._nu_to_unconstrained(nu_1_init)   # nu_1 - LOW df (fat tails)
         ])
@@ -477,8 +484,16 @@ class MSGARCHOptimized:
                 
                 if np.isnan(ll) or np.isinf(ll):
                     return 1e10
-                    
-                return -ll
+                
+                # SOFT PENALTY: Discourage low regime persistence (p00, p11 near 0.5)
+                # Without this, optimizer can converge to p00=p11=0.5 (no regime structure)
+                # Penalty increases quadratically as probabilities approach 0.5
+                persistence_penalty = 0.0
+                for p in [p00, p11]:
+                    if p < 0.7:  # Only penalize if persistence is low
+                        persistence_penalty += 10 * (0.7 - p) ** 2
+                
+                return -ll + persistence_penalty
                 
             except Exception:
                 return 1e10

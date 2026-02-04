@@ -111,6 +111,7 @@ def run_regime_switching_estimation(daily_returns_df):
             p_00 = float(params_dict.get('p[0->0]', np.nan))
             p_10 = float(params_dict.get('p[1->0]', np.nan))
             
+<<<<<<< Updated upstream
             # Calculate complements
             p_01 = 1.0 - p_00 if not np.isnan(p_00) else np.nan
             # P(S_t=1|S_{t-1}=1) = 1 - P(S_t=0|S_{t-1}=1) = 1 - p[1->0]
@@ -119,6 +120,30 @@ def run_regime_switching_estimation(daily_returns_df):
             # Extract means (const)
             regime_0_mean = float(params_dict.get('const[0]', 0.0))
             regime_1_mean = float(params_dict.get('const[1]', 0.0))
+=======
+            # Get volatilities - calculate from data based on regime assignment
+            regime_0_vol_raw = float(np.std(returns[regime_state == 0])) if np.sum(regime_state == 0) > 0 else 0.2
+            regime_1_vol_raw = float(np.std(returns[regime_state == 1])) if np.sum(regime_state == 1) > 0 else 0.2
+            
+            # REGIME LABELING CORRECTION: Ensure regime 0 = HIGH vol, regime 1 = LOW vol
+            # If regime 0 has lower volatility than regime 1, swap the labels
+            if regime_0_vol_raw < regime_1_vol_raw:
+                # Swap regime states
+                regime_state = 1 - regime_state
+                # Recalculate volatilities with swapped states
+                regime_0_vol = float(np.std(returns[regime_state == 0])) if np.sum(regime_state == 0) > 0 else 0.2
+                regime_1_vol = float(np.std(returns[regime_state == 1])) if np.sum(regime_state == 1) > 0 else 0.2
+                # Swap means
+                regime_0_mean, regime_1_mean = regime_1_mean, regime_0_mean
+                # Update df_out with corrected regime states
+                for j, idx in enumerate(valid_indices):
+                    df_out.loc[idx, "regime_state"] = regime_state[j]
+                    df_out.loc[idx, "regime_probability_0"] = regime_probs[j, 1]  # Swapped
+                    df_out.loc[idx, "regime_probability_1"] = regime_probs[j, 0]  # Swapped
+            else:
+                regime_0_vol = regime_0_vol_raw
+                regime_1_vol = regime_1_vol_raw
+>>>>>>> Stashed changes
             
             # Extract volatilities (sigma2 -> sqrt)
             sigma2_0 = float(params_dict.get('sigma2[0]', 0.04))
@@ -150,8 +175,8 @@ def run_regime_switching_estimation(daily_returns_df):
             
             print(f"  ✓ Firm {i+1}/{len(firms)}: gvkey={gvkey}")
             print(f"      Observations: {len(returns)}")
-            print(f"      Regime 0: μ={regime_0_mean:.6f}, σ={regime_0_vol:.6f}")
-            print(f"      Regime 1: μ={regime_1_mean:.6f}, σ={regime_1_vol:.6f}")
+            print(f"      Regime 0 (HIGH vol/stress): μ={regime_0_mean:.6f}, σ={regime_0_vol:.6f}")
+            print(f"      Regime 1 (LOW vol/calm): μ={regime_1_mean:.6f}, σ={regime_1_vol:.6f}")
             print(f"      Transition: P(0→0)={trans[0, 0]:.3f}, P(1→1)={trans[1, 1]:.3f}\n")
             
         except Exception as e:
