@@ -59,16 +59,27 @@ def run_regime_switching_estimation(daily_returns_df):
         firm_indices = firm_df.index.tolist()
         
         # Get returns (drop NaNs but keep track of which indices are valid)
-        valid_mask = firm_df["asset_return_daily"].notna()
+        # Use centrally scaled returns if available
+        scaled_available = "asset_return_daily_scaled" in firm_df.columns
+        target_col = "asset_return_daily_scaled" if scaled_available else "asset_return_daily"
+        
+        valid_mask = firm_df[target_col].notna()
         valid_indices = [firm_indices[j] for j in range(len(firm_indices)) if valid_mask.iloc[j]]
-        returns = firm_df.loc[valid_mask, "asset_return_daily"].values
+        returns = firm_df.loc[valid_mask, target_col].values
+        
+        # Scale if fallback to unscaled data was necessary
+        SCALE_FACTOR = 100.0
+        used_scaled = scaled_available
+        if not used_scaled:
+            returns = returns * SCALE_FACTOR
+            used_scaled = True
         
         if len(returns) < 150:
             print(f"  Firm {i+1}/{len(firms)}: gvkey={gvkey} - Insufficient data (n={len(returns)})")
             continue
         
         try:
-            # Fit 2-regime Markov Regression
+            # Fit 2-regime Markov Regression (on SCALED returns)
             mod = MarkovRegression(
                 returns, 
                 k_regimes=2, 
@@ -95,59 +106,52 @@ def run_regime_switching_estimation(daily_returns_df):
                 df_out.loc[idx, "regime_probability_1"] = regime_probs[j, 1]
 
             # Create a dictionary of parameters for easy access by name
-            # statsmodels param names for 2-regime MarkovRegression are typically:
-            # ['p[0->0]', 'p[1->0]', 'const[0]', 'const[1]', 'sigma2[0]', 'sigma2[1]']
             param_names = res.model.param_names
             params_values = res.params
-            # Handle if params_values is a Series or array
             if hasattr(params_values, 'values'):
                 params_values = params_values.values
             
             params_dict = dict(zip(param_names, params_values))
             
             # Extract transition probabilities
-            # p[0->0] is P(S_t=0|S_{t-1}=0)
-            # p[1->0] is P(S_t=0|S_{t-1}=1)
             p_00 = float(params_dict.get('p[0->0]', np.nan))
             p_10 = float(params_dict.get('p[1->0]', np.nan))
             
-<<<<<<< Updated upstream
             # Calculate complements
             p_01 = 1.0 - p_00 if not np.isnan(p_00) else np.nan
-            # P(S_t=1|S_{t-1}=1) = 1 - P(S_t=0|S_{t-1}=1) = 1 - p[1->0]
             p_11 = 1.0 - p_10 if not np.isnan(p_10) else np.nan
 
-            # Extract means (const)
-            regime_0_mean = float(params_dict.get('const[0]', 0.0))
-            regime_1_mean = float(params_dict.get('const[1]', 0.0))
-=======
-            # Get volatilities - calculate from data based on regime assignment
-            regime_0_vol_raw = float(np.std(returns[regime_state == 0])) if np.sum(regime_state == 0) > 0 else 0.2
-            regime_1_vol_raw = float(np.std(returns[regime_state == 1])) if np.sum(regime_state == 1) > 0 else 0.2
+            # Extract means (const) and Unscale
+            regime_0_mean = float(params_dict.get('const[0]', 0.0)) / SCALE_FACTOR
+            regime_1_mean = float(params_dict.get('const[1]', 0.0)) / SCALE_FACTOR
+
+            # Extract volatilities (sigma2 -> sqrt) and Unscale
+            # param is sigma2 of scaled returns. 
+            # Real sigma2 = param / (SCALE^2). Real sigma = sqrt(param) / SCALE.
+            sigma2_0_scaled = float(params_dict.get('sigma2[0]', 0.04 * (SCALE_FACTOR**2)))
+            sigma2_1_scaled = float(params_dict.get('sigma2[1]', 0.04 * (SCALE_FACTOR**2)))
             
-            # REGIME LABELING CORRECTION: Ensure regime 0 = HIGH vol, regime 1 = LOW vol
-            # If regime 0 has lower volatility than regime 1, swap the labels
-            if regime_0_vol_raw < regime_1_vol_raw:
-                # Swap regime states
-                regime_state = 1 - regime_state
-                # Recalculate volatilities with swapped states
-                regime_0_vol = float(np.std(returns[regime_state == 0])) if np.sum(regime_state == 0) > 0 else 0.2
-                regime_1_vol = float(np.std(returns[regime_state == 1])) if np.sum(regime_state == 1) > 0 else 0.2
-                # Swap means
-                regime_0_mean, regime_1_mean = regime_1_mean, regime_0_mean
-                # Update df_out with corrected regime states
+            regime_0_vol = (np.sqrt(sigma2_0_scaled) / SCALE_FACTOR) if sigma2_0_scaled > 0 else 0.2
+            regime_1_vol = (np.sqrt(sigma2_1_scaled) / SCALE_FACTOR) if sigma2_1_scaled > 0 else 0.2
+            
+            # CORRECT REGIME LABELING: Ensure regime 0 = HIGH vol, regime 1 = LOW vol
+            if regime_0_vol < regime_1_vol:
+                # Swap regime states in output df
                 for j, idx in enumerate(valid_indices):
-                    df_out.loc[idx, "regime_state"] = regime_state[j]
-                    df_out.loc[idx, "regime_probability_0"] = regime_probs[j, 1]  # Swapped
-                    df_out.loc[idx, "regime_probability_1"] = regime_probs[j, 0]  # Swapped
-            else:
-                regime_0_vol = regime_0_vol_raw
-                regime_1_vol = regime_1_vol_raw
->>>>>>> Stashed changes
-            
-            # Extract volatilities (sigma2 -> sqrt)
-            sigma2_0 = float(params_dict.get('sigma2[0]', 0.04))
-            sigma2_1 = float(params_dict.get('sigma2[1]', 0.04))
+                     df_out.loc[idx, "regime_state"] = 1 - df_out.loc[idx, "regime_state"]
+                     # Swap probabilities
+                     p0_val = df_out.loc[idx, "regime_probability_0"]
+                     df_out.loc[idx, "regime_probability_0"] = df_out.loc[idx, "regime_probability_1"]
+                     df_out.loc[idx, "regime_probability_1"] = p0_val
+
+                # Swap parameters
+                regime_0_vol, regime_1_vol = regime_1_vol, regime_0_vol
+                regime_0_mean, regime_1_mean = regime_1_mean, regime_0_mean
+                
+                # Swap transitions:
+                # New Regime 0 is old Regime 1. New Regime 1 is old Regime 0.
+                p_00, p_11 = p_11, p_00
+                p_01, p_10 = p_10, p_01
             regime_0_vol = np.sqrt(sigma2_0) if sigma2_0 > 0 else 0.2
             regime_1_vol = np.sqrt(sigma2_1) if sigma2_1 > 0 else 0.2
             

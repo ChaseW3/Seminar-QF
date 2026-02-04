@@ -770,7 +770,23 @@ def run_ms_garch_estimation_optimized(data_df,
         
         try:
             firm_data = data_df[data_df[gvkey_column] == gvkey].copy()
-            returns = firm_data[return_column].dropna().values
+            
+            # Use centrally scaled returns if available
+            # We enforce using returns around ~1.0 scale (percentage) for optimizer stability
+            # If input is already scaled (e.g. 1.0%), use it.
+            # If input is raw (e.g. 0.01), scale it by 100.
+            
+            scale_factor = 1.0
+            
+            if "asset_return_daily_scaled" in firm_data.columns:
+                returns = firm_data["asset_return_daily_scaled"].dropna().values
+                scale_factor = 100.0 # It means data IS scaled by 100, so we unscale by 100 later
+            else:
+                returns = firm_data[return_column].dropna().values
+                # Check scale by looking at std dev. If < 0.1, assume it's raw and scale it.
+                if np.std(returns) < 0.1:
+                    returns = returns * 100.0
+                    scale_factor = 100.0
             
             if len(returns) < 100:
                 if verbose:
@@ -790,16 +806,32 @@ def run_ms_garch_estimation_optimized(data_df,
             vol_series = model.get_volatility_series()
             regime_probs = model.get_regime_probabilities()
             
+            # Unscale parameters for saving (so they match RAW return scale)
+            if scale_factor != 1.0:
+                params['omega_0'] /= (scale_factor ** 2)
+                params['omega_1'] /= (scale_factor ** 2)
+                params['mu_0'] /= scale_factor
+                params['mu_1'] /= scale_factor
+                
+                # Unscale volatility series
+                vol_series /= scale_factor
+                
+                # Update model's conditional vol (just in case)
+                model.conditional_vol = vol_series
+            
             # Store parameters
             params['gvkey'] = gvkey
-            params['log_likelihood'] = model.log_likelihood
-            params['aic'] = model.aic
-            params['bic'] = model.bic
+            params['log_likelihood'] = model.log_likelihood - len(returns) * np.log(scale_factor) if scale_factor != 1.0 else model.log_likelihood
+            params['aic'] = 2 * 12 - 2 * params['log_likelihood']
+            params['bic'] = np.log(len(returns)) * 12 - 2 * params['log_likelihood']
             params['n_obs'] = len(returns)
             all_params.append(params)
             
             # Add volatility to data
-            valid_idx = firm_data[return_column].notna()
+            # Use return_column for indexing alignment
+            target_col = "asset_return_daily_scaled" if "asset_return_daily_scaled" in firm_data.columns else return_column
+            valid_idx = firm_data[target_col].notna()
+            
             firm_idx = data_with_vol[gvkey_column] == gvkey
             vol_idx = np.where(firm_idx)[0]
             valid_positions = np.where(valid_idx.values)[0]

@@ -406,11 +406,15 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=True)
         lambda x: np.log(x / x.shift(1))
     )
     
+    # ADD SCALE RETURNS (Multiply by 100) for numerical stability in optimization
+    # This centralized scaling ensures all models work on the same scaled data
+    daily_returns_df["asset_return_daily_scaled"] = daily_returns_df["asset_return_daily"] * 100.0
+    
     # CRITICAL: Convert annualized volatility to DAILY for scale matching
     daily_returns_df["asset_volatility"] = daily_returns_df["asset_volatility"] / np.sqrt(252)
     
     daily_returns_df = daily_returns_df[[
-        "gvkey", "date", "asset_return_daily", "asset_value", "asset_volatility"
+        "gvkey", "date", "asset_return_daily", "asset_return_daily_scaled", "asset_value", "asset_volatility"
     ]].dropna()
     
     overall_time = time.time() - overall_start

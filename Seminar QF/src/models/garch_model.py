@@ -42,13 +42,21 @@ def run_garch_estimation(daily_returns_df):
     
     for i, gvkey in enumerate(firms):
         mask = df_out["gvkey"] == gvkey
-        firm_ts = df_out.loc[mask].dropna(subset=["asset_return_daily"])
+        firm_ts = df_out.loc[mask]
         
-        if len(firm_ts) < 50:
-            continue
-            
-        # Scale returns to percentage
-        returns = firm_ts["asset_return_daily"].values * SCALE_FACTOR
+        # Check for sufficient data
+        # Prefer scaled returns if available
+        if "asset_return_daily_scaled" in firm_ts.columns:
+            firm_ts = firm_ts.dropna(subset=["asset_return_daily_scaled"])
+            if len(firm_ts) < 50:
+                continue
+            returns = firm_ts["asset_return_daily_scaled"].values
+        else:
+            firm_ts = firm_ts.dropna(subset=["asset_return_daily"])
+            if len(firm_ts) < 50:
+                continue
+            # Scale returns to percentage locally if not already scaled
+            returns = firm_ts["asset_return_daily"].values * SCALE_FACTOR
         
         try:
             # Use Student's t distribution to handle fat tails
