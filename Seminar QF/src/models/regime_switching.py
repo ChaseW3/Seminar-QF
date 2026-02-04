@@ -73,6 +73,7 @@ def run_regime_switching_estimation(daily_returns_df):
                 returns, 
                 k_regimes=2, 
                 trend='c'
+                switching_variance=True
             )
             res = mod.fit(disp=False, maxiter=200)
             
