@@ -93,25 +93,41 @@ def run_regime_switching_estimation(daily_returns_df):
                 df_out.loc[idx, "regime_state"] = regime_state[j]
                 df_out.loc[idx, "regime_probability_0"] = regime_probs[j, 0]
                 df_out.loc[idx, "regime_probability_1"] = regime_probs[j, 1]
+
+            # Create a dictionary of parameters for easy access by name
+            # statsmodels param names for 2-regime MarkovRegression are typically:
+            # ['p[0->0]', 'p[1->0]', 'const[0]', 'const[1]', 'sigma2[0]', 'sigma2[1]']
+            param_names = res.model.param_names
+            params_values = res.params
+            # Handle if params_values is a Series or array
+            if hasattr(params_values, 'values'):
+                params_values = params_values.values
             
-            # Extract parameters
-            params_values = res.params.values if hasattr(res.params, 'values') else np.array(res.params)
+            params_dict = dict(zip(param_names, params_values))
             
-            # Get means (intercepts)
-            regime_0_mean = float(params_values[0]) if len(params_values) > 0 else 0.0
-            regime_1_mean = float(params_values[1]) if len(params_values) > 1 else 0.0
+            # Extract transition probabilities
+            # p[0->0] is P(S_t=0|S_{t-1}=0)
+            # p[1->0] is P(S_t=0|S_{t-1}=1)
+            p_00 = float(params_dict.get('p[0->0]', np.nan))
+            p_10 = float(params_dict.get('p[1->0]', np.nan))
             
-            # Get volatilities - calculate from data based on regime assignment
-            regime_0_vol = float(np.std(returns[regime_state == 0])) if np.sum(regime_state == 0) > 0 else 0.2
-            regime_1_vol = float(np.std(returns[regime_state == 1])) if np.sum(regime_state == 1) > 0 else 0.2
+            # Calculate complements
+            p_01 = 1.0 - p_00 if not np.isnan(p_00) else np.nan
+            # P(S_t=1|S_{t-1}=1) = 1 - P(S_t=0|S_{t-1}=1) = 1 - p[1->0]
+            p_11 = 1.0 - p_10 if not np.isnan(p_10) else np.nan
+
+            # Extract means (const)
+            regime_0_mean = float(params_dict.get('const[0]', 0.0))
+            regime_1_mean = float(params_dict.get('const[1]', 0.0))
             
-            # Compute transition matrix from data
-            trans = np.zeros((2, 2))
-            for t in range(len(regime_state) - 1):
-                trans[int(regime_state[t]), int(regime_state[t + 1])] += 1
-            row_sums = trans.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1
-            trans = trans / row_sums
+            # Extract volatilities (sigma2 -> sqrt)
+            sigma2_0 = float(params_dict.get('sigma2[0]', 0.04))
+            sigma2_1 = float(params_dict.get('sigma2[1]', 0.04))
+            regime_0_vol = np.sqrt(sigma2_0) if sigma2_0 > 0 else 0.2
+            regime_1_vol = np.sqrt(sigma2_1) if sigma2_1 > 0 else 0.2
+            
+            # Create trans matrix for printing
+            trans = np.array([[p_00, p_01], [p_10, p_11]])
             
             # Store parameters
             params_row = {
@@ -122,10 +138,10 @@ def run_regime_switching_estimation(daily_returns_df):
                 'regime_1_ar': 0.0,
                 'regime_0_vol': regime_0_vol,
                 'regime_1_vol': regime_1_vol,
-                'transition_prob_00': float(trans[0, 0]),
-                'transition_prob_01': float(trans[0, 1]),
-                'transition_prob_10': float(trans[1, 0]),
-                'transition_prob_11': float(trans[1, 1]),
+                'transition_prob_00': p_00,
+                'transition_prob_01': p_01,
+                'transition_prob_10': p_10,
+                'transition_prob_11': p_11,
                 'log_likelihood': float(res.llf) if hasattr(res, 'llf') else np.nan,
                 'aic': float(res.aic) if hasattr(res, 'aic') else np.nan,
                 'bic': float(res.bic) if hasattr(res, 'bic') else np.nan
