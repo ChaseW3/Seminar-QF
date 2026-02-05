@@ -56,7 +56,8 @@ COMPANY_MAPPING = {
     'SANOFI': 'SANOFI SA',
     'SAP SE': 'SAP SE',
     'SCHNEIDER ELECTRIC S E': 'SCHNEIDER ELECTRIC',
-    # 'SIEMENS ENERGY AG': 'SIEMENS AG',  # Different company - exclude
+    'SIEMENS AG': 'SIEMENS AG',  # Parent company - included
+    # 'SIEMENS ENERGY AG': excluded - spun off 2020, different company, no market CDS data
     'TOTALENERGIES SE': 'TOTALENERGIES SE',
     'UNICREDIT SPA': 'UNICREDIT SPA',  # Financial institution - included
     'VINCI SA': 'VINCI',
@@ -368,7 +369,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         merton_file=merton_file,
         cds_market_df=cds_market,
         model_name='Regime-Switching',
-        col_prefix='cds_spread_garch_mc'
+        col_prefix='cds_spread_regime_switching_mc'
     )
     
     # MS-GARCH
@@ -377,7 +378,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         merton_file=merton_file,
         cds_market_df=cds_market,
         model_name='MS-GARCH',
-        col_prefix='cds_spread_garch_mc'
+        col_prefix='cds_spread_msgarch_mc'
     )
     
     # Create summary table

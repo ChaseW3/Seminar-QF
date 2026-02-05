@@ -64,9 +64,11 @@ def load_and_preprocess_data():
     # NOW REMOVE FLAGGED COMPANIES (after column renaming)
     # Original flags (data issues, non-Euro stocks, etc.)
     gvkeys_to_remove = [
-        101248, 25466, 203053, 245663, 19349, 243774, 17828, 333645,
+        101248, 25466, 203053, 245663, 340153, 243774, 17828, 333645,
         101305, 61214, 15181, 14140, 100312, 101276, 100737, 214881
     ]
+    # NOTE: 340153 = SIEMENS ENERGY AG (excluded, spun off 2020, different from parent)
+    #       19349 = SIEMENS AG (included, parent company with market CDS data)
     
     # NOTE: Financial institutions (banks/insurance) are now INCLUDED in the analysis
     # Previously excluded: UniCredit, BNP, ING, Intesa, AXA (gvkeys: 15549, 15532, 15617, 16348, 63120)

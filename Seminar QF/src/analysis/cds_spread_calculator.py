@@ -486,7 +486,8 @@ class CDSSpreadCalculator:
         return df_cds_all
     
     def calculate_cds_spreads_from_mc_garch(self, mc_garch_file, daily_returns_file, 
-                                        merton_file, output_file=None, volatility_column=None):
+                                        merton_file, output_file=None, volatility_column=None,
+                                        model_name='GARCH'):
         """
         Calculate model-implied CDS spreads based on Monte Carlo Integrated Variance forecasts.
         
@@ -504,6 +505,9 @@ class CDSSpreadCalculator:
             Path to save output
         volatility_column : str, optional
             Override column name for integrated variance. If None, auto-detect.
+        model_name : str, optional
+            Name of the model for column naming (default: 'GARCH')
+            Use 'MS-GARCH' or 'Regime Switching' for those models.
         
         Returns:
         --------
@@ -695,14 +699,17 @@ class CDSSpreadCalculator:
         
         print("Calculating CDS spreads...\n")
         
+        # Sanitize model name for column names (lowercase, replace spaces with underscores)
+        model_tag = model_name.lower().replace('-', '').replace(' ', '_')
+        
         # Calculate spreads for each maturity
         results_data = {'gvkey': df_merged['gvkey'].values, 
                         'date': df_merged['date'].values}
         
         for tau in self.maturity_horizons:
             spread, spread_bps = self.credit_spread_from_put_value(V_t, K, r_t, sigma_V, tau)
-            results_data[f'cds_spread_garch_mc_{tau}y'] = spread
-            results_data[f'cds_spread_garch_mc_{tau}y_bps'] = spread_bps
+            results_data[f'cds_spread_{model_tag}_mc_{tau}y'] = spread
+            results_data[f'cds_spread_{model_tag}_mc_{tau}y_bps'] = spread_bps
         
         df_cds_spreads = pd.DataFrame(results_data)
         
@@ -714,7 +721,7 @@ class CDSSpreadCalculator:
         print(f"{'='*80}\n")
         
         for tau in self.maturity_horizons:
-            col_bps = f'cds_spread_garch_mc_{tau}y_bps'
+            col_bps = f'cds_spread_{model_tag}_mc_{tau}y_bps'
             
             if col_bps in df_cds_spreads.columns:
                 mean_spread = df_cds_spreads[col_bps].mean()

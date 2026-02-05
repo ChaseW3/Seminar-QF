@@ -102,15 +102,20 @@ def simulate_ms_garch_paths_t_jit(
                     nu = nu_1[f]
                 
                 # GARCH(1,1) variance update
+                # IMPORTANT: The GARCH parameters were estimated using RAW residuals ε²,
+                # NOT standardized residuals z². So we must use eps² = (σ*z)²
                 if day > 0:
                     sigma2[f] = omega + alpha * eps2_prev[f] + beta * sigma2[f]
                 
-                sigma2[f] = max(sigma2[f], 1e-10)
+                # Enforce reasonable variance bounds (1% to 10% daily volatility)
+                sigma2[f] = max(min(sigma2[f], 0.01), 1e-6)
                 sigma = np.sqrt(sigma2[f])
                 daily_volatilities[day, sim, f] = sigma
                 
                 # Generate t-distributed innovation using JIT sampler
                 z = sample_standardized_t(nu)
+                #Cap extreme innovations to prevent temporary spikes
+                z = max(min(z, 5.0), -5.0)  # Cap at ±5 sigma
                 eps = sigma * z
                 eps2_prev[f] = eps * eps
                 
@@ -208,18 +213,20 @@ def simulate_ms_garch_paths_vectorized(
                     mu = mu_1[f]
                 
                 # GARCH(1,1) variance update
+                # Use RAW residuals ε² = (σ*z)², not standardized z²
                 if day > 0:
                     sigma2[f] = omega + alpha * eps2_prev[f] + beta * sigma2[f]
                 
-                # Ensure positive variance
-                sigma2[f] = max(sigma2[f], 1e-10)
+                # Enforce reasonable variance bounds
+                sigma2[f] = max(min(sigma2[f], 0.01), 1e-6)
                 
                 # Current volatility
                 sigma = np.sqrt(sigma2[f])
                 daily_volatilities[day, sim, f] = sigma
                 
-                # Generate return and compute epsilon squared for next iteration
-                eps = sigma * z[f]
+                # Cap extreme innovations to prevent temporary spikes
+                z_capped = max(min(z[f], 5.0), -5.0)  # Cap at ±5 sigma
+                eps = sigma * z_capped
                 eps2_prev[f] = eps * eps
                 
                 # Regime transition for next period
@@ -579,9 +586,15 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
             firm_vols = daily_vols[:, :, 0]  # shape: (num_days, num_simulations)
             firm_regimes = regime_paths[:, :, 0]  # shape: (num_days, num_simulations)
             
-            # Calculate statistics
-            mean_path = np.mean(firm_vols, axis=1)
-            cumulative_volatility = np.sum(mean_path)
+            # Calculate statistics - CORRECT: Use VARIANCE not volatility for integration
+            # 1. Square to get variances
+            firm_variances = firm_vols ** 2  # shape: (num_days, num_simulations)
+            
+            # 2. Mean across simulations (Expected Conditional Variance per day)
+            mean_variance_path = np.mean(firm_variances, axis=1)  # shape: (num_days,)
+            
+            # 3. Sum over horizon (Integrated Variance)
+            integrated_variance = np.sum(mean_variance_path)
             
             # Regime fractions
             regime_0_frac = np.mean(firm_regimes == 0)
@@ -590,13 +603,13 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
             results_list.append({
                 'gvkey': firm,
                 'date': date,
-                'mc_msgarch_cumulative_volatility': cumulative_volatility,
-                'mc_msgarch_mean_daily_volatility': np.mean(mean_path),
-                'mc_msgarch_std_daily_volatility': np.std(mean_path),
-                'mc_msgarch_max_daily_volatility': np.max(mean_path),
-                'mc_msgarch_min_daily_volatility': np.min(mean_path),
-                'mc_msgarch_p95_daily_volatility': np.percentile(mean_path, 95),
-                'mc_msgarch_p05_daily_volatility': np.percentile(mean_path, 5),
+                'mc_msgarch_integrated_variance': integrated_variance,
+                'mc_msgarch_mean_daily_volatility': np.mean(firm_vols),
+                'mc_msgarch_std_daily_volatility': np.std(firm_vols),
+                'mc_msgarch_max_daily_volatility': np.max(firm_vols),
+                'mc_msgarch_min_daily_volatility': np.min(firm_vols),
+                'mc_msgarch_p95_daily_volatility': np.percentile(firm_vols, 95),
+                'mc_msgarch_p05_daily_volatility': np.percentile(firm_vols, 5),
                 'mc_msgarch_frac_regime_0': regime_0_frac,
                 'mc_msgarch_frac_regime_1': regime_1_frac
             })
