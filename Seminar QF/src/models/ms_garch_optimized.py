@@ -485,82 +485,166 @@ class MSGARCHOptimized:
                 if np.isnan(ll) or np.isinf(ll):
                     return 1e10
                 
-                # SOFT PENALTY: Discourage low regime persistence (p00, p11 near 0.5)
-                # Without this, optimizer can converge to p00=p11=0.5 (no regime structure)
-                # Penalty increases quadratically as probabilities approach 0.5
-                persistence_penalty = 0.0
-                for p in [p00, p11]:
-                    if p < 0.7:  # Only penalize if persistence is low
-                        persistence_penalty += 10 * (0.7 - p) ** 2
+                # IMPROVED SOFT PENALTIES: Guide optimizer to economically meaningful solutions
+                penalty = 0.0
                 
-                return -ll + persistence_penalty
+                # 1. Persistence Penalty: Discourage low regime persistence (p00, p11 near 0.5)
+                # Without this, optimizer can converge to p00=p11=0.5 (no regime structure)
+                for p in [p00, p11]:
+                    if p < 0.65:  # Minimum meaningful persistence
+                        penalty += 15 * (0.65 - p) ** 2
+                
+                # 2. Regime Differentiation Penalty: Encourage distinct regimes
+                # Calculate unconditional volatilities
+                uncond_vol_0 = np.sqrt(omega_0 / max(1 - alpha_0 - beta_0, 0.01))
+                uncond_vol_1 = np.sqrt(omega_1 / max(1 - alpha_1 - beta_1, 0.01))
+                vol_ratio = max(uncond_vol_1 / uncond_vol_0, uncond_vol_0 / uncond_vol_1)
+                
+                # Penalize if regimes are too similar (vol ratio < 1.2)
+                if vol_ratio < 1.2:
+                    penalty += 20 * (1.2 - vol_ratio) ** 2
+                
+                # 3. Degrees of Freedom Differentiation: Encourage different tail behavior
+                nu_ratio = max(nu_0 / nu_1, nu_1 / nu_0)
+                if nu_ratio < 1.3:  # Encourage different tail distributions
+                    penalty += 10 * (1.3 - nu_ratio) ** 2
+                
+                return -ll + penalty
                 
             except Exception:
                 return 1e10
         
         # =====================================================================
-        # OPTIMIZATION 4: Better Optimizer Settings with Multi-Start
+        # OPTIMIZATION 4: IMPROVED Multi-Start with Better Convergence
         # =====================================================================
         
         if verbose:
-            print("    → Running L-BFGS-B optimization with multi-start...")
+            print("    → Running IMPROVED optimization with multi-start and adaptive refinement...")
         
-        # Try main initialization
-        result = minimize(
-            neg_log_likelihood,
-            x0,
-            method='L-BFGS-B',
-            options={
-                'maxiter': 500,      # Increased for better convergence
-                'ftol': 1e-8,        # Tighter function tolerance
-                'gtol': 1e-6,        # Tighter gradient tolerance
-                'maxfun': 1000,      # Allow more function evaluations
-                'disp': False
-            }
-        )
+        # PHASE 1: Coarse optimization with multiple starting points
+        if verbose:
+            print("    → PHASE 1: Multi-start optimization (3 different initializations)...")
         
-        best_result = result
-        best_nll = result.fun
+        # Starting point 1: Base initialization (from warm start)
+        candidates = [('Base', x0)]
         
-        # Try alternative initialization with swapped regimes (helps avoid labeling issue)
-        if best_nll > 1e9:  # If first attempt failed badly, try alternatives
+        # Starting point 2: More extreme regime differentiation
+        x0_extreme = np.array([
+            np.log(max(omega_base * 0.2, 1e-10)),  # Very low omega for calm regime
+            self._alpha_to_unconstrained(0.02),     # Very low alpha
+            self._beta_to_unconstrained(0.96),      # Very high beta (high persistence)
+            np.log(max(omega_base * 4.0, 1e-10)),   # Very high omega for crisis regime
+            self._alpha_to_unconstrained(0.25),     # High alpha (quick response)
+            self._beta_to_unconstrained(0.60),      # Lower beta
+            mu_base + 0.0008,
+            mu_base - 0.0010,
+            3.0,  # expit(3.0) ≈ 0.95 - very persistent regime 0
+            3.0,  # expit(3.0) ≈ 0.95 - very persistent regime 1
+            self._nu_to_unconstrained(30.0),  # Very HIGH df for low-vol regime
+            self._nu_to_unconstrained(2.8)    # Very LOW df for high-vol regime
+        ])
+        candidates.append(('Extreme', x0_extreme))
+        
+        # Starting point 3: Moderate differentiation (between base and extreme)
+        x0_moderate = np.array([
+            np.log(max(omega_base * 0.5, 1e-10)),
+            self._alpha_to_unconstrained(0.04),
+            self._beta_to_unconstrained(0.94),
+            np.log(max(omega_base * 2.0, 1e-10)),
+            self._alpha_to_unconstrained(0.15),
+            self._beta_to_unconstrained(0.75),
+            mu_base + 0.0003,
+            mu_base - 0.0005,
+            2.0,  # expit(2.0) ≈ 0.88
+            2.0,
+            self._nu_to_unconstrained(18.0),
+            self._nu_to_unconstrained(5.0)
+        ])
+        candidates.append(('Moderate', x0_moderate))
+        
+        # Try all candidates with PHASE 1 settings (faster, less precise)
+        best_result = None
+        best_nll = 1e12
+        best_init_name = None
+        
+        for init_name, x0_candidate in candidates:
             if verbose:
-                print("    → First attempt suboptimal, trying alternative initialization...")
+                print(f"      → Trying {init_name} initialization...")
             
-            # Alternative 1: More extreme regime differentiation
-            x0_alt = np.array([
-                np.log(max(omega_base * 0.3, 1e-10)),
-                self._alpha_to_unconstrained(0.03),
-                self._beta_to_unconstrained(0.95),
-                np.log(max(omega_base * 3.0, 1e-10)),
-                self._alpha_to_unconstrained(0.20),
-                self._beta_to_unconstrained(0.65),
-                mu_base + 0.0005,
-                mu_base - 0.0005,
-                -0.5,  # Lower p00 initialization
-                -0.5,  # Lower p11 initialization
-                self._nu_to_unconstrained(20.0),  # HIGH df for low-vol regime
-                self._nu_to_unconstrained(3.0)    # LOW df for high-vol regime
-            ])
-            
-            result_alt = minimize(
+            result = minimize(
                 neg_log_likelihood,
-                x0_alt,
+                x0_candidate,
                 method='L-BFGS-B',
                 options={
-                    'maxiter': 500,
-                    'ftol': 1e-8,
-                    'gtol': 1e-6,
-                    'maxfun': 1000,
+                    'maxiter': 1000,     # More iterations for better convergence
+                    'ftol': 1e-9,        # Tighter function tolerance
+                    'gtol': 1e-7,        # Tighter gradient tolerance
+                    'maxfun': 2000,      # More function evaluations allowed
+                    'maxls': 50,         # More line search steps
                     'disp': False
                 }
             )
             
-            if result_alt.fun < best_nll:
-                best_result = result_alt
-                best_nll = result_alt.fun
+            if result.fun < best_nll:
+                best_result = result
+                best_nll = result.fun
+                best_init_name = init_name
                 if verbose:
-                    print("    → Alternative initialization improved fit")
+                    print(f"        ✓ New best: -LL = {best_nll:.2f}")
+        
+        if verbose:
+            print(f"    → PHASE 1 complete: Best initialization = {best_init_name} (-LL = {best_nll:.2f})")
+        
+        # PHASE 2: Refinement with tighter tolerances
+        if verbose:
+            print("    → PHASE 2: Refining best solution with tighter tolerances...")
+        
+        result_refined = minimize(
+            neg_log_likelihood,
+            best_result.x,  # Start from best Phase 1 result
+            method='L-BFGS-B',
+            options={
+                'maxiter': 2000,     # Even more iterations for refinement
+                'ftol': 1e-10,       # Very tight function tolerance
+                'gtol': 1e-8,        # Very tight gradient tolerance
+                'maxfun': 4000,      # Allow many function evaluations
+                'maxls': 100,        # Many line search steps for precision
+                'disp': False
+            }
+        )
+        
+        # Use refined result if it improved
+        if result_refined.fun < best_nll:
+            best_result = result_refined
+            best_nll = result_refined.fun
+            if verbose:
+                print(f"      ✓ Refinement improved: -LL = {best_nll:.2f}")
+        else:
+            if verbose:
+                print(f"      → Refinement did not improve (-LL = {result_refined.fun:.2f}), keeping Phase 1 result")
+        
+        # PHASE 3: Final check with alternative optimizer (if still not converged)
+        if not best_result.success or best_nll > 1e8:
+            if verbose:
+                print("    → PHASE 3: Trying alternative optimizer (TNC) for difficult case...")
+            
+            result_tnc = minimize(
+                neg_log_likelihood,
+                best_result.x,
+                method='TNC',
+                options={
+                    'maxiter': 1500,
+                    'ftol': 1e-9,
+                    'gtol': 1e-7,
+                    'disp': False
+                }
+            )
+            
+            if result_tnc.fun < best_nll:
+                best_result = result_tnc
+                best_nll = result_tnc.fun
+                if verbose:
+                    print(f"      ✓ TNC optimizer improved: -LL = {best_nll:.2f}")
         
         result = best_result
         
@@ -637,15 +721,115 @@ class MSGARCHOptimized:
         self.aic = 2 * n_params - 2 * self.log_likelihood
         self.bic = np.log(T) * n_params - 2 * self.log_likelihood
         
+        # =====================================================================
+        # COMPREHENSIVE DIAGNOSTIC OUTPUT
+        # =====================================================================
         if verbose:
-            print(f"  MLE converged: {result.success}")
-            print(f"  Log-likelihood: {self.log_likelihood:.2f}")
-            print(f"  Regime 0 (low vol): omega={omega_0:.6f}, alpha={alpha_0:.4f}, "
-                  f"beta={beta_0:.4f}, persist={persistence_0:.4f}, uncond_vol={uncond_vol_0:.4f}, ν={nu_0:.2f}")
-            print(f"  Regime 1 (high vol): omega={omega_1:.6f}, alpha={alpha_1:.4f}, "
-                  f"beta={beta_1:.4f}, persist={persistence_1:.4f}, uncond_vol={uncond_vol_1:.4f}, ν={nu_1:.2f}")
-            print(f"  Transition probs: p00={p00:.4f}, p11={p11:.4f}")
-            print(f"  Volatility ratio: {uncond_vol_1/uncond_vol_0:.2f}x, ν ratio: {nu_0/nu_1:.2f}x")
+            print(f"\n  {'='*70}")
+            print(f"  MS-GARCH ESTIMATION COMPLETE")
+            print(f"  {'='*70}")
+            
+            # Convergence status
+            print(f"\n  📊 CONVERGENCE:")
+            print(f"     Success: {result.success}")
+            print(f"     Status: {result.message if hasattr(result, 'message') else 'N/A'}")
+            print(f"     Function evals: {result.nfev if hasattr(result, 'nfev') else 'N/A'}")
+            print(f"     Iterations: {result.nit if hasattr(result, 'nit') else 'N/A'}")
+            
+            # Model fit
+            print(f"\n  📈 MODEL FIT:")
+            print(f"     Log-likelihood: {self.log_likelihood:.2f}")
+            print(f"     AIC: {self.aic:.2f}")
+            print(f"     BIC: {self.bic:.2f}")
+            print(f"     Number of observations: {T}")
+            
+            # Regime 0 (Low Volatility)
+            print(f"\n  🟢 REGIME 0 (Low Volatility / Calm Period):")
+            print(f"     GARCH(1,1): ω={omega_0:.2e}, α={alpha_0:.4f}, β={beta_0:.4f}")
+            print(f"     Persistence: α+β = {persistence_0:.4f}")
+            print(f"     Unconditional volatility: {uncond_vol_0:.4f} ({uncond_vol_0*100:.2f}%)")
+            print(f"     Degrees of freedom: ν₀ = {nu_0:.2f}")
+            print(f"     Mean return: μ₀ = {mu_0:.6f} ({mu_0*252*100:.2f}% annualized)")
+            print(f"     Stationarity: {'✓ Stationary' if persistence_0 < 0.999 else '✗ Near non-stationary'}")
+            
+            # Regime 1 (High Volatility)
+            print(f"\n  🔴 REGIME 1 (High Volatility / Crisis Period):")
+            print(f"     GARCH(1,1): ω={omega_1:.2e}, α={alpha_1:.4f}, β={beta_1:.4f}")
+            print(f"     Persistence: α+β = {persistence_1:.4f}")
+            print(f"     Unconditional volatility: {uncond_vol_1:.4f} ({uncond_vol_1*100:.2f}%)")
+            print(f"     Degrees of freedom: ν₁ = {nu_1:.2f}")
+            print(f"     Mean return: μ₁ = {mu_1:.6f} ({mu_1*252*100:.2f}% annualized)")
+            print(f"     Stationarity: {'✓ Stationary' if persistence_1 < 0.999 else '✗ Near non-stationary'}")
+            
+            # Regime comparison
+            print(f"\n  🔄 REGIME DIFFERENTIATION:")
+            vol_ratio = uncond_vol_1 / uncond_vol_0
+            nu_ratio = nu_0 / nu_1
+            alpha_ratio = alpha_1 / alpha_0
+            print(f"     Volatility ratio (High/Low): {vol_ratio:.2f}x")
+            print(f"     Tail heaviness ratio (ν₀/ν₁): {nu_ratio:.2f}x")
+            print(f"     Shock response ratio (α₁/α₀): {alpha_ratio:.2f}x")
+            
+            # Check regime separation quality
+            if vol_ratio < 1.3:
+                print(f"     ⚠️  WARNING: Regimes are not well-separated (vol ratio < 1.3)")
+                print(f"         MS-GARCH may reduce to simple GARCH (overfitting risk)")
+            elif vol_ratio > 5.0:
+                print(f"     ⚠️  WARNING: Regimes are VERY different (vol ratio > 5)")
+                print(f"         Check for outliers or data quality issues")
+            else:
+                print(f"     ✓ Good regime separation")
+            
+            if nu_ratio < 1.5:
+                print(f"     ⚠️  WARNING: Tail distributions are similar (ν ratio < 1.5)")
+                print(f"         Regime differences may be driven mainly by volatility")
+            else:
+                print(f"     ✓ Good tail differentiation")
+            
+            # Transition probabilities
+            print(f"\n  🔀 TRANSITION PROBABILITIES:")
+            print(f"     P(stay in regime 0 | in regime 0): p₀₀ = {p00:.4f}")
+            print(f"     P(stay in regime 1 | in regime 1): p₁₁ = {p11:.4f}")
+            print(f"     P(switch 0→1): {1-p00:.4f}")
+            print(f"     P(switch 1→0): {1-p11:.4f}")
+            
+            # Expected regime durations
+            duration_0 = 1 / (1 - p00) if p00 < 0.9999 else np.inf
+            duration_1 = 1 / (1 - p11) if p11 < 0.9999 else np.inf
+            print(f"     Expected duration regime 0: {duration_0:.1f} days" if duration_0 < 1e6 else "     Expected duration regime 0: Very long (highly persistent)")
+            print(f"     Expected duration regime 1: {duration_1:.1f} days" if duration_1 < 1e6 else "     Expected duration regime 1: Very long (highly persistent)")
+            
+            # Ergodic (long-run) probabilities
+            if p00 + p11 > 0.0001:
+                ergodic_0 = (1 - p11) / (2 - p00 - p11)
+                ergodic_1 = (1 - p00) / (2 - p00 - p11)
+                print(f"     Long-run prob(regime 0): {ergodic_0:.3f} ({ergodic_0*100:.1f}%)")
+                print(f"     Long-run prob(regime 1): {ergodic_1:.3f} ({ergodic_1*100:.1f}%)")
+            
+            # Check for regime persistence issues
+            if p00 < 0.7 or p11 < 0.7:
+                print(f"     ⚠️  WARNING: Low regime persistence (p < 0.70)")
+                print(f"         Regimes may be switching too frequently (not economically meaningful)")
+            elif p00 > 0.98 or p11 > 0.98:
+                print(f"     ⚠️  WARNING: Very high persistence (p > 0.98)")
+                print(f"         Regimes rarely switch (may need longer data sample)")
+            else:
+                print(f"     ✓ Reasonable regime persistence")
+            
+            # Empirical regime statistics
+            avg_prob_0 = np.mean(self.filtered_probs[:, 0])
+            avg_prob_1 = np.mean(self.filtered_probs[:, 1])
+            print(f"\n  📊 EMPIRICAL REGIME STATISTICS:")
+            print(f"     Average prob(regime 0): {avg_prob_0:.3f}")
+            print(f"     Average prob(regime 1): {avg_prob_1:.3f}")
+            
+            # Count regime switches (when prob crosses 0.5)
+            regime_states = (self.filtered_probs[:, 1] > 0.5).astype(int)
+            n_switches = np.sum(np.abs(np.diff(regime_states)))
+            print(f"     Approximate number of regime switches: {n_switches}")
+            print(f"     Average switches per year: {n_switches / (T/252):.1f}")
+            
+            print(f"\n  {'='*70}\n")
         
         return self.params
     

@@ -354,6 +354,19 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     else:
         print(f"⚠ Warning: {merton_cds_file} not found. Run analytical Merton CDS calculation first.")
     
+    # Merton Monte Carlo (Constant Volatility Baseline)
+    merton_mc_cds_file = output_dir / 'cds_spreads_merton_mc_all_firms.csv'
+    if merton_mc_cds_file.exists():
+        results['Merton_MC'] = calculate_cds_correlations(
+            model_cds_file=merton_mc_cds_file,
+            merton_file=merton_file,
+            cds_market_df=cds_market,
+            model_name='Merton MC',
+            col_prefix='cds_spread_merton_mc'
+        )
+    else:
+        print(f"⚠ Warning: {merton_mc_cds_file} not found. Run Merton MC CDS calculation first.")
+    
     # GARCH
     results['GARCH'] = calculate_cds_correlations(
         model_cds_file=output_dir / 'cds_spreads_garch_mc_all_firms.csv',
@@ -389,17 +402,31 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Build summary DataFrame with all metrics
     summary_df = results['GARCH'][2][['company', 'gvkey', 'n_obs']].copy()
     
-    # Include Merton if available
+    # Include Merton and Merton_MC if available
     model_list = [('GARCH', 'GARCH'), ('RS', 'RS'), ('MSGARCH', 'MSGARCH')]
     if 'Merton' in results:
         model_list = [('Merton', 'Merton')] + model_list
+    if 'Merton_MC' in results:
+        # Insert Merton_MC after Merton if both exist
+        if 'Merton' in results:
+            model_list.insert(1, ('Merton_MC', 'Merton_MC'))
+        else:
+            model_list = [('Merton_MC', 'Merton_MC')] + model_list
     
     for model_key, model_short in model_list:
         if model_key not in results:
             continue
         firm_df = results[model_key][2]
+        
+        # Check if required columns exist
+        required_cols = ['company', 'rmse_5y', 'corr_levels_5y', 'corr_changes_5y']
+        missing_cols = [col for col in required_cols if col not in firm_df.columns]
+        if missing_cols:
+            print(f"⚠️  Warning: Skipping {model_key} - missing columns: {missing_cols}")
+            continue
+        
         summary_df = summary_df.merge(
-            firm_df[['company', 'rmse_5y', 'corr_levels_5y', 'corr_changes_5y']].rename(columns={
+            firm_df[required_cols].rename(columns={
                 'rmse_5y': f'{model_short}_rmse',
                 'corr_levels_5y': f'{model_short}_corr_lvl',
                 'corr_changes_5y': f'{model_short}_corr_chg'
@@ -418,10 +445,16 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     print("OVERALL SUMMARY STATISTICS (5-Year Maturity)")
     print("="*80)
     
-    # Include Merton if available
+    # Include Merton and Merton_MC if available
     model_display_list = [('GARCH', 'GARCH'), ('RS', 'Regime-Switching'), ('MSGARCH', 'MS-GARCH')]
     if 'Merton' in results:
         model_display_list = [('Merton', 'Classical Merton')] + model_display_list
+    if 'Merton_MC' in results:
+        # Insert Merton_MC after Merton if both exist
+        if 'Merton' in results:
+            model_display_list.insert(1, ('Merton_MC', 'Merton MC'))
+        else:
+            model_display_list = [('Merton_MC', 'Merton MC')] + model_display_list
     
     for model_key, model_name in model_display_list:
         if model_key not in results:
@@ -434,26 +467,30 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         # RMSE
         if '5Y' in metrics.get('rmse', {}):
             print(f"  Overall RMSE:           {metrics['rmse']['5Y']:.2f} bps")
-        rmse_col = firm_df['rmse_5y'].dropna()
-        if len(rmse_col) > 0:
-            print(f"  Mean Firm RMSE:         {rmse_col.mean():.2f} bps")
-            print(f"  Median Firm RMSE:       {rmse_col.median():.2f} bps")
+        if 'rmse_5y' in firm_df.columns:
+            rmse_col = firm_df['rmse_5y'].dropna()
+            if len(rmse_col) > 0:
+                print(f"  Mean Firm RMSE:         {rmse_col.mean():.2f} bps")
+                print(f"  Median Firm RMSE:       {rmse_col.median():.2f} bps")
         
         # Correlation of levels
         if '5Y' in metrics.get('corr_levels', {}):
             print(f"  Overall Corr (levels):  {metrics['corr_levels']['5Y']:.4f}")
-        corr_lvl = firm_df['corr_levels_5y'].dropna()
-        if len(corr_lvl) > 0:
-            print(f"  Mean Firm Corr (lvl):   {corr_lvl.mean():.4f}")
+        if 'corr_levels_5y' in firm_df.columns:
+            corr_lvl = firm_df['corr_levels_5y'].dropna()
+            if len(corr_lvl) > 0:
+                print(f"  Mean Firm Corr (lvl):   {corr_lvl.mean():.4f}")
         
         # Correlation of changes (the key metric from Byström 2006)
         if '5Y' in metrics.get('corr_changes', {}):
             print(f"  Overall Corr (changes): {metrics['corr_changes']['5Y']:.4f}")
-        corr_chg = firm_df['corr_changes_5y'].dropna()
-        if len(corr_chg) > 0:
-            print(f"  Mean Firm Corr (chg):   {corr_chg.mean():.4f}")
+        if 'corr_changes_5y' in firm_df.columns:
+            corr_chg = firm_df['corr_changes_5y'].dropna()
+            if len(corr_chg) > 0:
+                print(f"  Mean Firm Corr (chg):   {corr_chg.mean():.4f}")
         
-        print(f"  Firms with data:        {len(firm_df.dropna(subset=['rmse_5y']))}")
+        if 'rmse_5y' in firm_df.columns:
+            print(f"  Firms with data:        {len(firm_df.dropna(subset=['rmse_5y']))}")
     
     # Save summary
     summary_file = output_dir / 'cds_model_vs_market_correlations.csv'

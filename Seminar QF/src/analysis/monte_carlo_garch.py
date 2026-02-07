@@ -63,7 +63,9 @@ def simulate_garch_paths_t_jit(omega, alpha, beta, sigma_t, nu,
             # Generate t-distributed innovations for each firm
             z = np.zeros(num_firms)
             for f in range(num_firms):
-                z[f] = sample_standardized_t(nu[f])
+                z_raw = sample_standardized_t(nu[f])
+                # Cap extreme innovations to prevent temporary spikes (consistent with MS-GARCH)
+                z[f] = max(min(z_raw, 5.0), -5.0)  # Cap at ±5 sigma
             
             r = sigma * z
             sigma_squared = omega + alpha * (r ** 2) + beta * (sigma ** 2)
@@ -93,7 +95,9 @@ def simulate_garch_paths_vectorized_daily(omega, alpha, beta, sigma_t, returns,
         sigma = sigma_t.copy()
         
         for day in range(num_days):
-            z = np.random.standard_normal(num_firms)
+            z_raw = np.random.standard_normal(num_firms)
+            # Cap extreme innovations to prevent temporary spikes (consistent with MS-GARCH)
+            z = np.maximum(np.minimum(z_raw, 5.0), -5.0)  # Cap at ±5 sigma
             r = sigma * z
             sigma_squared = omega + alpha * (r ** 2) + beta * (sigma ** 2)
             sigma = np.sqrt(np.maximum(sigma_squared, 1e-6))
@@ -351,13 +355,24 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     # For each firm, calculate statistics
     for firm_idx, firm in enumerate(firms_on_date):
         firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
+        
+        # Calculate Integrated Variance (IV = Σ E[σ²])
+        # 1. Square the volatilities to get variances
+        firm_daily_variances = firm_daily_vols ** 2
+        
+        # 2. Average variances across simulations (Expected Conditional Variance)
+        mean_variance_path = np.mean(firm_daily_variances, axis=1)  # shape: (num_days,)
+        
+        # 3. Sum expected variances over horizon (Integrated Variance)
+        integrated_variance = np.sum(mean_variance_path)
+        
+        # Also calculate mean volatility path for other statistics
         mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
-        cumulative_volatility = np.sum(mean_path)
         
         results_list.append({
             'gvkey': firm,
             'date': date,
-            'mc_garch_cumulative_volatility': cumulative_volatility,
+            'mc_garch_integrated_variance': integrated_variance,
             'mc_garch_mean_daily_volatility': np.mean(mean_path),
             'mc_garch_std_daily_volatility': np.std(mean_path),
             'mc_garch_max_daily_volatility': np.max(mean_path),

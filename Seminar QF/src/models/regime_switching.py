@@ -152,8 +152,6 @@ def run_regime_switching_estimation(daily_returns_df):
                 # New Regime 0 is old Regime 1. New Regime 1 is old Regime 0.
                 p_00, p_11 = p_11, p_00
                 p_01, p_10 = p_10, p_01
-            regime_0_vol = np.sqrt(sigma2_0) if sigma2_0 > 0 else 0.2
-            regime_1_vol = np.sqrt(sigma2_1) if sigma2_1 > 0 else 0.2
             
             # Create trans matrix for printing
             trans = np.array([[p_00, p_01], [p_10, p_11]])

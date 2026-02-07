@@ -702,14 +702,20 @@ class CDSSpreadCalculator:
         # Sanitize model name for column names (lowercase, replace spaces with underscores)
         model_tag = model_name.lower().replace('-', '').replace(' ', '_')
         
+        # Determine suffix: don't add '_mc' if model name already contains 'mc'
+        if 'mc' in model_tag or 'monte' in model_tag.lower():
+            suffix = ''  # Model name already indicates Monte Carlo (e.g., 'merton_mc', 'garch_mc')
+        else:
+            suffix = '_mc'  # Add '_mc' for models like 'garch', 'regime_switching', 'msgarch'
+        
         # Calculate spreads for each maturity
         results_data = {'gvkey': df_merged['gvkey'].values, 
                         'date': df_merged['date'].values}
         
         for tau in self.maturity_horizons:
             spread, spread_bps = self.credit_spread_from_put_value(V_t, K, r_t, sigma_V, tau)
-            results_data[f'cds_spread_{model_tag}_mc_{tau}y'] = spread
-            results_data[f'cds_spread_{model_tag}_mc_{tau}y_bps'] = spread_bps
+            results_data[f'cds_spread_{model_tag}{suffix}_{tau}y'] = spread
+            results_data[f'cds_spread_{model_tag}{suffix}_{tau}y_bps'] = spread_bps
         
         df_cds_spreads = pd.DataFrame(results_data)
         
@@ -721,7 +727,7 @@ class CDSSpreadCalculator:
         print(f"{'='*80}\n")
         
         for tau in self.maturity_horizons:
-            col_bps = f'cds_spread_{model_tag}_mc_{tau}y_bps'
+            col_bps = f'cds_spread_{model_tag}{suffix}_{tau}y_bps'
             
             if col_bps in df_cds_spreads.columns:
                 mean_spread = df_cds_spreads[col_bps].mean()
@@ -854,4 +860,189 @@ class CDSSpreadCalculator:
         print("Done calculation.\n")
         
         return df_spreads
+
+    def calculate_cds_spreads_from_all_mc_models(self, mc_garch_file, mc_regime_file, 
+                                                   mc_msgarch_file, mc_merton_file,
+                                                   daily_returns_file, merton_file, 
+                                                   output_file=None):
+        """
+        Calculate CDS spreads from ALL Monte Carlo models including Merton MC.
+        
+        This provides a comprehensive comparison of:
+        - GARCH MC (dynamic, single regime)
+        - Regime Switching MC (two regimes, constant vol per regime)
+        - MS-GARCH MC (two regimes, GARCH dynamics per regime)
+        - Merton MC (constant volatility for fair comparison)
+        
+        Parameters:
+        -----------
+        mc_garch_file : str
+            Path to GARCH MC results (daily_monte_carlo_garch_results.csv)
+        mc_regime_file : str
+            Path to Regime Switching MC results (daily_monte_carlo_regime_switching_results.csv)
+        mc_msgarch_file : str
+            Path to MS-GARCH MC results (daily_monte_carlo_ms_garch_results.csv)
+        mc_merton_file : str
+            Path to Merton MC results (daily_monte_carlo_merton_results.csv)
+        daily_returns_file : str
+            Path to daily returns with asset values
+        merton_file : str
+            Path to Merton results with liabilities
+        output_file : str, optional
+            Where to save combined results
+            
+        Returns:
+        --------
+        pd.DataFrame with CDS spreads for all four MC models and all maturities
+        """
+        
+        overall_start = time.time()
+        
+        print(f"\n{'='*80}")
+        print("CDS SPREADS FROM ALL MONTE CARLO MODELS")
+        print(f"{'='*80}\n")
+        
+        print("This will calculate CDS spreads for:")
+        print("  1. GARCH Monte Carlo (dynamic volatility)")
+        print("  2. Regime Switching Monte Carlo (two regime states)")
+        print("  3. MS-GARCH Monte Carlo (regime-dependent GARCH)")
+        print("  4. Merton Monte Carlo (constant volatility baseline)\n")
+        
+        # Calculate CDS spreads for each MC model
+        print("="*80)
+        print("1/4: GARCH Monte Carlo")
+        print("="*80)
+        df_garch = self.calculate_cds_spreads_from_mc_garch(
+            mc_garch_file=mc_garch_file,
+            daily_returns_file=daily_returns_file,
+            merton_file=merton_file,
+            output_file='data/output/cds_spreads_garch_mc_all_firms.csv',
+            volatility_column='mc_garch_integrated_variance',
+            model_name='GARCH'
+        )
+        
+        print("\n" + "="*80)
+        print("2/4: Regime Switching Monte Carlo")
+        print("="*80)
+        df_regime = self.calculate_cds_spreads_from_mc_garch(
+            mc_garch_file=mc_regime_file,
+            daily_returns_file=daily_returns_file,
+            merton_file=merton_file,
+            output_file='data/output/cds_spreads_regime_switching_mc_all_firms.csv',
+            volatility_column='rs_integrated_variance',
+            model_name='Regime Switching'
+        )
+        
+        print("\n" + "="*80)
+        print("3/4: MS-GARCH Monte Carlo")
+        print("="*80)
+        df_msgarch = self.calculate_cds_spreads_from_mc_garch(
+            mc_garch_file=mc_msgarch_file,
+            daily_returns_file=daily_returns_file,
+            merton_file=merton_file,
+            output_file='data/output/cds_spreads_ms_garch_mc_all_firms.csv',
+            volatility_column='mc_msgarch_integrated_variance',
+            model_name='MS-GARCH'
+        )
+        
+        print("\n" + "="*80)
+        print("4/4: Merton Monte Carlo (Constant Volatility)")
+        print("="*80)
+        df_merton_mc = self.calculate_cds_spreads_from_mc_garch(
+            mc_garch_file=mc_merton_file,
+            daily_returns_file=daily_returns_file,
+            merton_file=merton_file,
+            output_file='data/output/cds_spreads_merton_mc_all_firms.csv',
+            volatility_column='merton_mc_integrated_variance',
+            model_name='Merton MC'
+        )
+        
+        # Merge all results
+        print("\n" + "="*80)
+        print("MERGING RESULTS")
+        print("="*80 + "\n")
+        
+        # Start with GARCH as base
+        df_combined = df_garch[['gvkey', 'date']].copy()
+        
+        # Add CDS spreads from each model
+        for tau in self.maturity_horizons:
+            # GARCH MC
+            garch_col = f'cds_spread_garch_mc_{tau}y_bps'
+            if garch_col in df_garch.columns:
+                df_combined[garch_col] = df_garch[garch_col]
+            
+            # Regime Switching MC
+            regime_col = f'cds_spread_regimeswitching_mc_{tau}y_bps'
+            if regime_col in df_regime.columns:
+                df_combined = pd.merge(
+                    df_combined, 
+                    df_regime[['gvkey', 'date', regime_col]],
+                    on=['gvkey', 'date'],
+                    how='left'
+                )
+            
+            # MS-GARCH MC
+            msgarch_col = f'cds_spread_msgarch_mc_{tau}y_bps'
+            if msgarch_col in df_msgarch.columns:
+                df_combined = pd.merge(
+                    df_combined,
+                    df_msgarch[['gvkey', 'date', msgarch_col]],
+                    on=['gvkey', 'date'],
+                    how='left'
+                )
+            
+            # Merton MC
+            merton_mc_col = f'cds_spread_mertonmc_mc_{tau}y_bps'
+            if merton_mc_col in df_merton_mc.columns:
+                df_combined = pd.merge(
+                    df_combined,
+                    df_merton_mc[['gvkey', 'date', merton_mc_col]],
+                    on=['gvkey', 'date'],
+                    how='left'
+                )
+        
+        # Print summary comparison
+        print("="*80)
+        print("CDS SPREAD COMPARISON SUMMARY (5Y Maturity, basis points)")
+        print("="*80 + "\n")
+        
+        comparison_cols = [
+            ('GARCH MC', 'cds_spread_garch_mc_5y_bps'),
+            ('Regime Switching MC', 'cds_spread_regimeswitching_mc_5y_bps'),
+            ('MS-GARCH MC', 'cds_spread_msgarch_mc_5y_bps'),
+            ('Merton MC (Constant)', 'cds_spread_mertonmc_mc_5y_bps')
+        ]
+        
+        print(f"{'Model':<25} {'Mean':>10} {'Median':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'N':>10}")
+        print("-" * 95)
+        
+        for model_name, col in comparison_cols:
+            if col in df_combined.columns:
+                data = df_combined[col].dropna()
+                if len(data) > 0:
+                    print(f"{model_name:<25} {data.mean():>10.2f} {data.median():>10.2f} "
+                          f"{data.std():>10.2f} {data.min():>10.2f} {data.max():>10.2f} {len(data):>10,}")
+        
+        print("\n" + "="*80)
+        
+        # Save combined results
+        if output_file is None:
+            output_file = 'data/output/cds_spreads_comparison_all_mc.csv'
+        
+        df_combined.to_csv(output_file, index=False)
+        
+        overall_time = time.time() - overall_start
+        
+        print(f"\n{'='*80}")
+        print("ALL MONTE CARLO CDS SPREADS COMPLETE")
+        print(f"{'='*80}")
+        print(f"Total time: {timedelta(seconds=int(overall_time))}")
+        print(f"Total observations: {len(df_combined):,}")
+        print(f"Unique firms: {df_combined['gvkey'].nunique()}")
+        print(f"Saved to: {output_file}")
+        print(f"{'='*80}\n")
+        
+        return df_combined
+
 

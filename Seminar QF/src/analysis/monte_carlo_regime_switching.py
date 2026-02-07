@@ -82,7 +82,9 @@ def simulate_regime_switching_paths_vectorized(
                         regime[f] = 0
             
             # Generate returns conditional on regime
-            z = np.random.standard_normal(num_firms)
+            z_raw = np.random.standard_normal(num_firms)
+            # Cap extreme innovations to prevent temporary spikes (consistent with MS-GARCH)
+            z = np.maximum(np.minimum(z_raw, 5.0), -5.0)  # Cap at ±5 sigma
             
             for f in range(num_firms):
                 if regime[f] == 0:
