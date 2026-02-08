@@ -347,6 +347,22 @@ def monte_carlo_ms_garch_1year(
         print(f"   Run MS-GARCH estimation first (ms_garch_proper.py)")
         return pd.DataFrame()
     
+    # Load Merton Data for PD calculation
+    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(ms_garch_params_file))), 'data', 'output', 'merged_data_with_merton.csv')
+    if not os.path.exists(merton_file):
+         merton_file = './data/output/merged_data_with_merton.csv'
+
+    merton_by_date = {}
+    if os.path.exists(merton_file):
+        try:
+            df_merton = pd.read_csv(merton_file)
+            df_merton['date'] = pd.to_datetime(df_merton['date'])
+            merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+        except Exception as e:
+            print(f"⚠ Error loading Merton data: {e}")
+            merton_by_date = {}
+    
     # Load daily returns with MS-GARCH volatility
     df_returns = pd.read_csv(daily_returns_file)
     df_returns['date'] = pd.to_datetime(df_returns['date'])
@@ -458,15 +474,23 @@ def monte_carlo_ms_garch_1year(
         # CALCULATE STATISTICS
         # daily_vols shape: (num_days, num_simulations, num_firms)
         
-        # MEAN VARIANCE CALCULATION
-        # 1. Square to get variances
-        daily_variances = daily_vols ** 2
+        # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
+        # 1. Generate random innovations (standard normal) for Asset Returns
+        z_innovations = np.random.standard_normal(daily_vols.shape)
         
-        # 2. Mean across simulations (Expected Conditional Variance)
-        mean_variance_paths = np.mean(daily_variances, axis=1) # (num_days, num_firms)
+        # 2. Calculate daily asset returns: R_t ~ N(0, sigma_t)
+        assets_daily_returns = daily_vols * z_innovations
         
-        # 3. Sum over horizon (Integrated Variance)
-        integrated_variances = np.sum(mean_variance_paths, axis=0) # (num_firms,)
+        # 3. Calculate yearly cumulative return for each path
+        # V_end = V_start * prod(1 + R_t)
+        # R_yearly = V_end/V_start - 1 = prod(1 + R_t) - 1
+        path_cumulative_returns = np.prod(1.0 + assets_daily_returns, axis=0) - 1.0  # Shape: (num_simulations, num_firms)
+        
+        # 4. Calculate Variance of yearly returns across simulations
+        daily_variances = np.var(path_cumulative_returns, axis=0, ddof=1)  # Shape: (num_firms,)
+        # Note: We assign to 'integrated_variances' variable to match expected downstream name
+        integrated_variances = daily_variances
+
         
         # Calculate regime statistics
         mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
@@ -534,7 +558,7 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
     Parameters:
     -----------
     date_data : tuple
-        (date, df_date, msgarch_params_dict) 
+        (date, df_date, msgarch_params_dict, merton_data_dict) 
     num_simulations : int
         Number of Monte Carlo paths
     num_days : int
@@ -544,7 +568,13 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
     --------
     list : Results for all firms on this date
     """
-    date, df_date, msgarch_params = date_data
+    # Unpack with optional merton_data_dict
+    if len(date_data) == 4:
+        date, df_date, msgarch_params, merton_data_dict = date_data
+    else:
+        date, df_date, msgarch_params = date_data
+        merton_data_dict = {}
+
     results_list = []
     
     if df_date.empty:
@@ -586,15 +616,19 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
             firm_vols = daily_vols[:, :, 0]  # shape: (num_days, num_simulations)
             firm_regimes = regime_paths[:, :, 0]  # shape: (num_days, num_simulations)
             
-            # Calculate statistics - CORRECT: Use VARIANCE not volatility for integration
-            # 1. Square to get variances
-            firm_variances = firm_vols ** 2  # shape: (num_days, num_simulations)
+            # Calculate statistics - ASSET VALUE SIMULATION METHOD
+            # 1. Generate random innovations (standard normal)
+            z_innovations = np.random.standard_normal(firm_vols.shape)
             
-            # 2. Mean across simulations (Expected Conditional Variance per day)
-            mean_variance_path = np.mean(firm_variances, axis=1)  # shape: (num_days,)
+            # 2. Daily returns: R_t ~ N(0, sigma_t)
+            firm_daily_returns = firm_vols * z_innovations
             
-            # 3. Sum over horizon (Integrated Variance)
-            integrated_variance = np.sum(mean_variance_path)
+            # 3. Cumulative yearly return
+            firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0
+            
+            # 4. Variance of yearly returns
+            integrated_variance = np.var(firm_cumulative_returns, ddof=1)
+
             
             # Regime fractions
             regime_0_frac = np.mean(firm_regimes == 0)
@@ -686,10 +720,23 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
     start_time = pd.Timestamp.now()
     
     # Prepare date groups for parallel processing
+    date_groups = []
     if 'date' in df.columns:
-        date_groups = [(date, group, msgarch_params) for date, group in df.groupby('date')]
+        for date, group in df.groupby('date'):
+            # Prepare merton dict
+            merton_date_dict = {}
+            if date in merton_by_date:
+                df_m = merton_by_date[date]
+                firms_on_date = group['gvkey'].unique()
+                df_m_relevant = df_m[df_m['gvkey'].isin(firms_on_date)]
+                for _, row in df_m_relevant.iterrows():
+                    merton_date_dict[row['gvkey']] = {
+                        'asset_value': row['asset_value'],
+                        'liabilities_total': row['liabilities_total']
+                    }
+            date_groups.append((date, group, msgarch_params, merton_date_dict))
     else:
-        date_groups = [(pd.Timestamp.now().date(), df, msgarch_params)]
+        date_groups = [(pd.Timestamp.now().date(), df, msgarch_params, {})]
     
     print(f"\nProcessing {len(date_groups)} dates in parallel...")
     

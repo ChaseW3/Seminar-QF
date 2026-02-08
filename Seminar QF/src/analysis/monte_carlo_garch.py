@@ -224,32 +224,32 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
             num_simulations, num_days, len(firms_on_date)
         )
         
-        # For each firm, calculate:
-        # 1. Mean variance path (mean across simulations for each day)
-        # 2. Sum of mean variances over 252 days (Integrated Variance)
+        # For each firm, calculate yearly variance using Asset Value Simulation
+        # Simulate returns R ~ N(0, sigma) and measure variance of yearly return
         for firm_idx, firm in enumerate(firms_on_date):
             # daily_vols shape: (num_days, num_simulations, num_firms)
             # Get volatilities for this firm across all days and simulations
             firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
             
-            # MEAN VARIANCE CALCULATION (Corrected per request)
-            # 1. Square the volatilities to get variances
-            firm_daily_variances = firm_daily_vols ** 2
+            # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
+            # 1. Generate random innovations (standard normal) for Asset Returns
+            z_innovations = np.random.standard_normal(firm_daily_vols.shape)
             
-            # 2. Average variances across simulations (Expected Conditional Variance)
-            # \bar{\sigma}^2_{t+h} = \frac{1}{M} \sum \sigma^{2,(m)}_{t+h}
-            mean_variance_path = np.mean(firm_daily_variances, axis=1)  # shape: (num_days,)
+            # 2. Daily returns: R_t ~ N(0, sigma_t)
+            firm_daily_returns = firm_daily_vols * z_innovations
             
-            # 3. Sum expected variances over horizon (Integrated Variance)
-            # IV_{t,T} = \sum \bar{\sigma}^2_{t+h}
-            integrated_variance = np.sum(mean_variance_path)
+            # 3. Cumulative yearly return
+            firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0
+            
+            # 4. Variance of yearly returns
+            integrated_variance = np.var(firm_cumulative_returns, ddof=1)
             
             # Also store other statistics
             results_list.append({
                 'gvkey': firm,
                 'date': date,
                 'mc_garch_integrated_variance': integrated_variance,
-                'mc_garch_mean_daily_volatility': np.mean(mean_variance_path) ** 0.5, # approx
+                'mc_garch_mean_daily_volatility': np.mean(firm_daily_vols ** 2) ** 0.5, # RMS volatility
                 'mc_garch_std_daily_volatility': np.std(firm_daily_vols),
                 'mc_garch_min_daily_volatility': np.min(firm_daily_vols),
                 'mc_garch_max_daily_volatility': np.max(firm_daily_vols),
@@ -305,7 +305,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     Parameters:
     -----------
     date_data : tuple
-        (date, df_date) where df_date contains firms data for that date
+        (date, df_date, merton_data_dict) 
     num_simulations : int
         Number of Monte Carlo paths
     num_days : int
@@ -315,7 +315,13 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     --------
     list : Results for all firms on this date
     """
-    date, df_date = date_data
+    # Unpack with optional merton_data_dict
+    if len(date_data) == 3:
+        date, df_date, merton_data_dict = date_data
+    else:
+        date, df_date = date_data
+        merton_data_dict = {}
+
     results_list = []
     
     if df_date.empty:
@@ -356,16 +362,36 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     for firm_idx, firm in enumerate(firms_on_date):
         firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
         
-        # Calculate Integrated Variance (IV = Σ E[σ²])
-        # 1. Square the volatilities to get variances
-        firm_daily_variances = firm_daily_vols ** 2
+        # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
+        # 1. Generate random innovations (standard normal) for Asset Returns
+        z_innovations = np.random.standard_normal(firm_daily_vols.shape)
         
-        # 2. Average variances across simulations (Expected Conditional Variance)
-        mean_variance_path = np.mean(firm_daily_variances, axis=1)  # shape: (num_days,)
+        # 2. Daily returns: R_t ~ N(0, sigma_t)
+        firm_daily_returns = firm_daily_vols * z_innovations
         
-        # 3. Sum expected variances over horizon (Integrated Variance)
-        integrated_variance = np.sum(mean_variance_path)
+        # 3. Cumulative yearly return
+        firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0
         
+        # 4. Variance of yearly returns
+        integrated_variance = np.var(firm_cumulative_returns, ddof=1)
+        
+        # Determine Probability of Default
+        pd_value = np.nan
+        if firm in merton_data_dict:
+            m_data = merton_data_dict[firm]
+            v0 = m_data.get('asset_value', np.nan)
+            liability = m_data.get('liabilities_total', np.nan)
+            
+            if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
+                 # Asset Paths: V_t = V0 * cumulative_prod(1+R)
+                 # We need full path.
+                 cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
+                 asset_paths = v0 * cum_returns_path
+                 
+                 # Default condition: Asset < Liability at any time step
+                 path_defaulted = np.any(asset_paths < liability, axis=0) # shape: (num_simulations,)
+                 pd_value = np.mean(path_defaulted)
+
         # Also calculate mean volatility path for other statistics
         mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
         
@@ -378,7 +404,8 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
             'mc_garch_max_daily_volatility': np.max(mean_path),
             'mc_garch_min_daily_volatility': np.min(mean_path),
             'mc_garch_p95_daily_volatility': np.percentile(mean_path, 95),
-            'mc_garch_p05_daily_volatility': np.percentile(mean_path, 5)
+            'mc_garch_p05_daily_volatility': np.percentile(mean_path, 5),
+            'mc_garch_probability_of_default': pd_value
         })
     
     return results_list
@@ -429,11 +456,41 @@ def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simula
     start_time = pd.Timestamp.now()
     
     # Prepare date groups for parallel processing
+    
+    # Load Merton Data for PD calculation
+    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(garch_file))), 'merged_data_with_merton.csv')
+    if not os.path.exists(merton_file):
+        merton_file = './data/output/merged_data_with_merton.csv'
+
+    merton_by_date = {}
+    if os.path.exists(merton_file):
+        try:
+            df_merton = pd.read_csv(merton_file)
+            df_merton['date'] = pd.to_datetime(df_merton['date'])
+            merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+        except Exception as e:
+            print(f"⚠ Error loading Merton data: {e}")
+            merton_by_date = {}
+
+    date_groups = []
     if 'date' in df.columns:
-        date_groups = [(date, group) for date, group in df.groupby('date')]
+        for date, group in df.groupby('date'):
+            # Prepare merton dict
+            merton_date_dict = {}
+            if date in merton_by_date:
+                df_m = merton_by_date[date]
+                firms_on_date = group['gvkey'].unique()
+                df_m_relevant = df_m[df_m['gvkey'].isin(firms_on_date)]
+                for _, row in df_m_relevant.iterrows():
+                    merton_date_dict[row['gvkey']] = {
+                        'asset_value': row['asset_value'],
+                        'liabilities_total': row['liabilities_total']
+                    }
+            date_groups.append((date, group, merton_date_dict))
     else:
         # Single date case
-        date_groups = [(pd.Timestamp.now().date(), df)]
+        date_groups = [(pd.Timestamp.now().date(), df, {})]
     
     print(f"\nProcessing {len(date_groups)} dates in parallel...")
     

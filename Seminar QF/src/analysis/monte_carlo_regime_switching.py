@@ -237,15 +237,23 @@ def monte_carlo_regime_switching_1year(
         # CALCULATE STATISTICS
         # daily_vols shape: (num_days, num_simulations, num_firms)
         
-        # MEAN VARIANCE CALCULATION
-        # 1. Square to get variances
-        daily_variances = daily_vols ** 2
+        # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
+        # 1. Generate random innovations (standard normal) for Asset Returns
+        z_innovations = np.random.standard_normal(daily_vols.shape)
         
-        # 2. Mean across simulations (Expected Conditional Variance)
-        mean_variance_paths = np.mean(daily_variances, axis=1)  # (num_days, num_firms)
+        # 2. Calculate daily asset returns: R_t ~ N(0, sigma_t)
+        assets_daily_returns = daily_vols * z_innovations
         
-        # 3. Sum over horizon (Integrated Variance)
-        integrated_variances = np.sum(mean_variance_paths, axis=0)  # (num_firms,)
+        # 3. Calculate yearly cumulative return for each path
+        # V_end = V_start * prod(1 + R_t)
+        # R_yearly = V_end/V_start - 1 = prod(1 + R_t) - 1
+        path_cumulative_returns = np.prod(1.0 + assets_daily_returns, axis=0) - 1.0  # Shape: (num_simulations, num_firms)
+        
+        # 4. Calculate Variance of yearly returns across simulations
+        daily_variances = np.var(path_cumulative_returns, axis=0, ddof=1)  # Shape: (num_firms,)
+        # Note: We assign to 'integrated_variances' variable to match expected downstream name
+        integrated_variances = daily_variances
+
         
         # Other stats
         mean_daily_vols = np.mean(daily_vols, axis=(0,1)) # overall mean
@@ -306,7 +314,14 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     """
     Process Monte Carlo regime-switching simulation for a single date (for parallelization).
     """
-    date, df_date, regime_params_dict, firms_on_date = date_data
+    # Unpack updated tuple
+    if len(date_data) == 5:
+        date, df_date, regime_params_dict, firms_on_date, merton_data_dict = date_data
+    else:
+        # Legacy support or fallback
+        date, df_date, regime_params_dict, firms_on_date = date_data
+        merton_data_dict = {}
+
     results_list = []
     
     if len(firms_on_date) == 0:
@@ -315,6 +330,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     # Prepare arrays for vectorized simulation
     n_firms = len(firms_on_date)
     mu_0_arr = np.zeros(n_firms)
+
     mu_1_arr = np.zeros(n_firms)
     ar_0_arr = np.zeros(n_firms)
     ar_1_arr = np.zeros(n_firms)
@@ -355,16 +371,47 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
         num_simulations, num_days, n_firms, initial_regime_probs
     )
     
-    # Calculate statistics
-    daily_variances = daily_vols ** 2
-    mean_variance_paths = np.mean(daily_variances, axis=1)
-    integrated_variances = np.sum(mean_variance_paths, axis=0)
+    # YEARLY VARIANCE & PD CALCULATION (Asset Value Simulation Method)
+    z_innovations = np.random.standard_normal(daily_vols.shape)
+    assets_daily_returns = daily_vols * z_innovations
+    
+    # Cumulative returns: V_t = V_0 * prod(1+R)
+    # Shape: (num_days, num_simulations, num_firms)
+    cumulative_returns = np.cumprod(1.0 + assets_daily_returns, axis=0)
+    
+    path_cumulative_returns = cumulative_returns[-1, :, :] - 1.0
+    integrated_variances = np.var(path_cumulative_returns, axis=0, ddof=1)
+    
+    # Other stats
     mean_daily_vols = np.mean(daily_vols, axis=(0, 1))
     mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
     mean_regime_1 = np.mean(regime_paths == 1, axis=(0, 1))
     
     # Append results for valid firms
     for f_idx, firm in valid_firms:
+        # Calculate Probability of Default (PD)
+        pd_value = np.nan
+        
+        if firm in merton_data_dict:
+             m_data = merton_data_dict[firm]
+             v0 = m_data.get('asset_value', np.nan)
+             liability = m_data.get('liabilities_total', np.nan)
+             
+             if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
+                 # Calculate asset paths: V_t = V_0 * cumulative_returns[t]
+                 # cumulative_returns shape: (num_days, num_simulations, n_firms)
+                 firm_cum_returns = cumulative_returns[:, :, f_idx]
+                 
+                 firm_asset_paths = v0 * firm_cum_returns
+                 
+                 # Check default condition (Asset < Liability) at any point
+                 is_below_barrier = firm_asset_paths < liability
+                 
+                 # Did default happen at any time step?
+                 path_defaulted = np.any(is_below_barrier, axis=0)
+                 
+                 pd_value = np.mean(path_defaulted)
+
         results_list.append({
             'gvkey': firm,
             'date': date,
@@ -372,6 +419,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
             'rs_mean_daily_volatility': mean_daily_vols[f_idx],
             'rs_fraction_regime_0': mean_regime_0[f_idx],
             'rs_fraction_regime_1': mean_regime_1[f_idx],
+            'rs_probability_of_default': pd_value
         })
     
     return results_list
@@ -420,6 +468,32 @@ def monte_carlo_regime_switching_1year_parallel(
             'transition_prob_11': row['transition_prob_11'],
         }
     
+    # Load Merton Data for PD calculation
+    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(garch_file))), 'merged_data_with_merton.csv')
+    if not os.path.exists(merton_file):
+        # Try relative to current script/workspace
+        merton_file = './data/output/merged_data_with_merton.csv'
+    
+    merton_lookup = {}
+    if os.path.exists(merton_file):
+        try:
+            df_merton = pd.read_csv(merton_file)
+            df_merton['date'] = pd.to_datetime(df_merton['date'])
+            # Create dict for fast lookup: (gvkey, date) -> {asset_value, liabilities}
+            # Optimize: Group by date first to avoid huge dict?
+            # Or just filter in loop. Let's create a full lookup if memory permits, or per date in loop.
+            # Using per-date filtering in the loop below is better for parallel pickup
+            
+            # Pre-group by date for faster access in loop
+            merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+        except Exception as e:
+            print(f"⚠ Error loading Merton data: {e}")
+            merton_by_date = {}
+    else:
+        print(f"⚠ Warning: {merton_file} not found. PD will be NaN.")
+        merton_by_date = {}
+
     # Load GARCH base data
     df_garch = pd.read_csv(garch_file)
     df_garch['date'] = pd.to_datetime(df_garch['date'])
@@ -438,7 +512,21 @@ def monte_carlo_regime_switching_1year_parallel(
     date_groups = []
     for date, group in df_garch.groupby('date'):
         firms_on_date = list(group['gvkey'].unique())
-        date_groups.append((date, group, regime_params_dict, firms_on_date))
+        
+        # Prepare merton dict for this date
+        merton_date_dict = {}
+        if date in merton_by_date:
+            df_m = merton_by_date[date]
+            # Create dict: gvkey -> {asset_value, liabilities_total}
+            # Only for firms on this date to save space
+            relevant_merton = df_m[df_m['gvkey'].isin(firms_on_date)]
+            for _, row in relevant_merton.iterrows():
+                merton_date_dict[row['gvkey']] = {
+                    'asset_value': row['asset_value'],
+                    'liabilities_total': row['liabilities_total']
+                }
+        
+        date_groups.append((date, group, regime_params_dict, firms_on_date, merton_date_dict))
     
     print(f"\nProcessing {len(date_groups)} dates in parallel...")
     
