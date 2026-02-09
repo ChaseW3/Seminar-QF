@@ -187,9 +187,8 @@ def run_regime_switching_estimation(daily_returns_df):
         returns = firm_df.loc[valid_mask, target_col].values
         valid_indices = firm_df.loc[valid_mask].index
         
-        calc_scale_factor = 1.0
+        calc_scale_factor = 100.0
         if not scaled_available:
-             calc_scale_factor = 100.0
              returns = returns * calc_scale_factor
         
         if len(returns) < 150:
@@ -200,11 +199,11 @@ def run_regime_switching_estimation(daily_returns_df):
             model = MarkovSwitchingTDist()
             params, probs = model.fit(returns)
             
-            # Map regimes: 0 = HIGH, 1 = LOW Volatility
+            # Map regimes: 0 = LOW, 1 = HIGH Volatility
             p_sigma0 = params['sigma2_0']
             p_sigma1 = params['sigma2_1']
             
-            if p_sigma1 > p_sigma0:
+            if p_sigma0 > p_sigma1:
                  params['sigma2_0'], params['sigma2_1'] = params['sigma2_1'], params['sigma2_0']
                  params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
                  params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
