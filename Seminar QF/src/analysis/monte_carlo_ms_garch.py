@@ -719,6 +719,22 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
     
     start_time = pd.Timestamp.now()
     
+    # Load Merton Data for PD calculation
+    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(daily_returns_file))), 'merged_data_with_merton.csv')
+    if not os.path.exists(merton_file):
+        merton_file = './data/output/merged_data_with_merton.csv'
+
+    merton_by_date = {}
+    if os.path.exists(merton_file):
+        try:
+            df_merton = pd.read_csv(merton_file)
+            df_merton['date'] = pd.to_datetime(df_merton['date'])
+            merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+        except Exception as e:
+            print(f"⚠ Error loading Merton data: {e}")
+            merton_by_date = {}
+    
     # Prepare date groups for parallel processing
     date_groups = []
     if 'date' in df.columns:

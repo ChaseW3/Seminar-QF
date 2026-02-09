@@ -158,6 +158,8 @@ class CDSSpreadCalculator:
         --------
         P : float or array
             Black-Scholes put option value
+        PD : float or array
+            Risk-neutral probability of default: PD = Φ(-d2) = 1 - Φ(d2)
         """
         
         V_t = np.asarray(V_t, dtype=np.float64)
@@ -177,11 +179,14 @@ class CDSSpreadCalculator:
         Nd1 = ndtr(d1)
         Nd2 = ndtr(d2)
         
+        # Risk-neutral probability of default: PD = Φ(-d2) = 1 - Φ(d2)
+        PD = 1 - Nd2
+        
         # Black-Scholes put: P = K e^(-rτ) Φ(-d2) - V Φ(-d1)
         # Note: Φ(-x) = 1 - Φ(x)
-        P = K * np.exp(-r * tau) * (1 - Nd2) - V_t * (1 - Nd1)
+        P = K * np.exp(-r * tau) * PD - V_t * (1 - Nd1)
         
-        return P
+        return P, PD
     
     
     def credit_spread_from_put_value(self, V_t, K, r, sigma_V, tau):
@@ -234,10 +239,12 @@ class CDSSpreadCalculator:
             Model-implied credit spread (annualized, decimal form)
         spread_bps : float or array
             Credit spread in basis points (100 bps = 1%)
+        PD : float or array
+            Risk-neutral probability of default over horizon tau
         """
         
-        # Put option value
-        P = self.black_scholes_put_value(V_t, K, r, sigma_V, tau)
+        # Put option value and probability of default
+        P, PD = self.black_scholes_put_value(V_t, K, r, sigma_V, tau)
         
         # Denominator: K e^(-rτ)
         denominator = K * np.exp(-r * tau)
@@ -283,7 +290,7 @@ class CDSSpreadCalculator:
         # spread[problematic_mask] = np.nan
         # spread_bps[problematic_mask] = np.nan
         
-        return spread, spread_bps
+        return spread, spread_bps, PD
     
     
     def calculate_cds_spreads_single_model(self, df_model, model_name, r_t=None, 
@@ -328,9 +335,9 @@ class CDSSpreadCalculator:
         K = df_model['liabilities_total'].values  # Already scaled in data_processing.py
         sigma_V = df_model[volatility_column].values
         
-        # Calculate spreads for each maturity
+        # Calculate spreads and PD for each maturity
         for tau in self.maturity_horizons:
-            spread, spread_bps = self.credit_spread_from_put_value(
+            spread, spread_bps, PD = self.credit_spread_from_put_value(
                 V_t=V_t,
                 K=K,
                 r=r_t if isinstance(r_t, (int, float)) else r_t,
@@ -340,6 +347,7 @@ class CDSSpreadCalculator:
             
             df_spreads[f'cds_spread_{tau}y'] = spread
             df_spreads[f'cds_spread_{tau}y_bps'] = spread_bps
+            df_spreads[f'pd_{tau}y'] = PD
         
         return df_spreads
     
@@ -708,18 +716,19 @@ class CDSSpreadCalculator:
         else:
             suffix = '_mc'  # Add '_mc' for models like 'garch', 'regime_switching', 'msgarch'
         
-        # Calculate spreads for each maturity
+        # Calculate spreads and PD for each maturity
         results_data = {'gvkey': df_merged['gvkey'].values, 
                         'date': df_merged['date'].values}
         
         for tau in self.maturity_horizons:
-            spread, spread_bps = self.credit_spread_from_put_value(V_t, K, r_t, sigma_V, tau)
+            spread, spread_bps, PD = self.credit_spread_from_put_value(V_t, K, r_t, sigma_V, tau)
             results_data[f'cds_spread_{model_tag}{suffix}_{tau}y'] = spread
             results_data[f'cds_spread_{model_tag}{suffix}_{tau}y_bps'] = spread_bps
+            results_data[f'pd_{model_tag}{suffix}_{tau}y'] = PD
         
         df_cds_spreads = pd.DataFrame(results_data)
         
-        print(f"✓ CDS spreads calculated\n")
+        print(f"✓ CDS spreads and PD calculated\n")
         
         # Print summary statistics
         print(f"{'='*80}")
@@ -850,6 +859,7 @@ class CDSSpreadCalculator:
         for tau in self.maturity_horizons:
             rename_map[f'cds_spread_{tau}y'] = f'cds_spread_merton_{tau}y'
             rename_map[f'cds_spread_{tau}y_bps'] = f'cds_spread_merton_{tau}y_bps'
+            rename_map[f'pd_{tau}y'] = f'pd_merton_{tau}y'
         df_spreads = df_spreads.rename(columns=rename_map)
         
         # Save Results
