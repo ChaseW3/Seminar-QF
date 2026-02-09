@@ -59,10 +59,17 @@ def simulate_regime_switching_paths_vectorized(
     regime_paths = np.zeros((num_days, num_simulations, num_firms), dtype=np.int32)
     
     for sim in numba.prange(num_simulations):
+        # OPTIMIZATION: Pre-generate all random innovations for this path at once
+        # This leverages efficient vector RNG (MKL/SIMD) and avoids 252*3 allocations per simulation
+        z_raw_all = np.random.standard_normal((num_days, num_firms))
+        
+        # Cap innovations (vectorized)
+        z_all = np.maximum(np.minimum(z_raw_all, 5.0), -5.0)
+
         # Initialize regime (0 or 1) for each firm based on initial probs
         regime = np.zeros(num_firms, dtype=np.int32)
         for f in range(num_firms):
-            if np.random.uniform() < initial_regime_probs[f]:
+            if np.random.uniform(0.0, 1.0) < initial_regime_probs[f]:
                 regime[f] = 1
             else:
                 regime[f] = 0
@@ -70,21 +77,19 @@ def simulate_regime_switching_paths_vectorized(
         r_prev = np.zeros(num_firms)  # Previous returns for AR(1)
         
         for day in range(num_days):
-            # Regime transitions (vectorized)
+            # Get pre-generated innovations for this day (no allocation)
+            z_day = z_all[day]
+            
+            # Regime transitions (vectorized loop)
             for f in range(num_firms):
                 if regime[f] == 0:
                     # In regime 0, stay with prob trans_00, switch with prob trans_01
-                    if np.random.uniform() < trans_01[f]:
+                    if np.random.uniform(0.0, 1.0) < trans_01[f]:
                         regime[f] = 1
                 else:
                     # In regime 1, switch with prob trans_10, stay with prob trans_11
-                    if np.random.uniform() < trans_10[f]:
+                    if np.random.uniform(0.0, 1.0) < trans_10[f]:
                         regime[f] = 0
-            
-            # Generate returns conditional on regime
-            z_raw = np.random.standard_normal(num_firms)
-            # Cap extreme innovations to prevent temporary spikes (consistent with MS-GARCH)
-            z = np.maximum(np.minimum(z_raw, 5.0), -5.0)  # Cap at ±5 sigma
             
             for f in range(num_firms):
                 if regime[f] == 0:
@@ -99,7 +104,8 @@ def simulate_regime_switching_paths_vectorized(
                     sigma = sigma_1[f]
                 
                 # AR(1) return: r_t = μ + φ*r_{t-1} + σ*z_t
-                r_curr = mu + ar * r_prev[f] + sigma * z[f]
+                # Use pre-generated z from array
+                r_curr = mu + ar * r_prev[f] + sigma * z_day[f]
                 r_prev[f] = r_curr
                 
                 # Volatility = conditional std dev (changes with regime)
