@@ -116,21 +116,41 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
     
     # For each firm, calculate statistics
     for firm_idx, firm in enumerate(firms_on_date):
+        firm_data = df_date[df_date['gvkey'] == firm].iloc[0]
         firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
         
-        # Calculate Integrated Variance (IV = Σ E[σ²])
-        # 1. Square the volatilities to get variances
-        firm_daily_variances = firm_daily_vols ** 2
+        # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
+        # 1. Generate random innovations (standard normal) for Asset Returns
+        z_innovations = np.random.standard_normal(firm_daily_vols.shape)
         
-        # 2. Average variances across simulations (Expected Conditional Variance)
-        mean_variance_path = np.mean(firm_daily_variances, axis=1)  # shape: (num_days,)
+        # 2. Daily returns: R_t ~ N(0, sigma_t)
+        firm_daily_returns = firm_daily_vols * z_innovations
         
-        # 3. Sum expected variances over horizon (Integrated Variance)
-        integrated_variance = np.sum(mean_variance_path)
+        # 3. Cumulative yearly return
+        # V_end = V_start * prod(1 + R_t)
+        # R_yearly = V_end/V_start - 1 = prod(1 + R_t) - 1
+        firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0
         
-        # Annualized volatility
+        # 4. Variance of yearly returns
+        integrated_variance = np.var(firm_cumulative_returns, ddof=1)
+        
+        # Annualized volatility from simulation (backward calculation from yearly variance)
         annualized_volatility = np.sqrt(integrated_variance)
         
+        # PROBABILITY OF DEFAULT CALCULATION
+        pd_value = np.nan
+        v0 = firm_data.get('asset_value', np.nan)
+        liability = firm_data.get('liabilities_total', np.nan)
+        
+        if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
+             # Asset Paths: V_t = V0 * cumulative_prod(1+R)
+             cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
+             asset_paths = v0 * cum_returns_path
+             
+             # Default condition: Asset < Liability at any time step
+             path_defaulted = np.any(asset_paths < liability, axis=0) # shape: (num_simulations,)
+             pd_value = np.mean(path_defaulted)
+
         # Also calculate mean volatility path for verification
         mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
         
@@ -140,7 +160,8 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
             'merton_mc_integrated_variance': integrated_variance,
             'merton_mc_annualized_volatility': annualized_volatility,
             'merton_mc_mean_daily_volatility': np.mean(mean_path),
-            'merton_mc_constant_annual_vol': merton_params[firm]['sigma_annual']
+            'merton_mc_constant_annual_vol': merton_params[firm]['sigma_annual'],
+            'merton_mc_probability_of_default': pd_value
         })
     
     return results_list
