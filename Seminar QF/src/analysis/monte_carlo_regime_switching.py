@@ -264,6 +264,8 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     ar_1_arr = np.zeros(n_firms)
     sigma_0_arr = np.zeros(n_firms)
     sigma_1_arr = np.zeros(n_firms)
+    nu_0_arr = np.zeros(n_firms)
+    nu_1_arr = np.zeros(n_firms)
     trans_00_arr = np.zeros(n_firms)
     trans_01_arr = np.zeros(n_firms)
     trans_10_arr = np.zeros(n_firms)
@@ -280,6 +282,8 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
         ar_1_arr[f_idx] = params['regime_1_ar']
         sigma_0_arr[f_idx] = params['regime_0_vol']
         sigma_1_arr[f_idx] = params['regime_1_vol']
+        nu_0_arr[f_idx] = params['regime_0_nu']
+        nu_1_arr[f_idx] = params['regime_1_nu']
         trans_00_arr[f_idx] = params['transition_prob_00']
         trans_01_arr[f_idx] = params['transition_prob_01']
         trans_10_arr[f_idx] = params['transition_prob_10']
@@ -293,15 +297,15 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     initial_regime_probs = np.full(n_firms, 0.5)
     
     # Run vectorized Monte Carlo
-    daily_vols, regime_paths = simulate_regime_switching_paths_vectorized(
-        mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr,
+    daily_vols, regime_paths, daily_returns = simulate_regime_switching_paths_vectorized(
+        mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr, nu_0_arr, nu_1_arr,
         trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
         num_simulations, num_days, n_firms, initial_regime_probs
     )
     
     # YEARLY VARIANCE & PD CALCULATION (Asset Value Simulation Method)
-    z_innovations = np.random.standard_normal(daily_vols.shape)
-    assets_daily_returns = daily_vols * z_innovations
+    # Use returns from simulation which include t-distribution and AR dynamics
+    assets_daily_returns = daily_returns
     
     # Cumulative returns: V_t = V_0 * prod(1+R)
     # Shape: (num_days, num_simulations, num_firms)
@@ -375,6 +379,12 @@ def monte_carlo_regime_switching_1year_parallel(
     # Load regime parameters
     try:
         regime_params = pd.read_csv(regime_params_file)
+        # Check for new 'nu' columns from updated estimator
+        if 'regime_0_nu' not in regime_params.columns:
+            print("⚠ Warning: 'regime_0_nu' not found in parameters from parallel function. Using default df=100 (Normal approx).")
+            regime_params['regime_0_nu'] = 100.0
+            regime_params['regime_1_nu'] = 100.0
+
         print(f"✓ Loaded regime-switching parameters for {len(regime_params)} firms")
     except FileNotFoundError:
         print(f"✗ File '{regime_params_file}' not found!")
@@ -390,6 +400,8 @@ def monte_carlo_regime_switching_1year_parallel(
             'regime_1_ar': row['regime_1_ar'],
             'regime_0_vol': row['regime_0_vol'],
             'regime_1_vol': row['regime_1_vol'],
+            'regime_0_nu': row['regime_0_nu'],
+            'regime_1_nu': row['regime_1_nu'],
             'transition_prob_00': row['transition_prob_00'],
             'transition_prob_01': row['transition_prob_01'],
             'transition_prob_10': row['transition_prob_10'],
