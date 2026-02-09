@@ -1,6 +1,6 @@
 
 # monte_carlo_regime_switching.py
-# Efficient regime-switching Monte Carlo with vectorization
+# Efficient regime-switching Monte Carlo with vectorization AND t-distribution
 
 import pandas as pd
 import numpy as np
@@ -11,62 +11,47 @@ from joblib import Parallel, delayed
 
 os.makedirs('./intermediates/', exist_ok=True)
 
+# =============================================================================
+# JIT-COMPILED T-DISTRIBUTION SAMPLER
+# =============================================================================
+
+@numba.jit(nopython=True)
+def sample_standardized_t(nu):
+    """
+    Generate a standardized t-distributed random variable using Numba.
+    
+    Uses the representation: t(ν) = Z / sqrt(V/ν) where Z ~ N(0,1), V ~ χ²(ν)
+    Then standardizes so variance = 1: multiply by sqrt((ν-2)/ν)
+    """
+    if nu <= 2:
+        return np.random.standard_normal()
+    
+    z = np.random.standard_normal()
+    v = 0.0
+    nu_int = int(nu)
+    for _ in range(nu_int):
+        v += np.random.standard_normal() ** 2
+    
+    t_sample = z / np.sqrt(v / nu)
+    scale = np.sqrt((nu - 2) / nu)
+    return t_sample * scale
 
 @numba.jit(nopython=True, parallel=True)
 def simulate_regime_switching_paths_vectorized(
-    mu_0, mu_1, ar_0, ar_1, sigma_0, sigma_1,
+    mu_0, mu_1, ar_0, ar_1, sigma_0, sigma_1, nu_0, nu_1,
     trans_00, trans_01, trans_10, trans_11,
     num_simulations, num_days, num_firms, initial_regime_probs
 ):
     """
-    Vectorized regime-switching Monte Carlo simulation.
-    
-    For each firm, simulates:
-    1. Regime path using Markov transitions
-    2. Returns conditional on regime
-    3. Volatility path
-    
-    Uses efficient matrix operations and Numba JIT compilation.
-    
-    Parameters:
-    -----------
-    mu_0, mu_1 : arrays (num_firms,)
-        Regime 0 and 1 mean returns
-    ar_0, ar_1 : arrays (num_firms,)
-        Regime 0 and 1 AR(1) coefficients
-    sigma_0, sigma_1 : arrays (num_firms,)
-        Regime 0 and 1 volatilities (daily)
-    trans_00, trans_01, trans_10, trans_11 : arrays (num_firms,)
-        Transition probabilities for each firm
-    num_simulations : int
-        Number of Monte Carlo paths
-    num_days : int
-        Forecast horizon (days)
-    num_firms : int
-        Number of firms
-    initial_regime_probs : array (num_firms,)
-        Initial regime probabilities (typically 0.5, 0.5)
-    
-    Returns:
-    --------
-    daily_volatilities : array (num_days, num_simulations, num_firms)
-        Simulated daily volatilities
-    regime_paths : array (num_days, num_simulations, num_firms)
-        Regime state paths (0 or 1)
+    Vectorized regime-switching Monte Carlo simulation with T-DISTRIBUTION.
     """
     
     daily_volatilities = np.zeros((num_days, num_simulations, num_firms))
+    daily_returns = np.zeros((num_days, num_simulations, num_firms))
     regime_paths = np.zeros((num_days, num_simulations, num_firms), dtype=np.int32)
     
     for sim in numba.prange(num_simulations):
-        # OPTIMIZATION: Pre-generate all random innovations for this path at once
-        # This leverages efficient vector RNG (MKL/SIMD) and avoids 252*3 allocations per simulation
-        z_raw_all = np.random.standard_normal((num_days, num_firms))
-        
-        # Cap innovations (vectorized)
-        z_all = np.maximum(np.minimum(z_raw_all, 5.0), -5.0)
-
-        # Initialize regime (0 or 1) for each firm based on initial probs
+        # Initialize regime (0 or 1)
         regime = np.zeros(num_firms, dtype=np.int32)
         for f in range(num_firms):
             if np.random.uniform(0.0, 1.0) < initial_regime_probs[f]:
@@ -74,47 +59,45 @@ def simulate_regime_switching_paths_vectorized(
             else:
                 regime[f] = 0
         
-        r_prev = np.zeros(num_firms)  # Previous returns for AR(1)
+        r_prev = np.zeros(num_firms)
         
         for day in range(num_days):
-            # Get pre-generated innovations for this day (no allocation)
-            z_day = z_all[day]
-            
-            # Regime transitions (vectorized loop)
+            # Regime transitions
             for f in range(num_firms):
                 if regime[f] == 0:
-                    # In regime 0, stay with prob trans_00, switch with prob trans_01
                     if np.random.uniform(0.0, 1.0) < trans_01[f]:
                         regime[f] = 1
                 else:
-                    # In regime 1, switch with prob trans_10, stay with prob trans_11
                     if np.random.uniform(0.0, 1.0) < trans_10[f]:
                         regime[f] = 0
             
             for f in range(num_firms):
                 if regime[f] == 0:
-                    # Regime 0: AR(1) with low volatility
                     mu = mu_0[f]
                     ar = ar_0[f]
                     sigma = sigma_0[f]
+                    nu = nu_0[f]
                 else:
-                    # Regime 1: AR(1) with high volatility
                     mu = mu_1[f]
                     ar = ar_1[f]
                     sigma = sigma_1[f]
+                    nu = nu_1[f]
+                    
+                # Generate t-distributed innovation
+                z = sample_standardized_t(nu)
+                # Cap innovations
+                z = max(min(z, 5.0), -5.0)
                 
-                # AR(1) return: r_t = μ + φ*r_{t-1} + σ*z_t
-                # Use pre-generated z from array
-                r_curr = mu + ar * r_prev[f] + sigma * z_day[f]
+                # AR(1) return
+                r_curr = mu + ar * r_prev[f] + sigma * z
                 r_prev[f] = r_curr
                 
-                # Volatility = conditional std dev (changes with regime)
                 daily_volatilities[day, sim, f] = sigma
+                daily_returns[day, sim, f] = r_curr
             
-            # Store regime path
             regime_paths[day, sim, :] = regime
     
-    return daily_volatilities, regime_paths
+    return daily_volatilities, regime_paths, daily_returns
 
 
 def monte_carlo_regime_switching_1year(
@@ -125,150 +108,96 @@ def monte_carlo_regime_switching_1year(
     num_days=252
 ):
     """
-    Run Monte Carlo regime-switching forecast for 1 year (252 trading days).
-    
-    VECTORIZED: All firms and simulations processed efficiently using Numba.
-    
-    For each trading date and firm:
-    1. Load regime parameters from CSV
-    2. Run 1,000 simulations with regime transitions
-    3. Calculate mean volatility path (mean across simulations for each day)
-    4. Sum mean volatilities over 252 days (cumulative volatility)
-    
-    Returns one row per firm per date with cumulative volatility.
-    
-    Parameters:
-    -----------
-    garch_file : str
-        Path to GARCH results (for base data)
-    regime_params_file : str
-        Path to regime-switching parameters CSV
-    gvkey_selected : int or None
-        If None, run for ALL firms
-    num_simulations : int
-        Number of Monte Carlo paths
-    num_days : int
-        Forecast horizon (days)
-    
-    Returns:
-    --------
-    results_df : pd.DataFrame
-        Cumulative volatility forecasts per firm per date
+    Run Monte Carlo regime-switching forecast for 1 year (252 days) with T-DISTRIBUTION.
     """
     
     start_time = pd.Timestamp.now()
     
     print(f"\n{'='*80}")
-    print("MONTE CARLO REGIME-SWITCHING 1-YEAR CUMULATIVE VOLATILITY FORECAST")
+    print("MONTE CARLO REGIME-SWITCHING (T-DIST) 1-YEAR VOLATILITY FORECAST")
     print(f"{'='*80}\n")
     
     # Load regime parameters
     try:
         regime_params = pd.read_csv(regime_params_file)
+        # Check for new 'nu' columns from updated estimator
+        if 'regime_0_nu' not in regime_params.columns:
+            print("⚠ Warning: 'regime_0_nu' not found in parameters. Using default df=100 (Normal approx).")
+            regime_params['regime_0_nu'] = 100.0
+            regime_params['regime_1_nu'] = 100.0
+            
         print(f"✓ Loaded regime-switching parameters for {len(regime_params)} firms\n")
     except FileNotFoundError:
         print(f"✗ File '{regime_params_file}' not found!")
-        print(f"   Run regime switching estimation first.\n")
         return pd.DataFrame()
     
-    # Load GARCH base data for dates and firms
+    # Load GARCH base data
     df_garch = pd.read_csv(garch_file)
     df_garch['date'] = pd.to_datetime(df_garch['date'])
     df_garch = df_garch.sort_values(['gvkey', 'date']).reset_index(drop=True)
     
     print(f"✓ Loaded {len(df_garch):,} GARCH observations")
     
-    # Get unique dates and firms
     unique_dates = sorted(df_garch['date'].unique())
     firm_list = sorted(df_garch['gvkey'].unique())
     
-    num_dates = len(unique_dates)
-    num_firms_total = len(firm_list)
-    
-    print(f"✓ Unique dates: {num_dates}")
-    print(f"✓ Unique firms: {num_firms_total}")
-    print(f"✓ Date range: {unique_dates[0].strftime('%Y-%m-%d')} to {unique_dates[-1].strftime('%Y-%m-%d')}")
-    print(f"✓ Expected output rows: ~{num_dates * num_firms_total:,}\n")
-    
     if gvkey_selected is not None:
         firm_list = [gvkey_selected]
-        num_firms_total = 1
-        print(f"⚠ Filtering to single firm: {gvkey_selected}\n")
     
     results_list = []
+    
+    num_dates = len(unique_dates)
     
     # Process each date
     for date_idx, date in enumerate(unique_dates):
         if date_idx % max(1, num_dates // 10) == 0:
             print(f"Progress: {date_idx + 1}/{num_dates} ({date.strftime('%Y-%m-%d')})")
         
-        # Get firms with data on this date
         df_date = df_garch[df_garch['date'] == date]
         firms_on_date = sorted(df_date['gvkey'].unique())
-        
-        # Filter to selected firms if applicable
         firms_on_date = [f for f in firms_on_date if f in firm_list]
         
         if len(firms_on_date) == 0:
             continue
         
-        # Get regime parameters for these firms
         regime_data = regime_params[regime_params['gvkey'].isin(firms_on_date)].set_index('gvkey')
         
         if len(regime_data) == 0:
             continue
         
-        # PREPARE VECTORIZED ARRAYS
+        # PREPARE ARRAYS
         mu_0_arr = np.array([regime_data.loc[f, 'regime_0_mean'] for f in firms_on_date])
         mu_1_arr = np.array([regime_data.loc[f, 'regime_1_mean'] for f in firms_on_date])
         ar_0_arr = np.array([regime_data.loc[f, 'regime_0_ar'] for f in firms_on_date])
         ar_1_arr = np.array([regime_data.loc[f, 'regime_1_ar'] for f in firms_on_date])
         sigma_0_arr = np.array([regime_data.loc[f, 'regime_0_vol'] for f in firms_on_date])
         sigma_1_arr = np.array([regime_data.loc[f, 'regime_1_vol'] for f in firms_on_date])
+        nu_0_arr = np.array([regime_data.loc[f, 'regime_0_nu'] for f in firms_on_date])
+        nu_1_arr = np.array([regime_data.loc[f, 'regime_1_nu'] for f in firms_on_date])
+        
         trans_00_arr = np.array([regime_data.loc[f, 'transition_prob_00'] for f in firms_on_date])
         trans_01_arr = np.array([regime_data.loc[f, 'transition_prob_01'] for f in firms_on_date])
         trans_10_arr = np.array([regime_data.loc[f, 'transition_prob_10'] for f in firms_on_date])
         trans_11_arr = np.array([regime_data.loc[f, 'transition_prob_11'] for f in firms_on_date])
         
-        # Initial regime probabilities (typically 0.5, 0.5)
         initial_regime_probs = np.full(len(firms_on_date), 0.5)
         
-        # RUN VECTORIZED MONTE CARLO SIMULATION
-        daily_vols, regime_paths = simulate_regime_switching_paths_vectorized(
-            mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr,
+        # RUN SIMULATION
+        daily_vols, regime_paths, daily_returns = simulate_regime_switching_paths_vectorized(
+            mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr, nu_0_arr, nu_1_arr,
             trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
             num_simulations, num_days, len(firms_on_date), initial_regime_probs
         )
         
         # CALCULATE STATISTICS
-        # daily_vols shape: (num_days, num_simulations, num_firms)
+        # Use generated daily_returns which now include t-distributed shocks
+        path_cumulative_returns = np.prod(1.0 + daily_returns, axis=0) - 1.0 
+        integrated_variances = np.var(path_cumulative_returns, axis=0, ddof=1)
         
-        # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
-        # 1. Generate random innovations (standard normal) for Asset Returns
-        z_innovations = np.random.standard_normal(daily_vols.shape)
-        
-        # 2. Calculate daily asset returns: R_t ~ N(0, sigma_t)
-        assets_daily_returns = daily_vols * z_innovations
-        
-        # 3. Calculate yearly cumulative return for each path
-        # V_end = V_start * prod(1 + R_t)
-        # R_yearly = V_end/V_start - 1 = prod(1 + R_t) - 1
-        path_cumulative_returns = np.prod(1.0 + assets_daily_returns, axis=0) - 1.0  # Shape: (num_simulations, num_firms)
-        
-        # 4. Calculate Variance of yearly returns across simulations
-        daily_variances = np.var(path_cumulative_returns, axis=0, ddof=1)  # Shape: (num_firms,)
-        # Note: We assign to 'integrated_variances' variable to match expected downstream name
-        integrated_variances = daily_variances
-
-        
-        # Other stats
-        mean_daily_vols = np.mean(daily_vols, axis=(0,1)) # overall mean
-        
-        # Calculate regime statistics
-        mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))  # Fraction time in regime 0
+        mean_daily_vols = np.mean(daily_vols, axis=(0,1))
+        mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
         mean_regime_1 = np.mean(regime_paths == 1, axis=(0, 1))
         
-        # APPEND RESULTS
         for firm_idx, firm in enumerate(firms_on_date):
             results_list.append({
                 'gvkey': firm,
@@ -280,24 +209,17 @@ def monte_carlo_regime_switching_1year(
             })
     
     results_df = pd.DataFrame(results_list)
+    results_df['year'] = results_df['date'].dt.year
     
     print(f"\n{'='*80}")
     print("REGIME-SWITCHING MONTE CARLO COMPLETE")
     print(f"{'='*80}\n")
     
-    print(f"Total output rows: {len(results_df):,}")
-    print(f"Unique firms: {results_df['gvkey'].nunique()}")
-    print(f"Unique dates: {results_df['date'].nunique()}")
+    if hasattr(results_df, 'year'):
+         for year in sorted(results_df['year'].unique()):
+            print(f"  {year}: {len(results_df[results_df['year'] == year]):,} rows")
     
-    # Year-wise breakdown
-    results_df['year'] = results_df['date'].dt.year
-    print(f"\nRows per year:")
-    for year in sorted(results_df['year'].unique()):
-        year_count = len(results_df[results_df['year'] == year])
-        print(f"  {year}: {year_count:,} rows")
-    print()
-    
-    # Sample statistics
+    return results_df
     print(f"Sample statistics (first 3 firms):")
     for firm in results_df['gvkey'].unique()[:3]:
         firm_data = results_df[results_df['gvkey'] == firm]

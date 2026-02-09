@@ -3,7 +3,10 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+from scipy.optimize import minimize
+from scipy.special import expit
+from numba import njit
+import sys
 
 # Import config for output paths
 try:
@@ -12,25 +15,152 @@ try:
 except ImportError:
     OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output"
 
+# =============================================================================
+# NUMBA JIT-COMPILED HELPER FUNCTIONS
+# =============================================================================
+
+@njit(cache=True)
+def _numba_gammaln(x):
+    """Numba-compatible log-gamma function."""
+    g = 7
+    c = np.array([
+        0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+        771.32342877765313, -176.61502916214059, 12.507343278686905,
+        -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7
+    ])
+    if x < 0.5: return np.log(np.pi / np.sin(np.pi * x)) - _numba_gammaln(1 - x)
+    x = x - 1
+    a = c[0]
+    for i in range(1, g + 2): a += c[i] / (x + i)
+    t = x + g + 0.5
+    return 0.5 * np.log(2 * np.pi) + (x + 0.5) * np.log(t) - t + np.log(a)
+
+@njit(cache=True)
+def _t_log_likelihood(x, nu, sigma2):
+    """Compute log-likelihood of t-distribution (Numba JIT compiled)."""
+    if sigma2 <= 0 or nu <= 2: return -1e10
+    const = _numba_gammaln((nu + 1) / 2) - _numba_gammaln(nu / 2) - 0.5 * np.log((nu - 2) * np.pi * sigma2)
+    kernel = -((nu + 1) / 2) * np.log(1 + x**2 / ((nu - 2) * sigma2))
+    return const + kernel
+
+@njit(cache=True)
+def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
+    """
+    Hamilton filter for Regime Switching with t-distribution and CONSTANT volatility per regime.
+    """
+    T = len(returns)
+    filtered_prob = np.zeros((T, 2))
+    log_likelihood = 0.0
+    
+    P = np.array([[p00, 1 - p00], [1 - p11, p11]])
+    
+    denom = (2 - p00 - p11)
+    if abs(denom) < 1e-10:
+        pi_stat = np.array([0.5, 0.5]) 
+    else:
+        pi_stat = np.array([(1 - p11) / denom, (1 - p00) / denom])
+        
+    prev_filtered = pi_stat.copy()
+    
+    for t in range(T):
+        r = returns[t]
+        
+        eps_0 = r - mu_0
+        eps_1 = r - mu_1
+        
+        ll_0 = _t_log_likelihood(eps_0, nu_0, sigma2_0)
+        ll_1 = _t_log_likelihood(eps_1, nu_1, sigma2_1)
+        
+        max_ll = max(ll_0, ll_1)
+        if max_ll < -500:
+            lik_0 = 1e-200
+            lik_1 = 1e-200
+        else:
+            lik_0 = np.exp(ll_0 - max_ll)
+            lik_1 = np.exp(ll_1 - max_ll)
+            
+        pred_prob = P.T @ prev_filtered
+        joint_0 = lik_0 * pred_prob[0]
+        joint_1 = lik_1 * pred_prob[1]
+        
+        marginal = joint_0 + joint_1
+        
+        if marginal < 1e-300:
+            marginal = 1e-300
+            
+        filtered_prob[t, 0] = joint_0 / marginal
+        filtered_prob[t, 1] = joint_1 / marginal
+        
+        log_likelihood += np.log(marginal) + max_ll
+        
+        prev_filtered = filtered_prob[t, :]
+        
+    return log_likelihood, filtered_prob
+
+# =============================================================================
+# ESTIMATION CLASS
+# =============================================================================
+
+class MarkovSwitchingTDist:
+    """Custom Estimator for Markov Switching Model with t-distribution."""
+    
+    def __init__(self):
+        self.params = {}
+        self.probs = None
+        
+    def fit(self, returns):
+        var = np.var(returns)
+        mean = np.mean(returns)
+        
+        # [mu0, mu1, log(sigma2_0), log(sigma2_1), logit(p00), logit(p11), log(nu0-2), log(nu1-2)]
+        x0 = np.array([
+            mean, mean, 
+            np.log(var * 0.5), np.log(var * 2.0),
+            2.0, 2.0,
+            np.log(8.0), np.log(4.0)
+        ])
+        
+        returns_arr = np.ascontiguousarray(returns)
+        
+        def neg_log_lik(params):
+            mu_0, mu_1 = params[0], params[1]
+            sigma2_0, sigma2_1 = np.exp(params[2]), np.exp(params[3])
+            p00, p11 = expit(params[4]), expit(params[5])
+            nu_0 = 2 + np.exp(params[6])
+            nu_1 = 2 + np.exp(params[7])
+            
+            if p00 < 0.01 or p11 < 0.01: return 1e10
+            if p00 > 0.999 or p11 > 0.999: return 1e10
+            
+            ll, _ = hamilton_filter_t_jit(returns_arr, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1)
+            return -ll if np.isfinite(ll) else 1e10
+
+        res = minimize(neg_log_lik, x0, method='L-BFGS-B', options={'disp': False, 'maxiter': 500})
+        
+        p = res.x
+        self.params = {
+            'mu_0': p[0], 'mu_1': p[1],
+            'sigma2_0': np.exp(p[2]), 'sigma2_1': np.exp(p[3]),
+            'p00': expit(p[4]), 'p11': expit(p[5]),
+            'nu_0': 2 + np.exp(p[6]), 'nu_1': 2 + np.exp(p[7]),
+            'log_likelihood': -res.fun
+        }
+        
+        _, probs = hamilton_filter_t_jit(
+            returns_arr, 
+            self.params['mu_0'], self.params['mu_1'], 
+            self.params['sigma2_0'], self.params['sigma2_1'],
+            self.params['p00'], self.params['p11'],
+            self.params['nu_0'], self.params['nu_1']
+        )
+        self.probs = probs
+        return self.params, self.probs
+
 def run_regime_switching_estimation(daily_returns_df):
     """
-    Estimates a 2-regime Hamilton filter on DAILY asset returns using MarkovRegression.
-    
-    Theory:
-    -------
-    Hidden Markov Model with 2 regimes (low volatility vs. high volatility).
-    
-    Parameters:
-    -----------
-    daily_returns_df : pd.DataFrame
-        DataFrame with columns: 'gvkey', 'date', 'asset_return_daily'
-    
-    Returns:
-    --------
-    pd.DataFrame: Copy of input with regime state columns added
+    Estimates a 2-regime Hamilton filter on DAILY asset returns using CUSTOM T-DISTRIBUTION ESTIMATOR.
     """
-    print("Estimating Regime Switching Model (2-Regime Markov) on DAILY Returns...")
-    print("(Hamilton Filter)\n")
+    print("Estimating Regime Switching Model (2-Regime Markov T-Dist) on DAILY Returns...")
     
     if daily_returns_df.empty:
         print("No daily returns provided.")
@@ -42,157 +172,76 @@ def run_regime_switching_estimation(daily_returns_df):
     df_out["regime_probability_1"] = np.nan
     
     firms = df_out["gvkey"].unique()
-    print(f"Processing Regime Switching for {len(firms)} firms...\n")
+    print(f"Processing Regime Switching for {len(firms)} firms...\\n")
     
-    # Initialize params list
     params_list = []
     
     for i, gvkey in enumerate(firms):
-        # Get firm data using boolean mask
         firm_mask = df_out["gvkey"] == gvkey
-        firm_df = df_out.loc[firm_mask].copy()
+        firm_df = df_out.loc[firm_mask].sort_values("date")
         
-        # Sort by date
-        firm_df = firm_df.sort_values("date")
-        
-        # Get the actual indices in df_out for this firm
-        firm_indices = firm_df.index.tolist()
-        
-        # Get returns (drop NaNs but keep track of which indices are valid)
-        # Use centrally scaled returns if available
         scaled_available = "asset_return_daily_scaled" in firm_df.columns
         target_col = "asset_return_daily_scaled" if scaled_available else "asset_return_daily"
         
         valid_mask = firm_df[target_col].notna()
-        valid_indices = [firm_indices[j] for j in range(len(firm_indices)) if valid_mask.iloc[j]]
         returns = firm_df.loc[valid_mask, target_col].values
+        valid_indices = firm_df.loc[valid_mask].index
         
-        # Scale if fallback to unscaled data was necessary
-        SCALE_FACTOR = 100.0
-        used_scaled = scaled_available
-        if not used_scaled:
-            returns = returns * SCALE_FACTOR
-            used_scaled = True
+        calc_scale_factor = 1.0
+        if not scaled_available:
+             calc_scale_factor = 100.0
+             returns = returns * calc_scale_factor
         
         if len(returns) < 150:
-            print(f"  Firm {i+1}/{len(firms)}: gvkey={gvkey} - Insufficient data (n={len(returns)})")
+            print(f"Skipping {gvkey}: insufficient data ({len(returns)})")
             continue
-        
+            
         try:
-            # Fit 2-regime Markov Regression (on SCALED returns)
-            mod = MarkovRegression(
-                returns, 
-                k_regimes=2, 
-                trend='c',
-                switching_variance=True
-            )
-            res = mod.fit(disp=False, maxiter=200)
+            model = MarkovSwitchingTDist()
+            params, probs = model.fit(returns)
             
-            # Get regime states using smoothed_marginal_probabilities
-            smoothed_probs = res.smoothed_marginal_probabilities
+            # Map regimes: 0 = HIGH, 1 = LOW Volatility
+            p_sigma0 = params['sigma2_0']
+            p_sigma1 = params['sigma2_1']
             
-            # Convert to numpy array
-            if hasattr(smoothed_probs, 'values'):
-                regime_probs = smoothed_probs.values
-            else:
-                regime_probs = np.array(smoothed_probs)
+            if p_sigma1 > p_sigma0:
+                 params['sigma2_0'], params['sigma2_1'] = params['sigma2_1'], params['sigma2_0']
+                 params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
+                 params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
+                 params['p00'], params['p11'] = params['p11'], params['p00']
+                 probs[:, [0, 1]] = probs[:, [1, 0]]
             
-            regime_state = regime_probs.argmax(axis=1)
+            count = 0
+            for idx in valid_indices:
+                df_out.loc[idx, "regime_probability_0"] = probs[count, 0]
+                df_out.loc[idx, "regime_probability_1"] = probs[count, 1]
+                df_out.loc[idx, "regime_state"] = 0 if probs[count, 0] > 0.5 else 1
+                count += 1
             
-            # Assign back to df_out using valid_indices
-            for j, idx in enumerate(valid_indices):
-                df_out.loc[idx, "regime_state"] = regime_state[j]
-                df_out.loc[idx, "regime_probability_0"] = regime_probs[j, 0]
-                df_out.loc[idx, "regime_probability_1"] = regime_probs[j, 1]
-
-            # Create a dictionary of parameters for easy access by name
-            param_names = res.model.param_names
-            params_values = res.params
-            if hasattr(params_values, 'values'):
-                params_values = params_values.values
-            
-            params_dict = dict(zip(param_names, params_values))
-            
-            # Extract transition probabilities
-            p_00 = float(params_dict.get('p[0->0]', np.nan))
-            p_10 = float(params_dict.get('p[1->0]', np.nan))
-            
-            # Calculate complements
-            p_01 = 1.0 - p_00 if not np.isnan(p_00) else np.nan
-            p_11 = 1.0 - p_10 if not np.isnan(p_10) else np.nan
-
-            # Extract means (const) and Unscale
-            regime_0_mean = float(params_dict.get('const[0]', 0.0)) / SCALE_FACTOR
-            regime_1_mean = float(params_dict.get('const[1]', 0.0)) / SCALE_FACTOR
-
-            # Extract volatilities (sigma2 -> sqrt) and Unscale
-            # param is sigma2 of scaled returns. 
-            # Real sigma2 = param / (SCALE^2). Real sigma = sqrt(param) / SCALE.
-            sigma2_0_scaled = float(params_dict.get('sigma2[0]', 0.04 * (SCALE_FACTOR**2)))
-            sigma2_1_scaled = float(params_dict.get('sigma2[1]', 0.04 * (SCALE_FACTOR**2)))
-            
-            regime_0_vol = (np.sqrt(sigma2_0_scaled) / SCALE_FACTOR) if sigma2_0_scaled > 0 else 0.2
-            regime_1_vol = (np.sqrt(sigma2_1_scaled) / SCALE_FACTOR) if sigma2_1_scaled > 0 else 0.2
-            
-            # CORRECT REGIME LABELING: Ensure regime 0 = HIGH vol, regime 1 = LOW vol
-            if regime_0_vol < regime_1_vol:
-                # Swap regime states in output df
-                for j, idx in enumerate(valid_indices):
-                     df_out.loc[idx, "regime_state"] = 1 - df_out.loc[idx, "regime_state"]
-                     # Swap probabilities
-                     p0_val = df_out.loc[idx, "regime_probability_0"]
-                     df_out.loc[idx, "regime_probability_0"] = df_out.loc[idx, "regime_probability_1"]
-                     df_out.loc[idx, "regime_probability_1"] = p0_val
-
-                # Swap parameters
-                regime_0_vol, regime_1_vol = regime_1_vol, regime_0_vol
-                regime_0_mean, regime_1_mean = regime_1_mean, regime_0_mean
-                
-                # Swap transitions:
-                # New Regime 0 is old Regime 1. New Regime 1 is old Regime 0.
-                p_00, p_11 = p_11, p_00
-                p_01, p_10 = p_10, p_01
-            
-            # Create trans matrix for printing
-            trans = np.array([[p_00, p_01], [p_10, p_11]])
-            
-            # Store parameters
-            params_row = {
+            params_list.append({
                 'gvkey': gvkey,
-                'regime_0_mean': regime_0_mean,
-                'regime_1_mean': regime_1_mean,
+                'regime_0_mean': params['mu_0'] / calc_scale_factor,
+                'regime_1_mean': params['mu_1'] / calc_scale_factor,
+                'regime_0_vol': np.sqrt(params['sigma2_0']) / calc_scale_factor,
+                'regime_1_vol': np.sqrt(params['sigma2_1']) / calc_scale_factor,
+                'regime_0_nu': params['nu_0'],
+                'regime_1_nu': params['nu_1'], 
+                'transition_prob_00': params['p00'],
+                'transition_prob_01': 1 - params['p00'],
+                'transition_prob_10': 1 - params['p11'],
+                'transition_prob_11': params['p11'],
                 'regime_0_ar': 0.0,
-                'regime_1_ar': 0.0,
-                'regime_0_vol': regime_0_vol,
-                'regime_1_vol': regime_1_vol,
-                'transition_prob_00': p_00,
-                'transition_prob_01': p_01,
-                'transition_prob_10': p_10,
-                'transition_prob_11': p_11,
-                'log_likelihood': float(res.llf) if hasattr(res, 'llf') else np.nan,
-                'aic': float(res.aic) if hasattr(res, 'aic') else np.nan,
-                'bic': float(res.bic) if hasattr(res, 'bic') else np.nan
-            }
-            params_list.append(params_row)
+                'regime_1_ar': 0.0
+            })
             
-            print(f"  ✓ Firm {i+1}/{len(firms)}: gvkey={gvkey}")
-            print(f"      Observations: {len(returns)}")
-            print(f"      Regime 0 (HIGH vol/stress): μ={regime_0_mean:.6f}, σ={regime_0_vol:.6f}")
-            print(f"      Regime 1 (LOW vol/calm): μ={regime_1_mean:.6f}, σ={regime_1_vol:.6f}")
-            print(f"      Transition: P(0→0)={trans[0, 0]:.3f}, P(1→1)={trans[1, 1]:.3f}\n")
+            print(f"  Processed {gvkey} (Reg0 Vol: {np.sqrt(params['sigma2_0'])/calc_scale_factor:.4f}, Nu: {params['nu_0']:.2f})")
             
         except Exception as e:
-            print(f"  ✗ Firm {i+1}/{len(firms)}: gvkey={gvkey} - Error: {str(e)[:80]}")
+            print(f"Error {gvkey}: {e}")
             continue
-    
-    print("Regime Switching estimation complete.")
-    
-    # Save parameters for Monte Carlo
+
     if params_list:
-        params_df = pd.DataFrame(params_list)
-        output_path = OUTPUT_DIR / 'regime_switching_parameters.csv'
-        params_df.to_csv(output_path, index=False)
-        print(f"\n✓ Saved regime-switching parameters to '{output_path}'")
-        print(f"  Successfully estimated {len(params_list)} firms")
+        pd.DataFrame(params_list).to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
+        print("Saved regime_switching_parameters.csv")
     
     return df_out
