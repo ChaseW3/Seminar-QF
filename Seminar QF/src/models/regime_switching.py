@@ -187,6 +187,12 @@ def run_regime_switching_estimation(daily_returns_df):
         returns = firm_df.loc[valid_mask, target_col].values
         valid_indices = firm_df.loc[valid_mask].index
         
+<<<<<<< Updated upstream
+=======
+        # Scale factor for converting parameters back to decimal scale
+        # If using pre-scaled data (×100), need to divide parameters by 100
+        # If using raw data, scale it by 100 for estimation, then divide by 100
+>>>>>>> Stashed changes
         calc_scale_factor = 100.0
         if not scaled_available:
              returns = returns * calc_scale_factor

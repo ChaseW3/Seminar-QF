@@ -341,19 +341,6 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     results = {}
     
-    # Classical Merton (Analytical - no Monte Carlo)
-    merton_cds_file = output_dir / 'cds_spreads_merton_analytical.csv'
-    if merton_cds_file.exists():
-        results['Merton'] = calculate_cds_correlations(
-            model_cds_file=merton_cds_file,
-            merton_file=merton_file,
-            cds_market_df=cds_market,
-            model_name='Classical Merton',
-            col_prefix='cds_spread_merton'
-        )
-    else:
-        print(f"⚠ Warning: {merton_cds_file} not found. Run analytical Merton CDS calculation first.")
-    
     # Merton Monte Carlo (Constant Volatility Baseline)
     merton_mc_cds_file = output_dir / 'cds_spreads_merton_mc_all_firms.csv'
     if merton_mc_cds_file.exists():
@@ -402,16 +389,10 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Build summary DataFrame with all metrics
     summary_df = results['GARCH'][2][['company', 'gvkey', 'n_obs']].copy()
     
-    # Include Merton and Merton_MC if available
+    # Include Merton_MC if available
     model_list = [('GARCH', 'GARCH'), ('RS', 'RS'), ('MSGARCH', 'MSGARCH')]
-    if 'Merton' in results:
-        model_list = [('Merton', 'Merton')] + model_list
     if 'Merton_MC' in results:
-        # Insert Merton_MC after Merton if both exist
-        if 'Merton' in results:
-            model_list.insert(1, ('Merton_MC', 'Merton_MC'))
-        else:
-            model_list = [('Merton_MC', 'Merton_MC')] + model_list
+        model_list = [('Merton_MC', 'Merton_MC')] + model_list
     
     for model_key, model_short in model_list:
         if model_key not in results:
@@ -445,16 +426,10 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     print("OVERALL SUMMARY STATISTICS (5-Year Maturity)")
     print("="*80)
     
-    # Include Merton and Merton_MC if available
+    # Include Merton_MC if available
     model_display_list = [('GARCH', 'GARCH'), ('RS', 'Regime-Switching'), ('MSGARCH', 'MS-GARCH')]
-    if 'Merton' in results:
-        model_display_list = [('Merton', 'Classical Merton')] + model_display_list
     if 'Merton_MC' in results:
-        # Insert Merton_MC after Merton if both exist
-        if 'Merton' in results:
-            model_display_list.insert(1, ('Merton_MC', 'Merton MC'))
-        else:
-            model_display_list = [('Merton_MC', 'Merton MC')] + model_display_list
+        model_display_list = [('Merton_MC', 'Merton MC')] + model_display_list
     
     for model_key, model_name in model_display_list:
         if model_key not in results:
@@ -525,8 +500,8 @@ def plot_cds_correlations(results, output_dir=None, maturity=5, axis_limit=None)
     
     # Determine which models are available
     available_models = []
-    if 'Merton' in results:
-        available_models.append(('Merton', 'Classical Merton'))
+    if 'Merton_MC' in results:
+        available_models.append(('Merton_MC', 'Merton MC'))
     available_models.extend([
         ('GARCH', 'GARCH'),
         ('RS', 'Regime-Switching'),
