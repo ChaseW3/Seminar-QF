@@ -323,11 +323,18 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     for f_idx, firm in valid_firms:
         # Calculate Probability of Default (PD)
         pd_value = np.nan
+        mc_spread = np.nan
+        mc_debt_value = np.nan
         
         if firm in merton_data_dict:
              m_data = merton_data_dict[firm]
              v0 = m_data.get('asset_value', np.nan)
              liability = m_data.get('liabilities_total', np.nan)
+             rf = m_data.get('risk_free_rate', np.nan)
+             
+             # Adjust units if needed (ensure decimal)
+             if not np.isnan(rf) and abs(rf) > 0.5:
+                 rf = rf / 100.0
              
              if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
                  # Calculate asset paths: V_t = V_0 * cumulative_returns[t]
@@ -343,6 +350,21 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
                  path_defaulted = np.any(is_below_barrier, axis=0)
                  
                  pd_value = np.mean(path_defaulted)
+                 
+                 # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
+                 # Simplified Method: Use Terminal Value from same paths as PD
+                 V_T_paths = firm_asset_paths[-1, :]
+                 
+                 # Price Debt: D = e^(-rT) * E[min(V_T, K)]
+                 payoffs = np.minimum(V_T_paths, liability)
+                 
+                 discount_factor = np.exp(-rf * num_days/252)
+                 expected_payoff = np.mean(payoffs)
+                 D = discount_factor * expected_payoff
+                 
+                 if D > 0:
+                     mc_spread = -1.0/(num_days/252) * np.log(D/liability) - rf
+                     mc_debt_value = D
 
         results_list.append({
             'gvkey': firm,
@@ -351,7 +373,9 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
             'rs_mean_daily_volatility': mean_daily_vols[f_idx],
             'rs_fraction_regime_0': mean_regime_0[f_idx],
             'rs_fraction_regime_1': mean_regime_1[f_idx],
-            'rs_probability_of_default': pd_value
+            'rs_probability_of_default': pd_value,
+            'rs_implied_spread': mc_spread,
+            'rs_debt_value': mc_debt_value
         })
     
     return results_list
@@ -363,7 +387,8 @@ def monte_carlo_regime_switching_1year_parallel(
     gvkey_selected=None, 
     num_simulations=1000, 
     num_days=252,
-    n_jobs=-1
+    n_jobs=-1,
+    merton_df=None
 ):
     """
     PARALLELIZED Monte Carlo regime-switching forecast for 1 year.
@@ -377,18 +402,24 @@ def monte_carlo_regime_switching_1year_parallel(
     print(f"{'='*80}\n")
     
     # Load regime parameters
-    try:
-        regime_params = pd.read_csv(regime_params_file)
-        # Check for new 'nu' columns from updated estimator
-        if 'regime_0_nu' not in regime_params.columns:
-            print("⚠ Warning: 'regime_0_nu' not found in parameters from parallel function. Using default df=100 (Normal approx).")
-            regime_params['regime_0_nu'] = 100.0
-            regime_params['regime_1_nu'] = 100.0
+    if isinstance(regime_params_file, str):
+        print(f"Loading regime parameters from {regime_params_file}...")
+        try:
+            regime_params = pd.read_csv(regime_params_file)
+        except Exception as e:
+            print(f"✗ File '{regime_params_file}' not found or error loading: {e}")
+            return pd.DataFrame()
+    else:
+        print(f"Using provided regime parameters DataFrame...")
+        regime_params = regime_params_file.copy()
 
-        print(f"✓ Loaded regime-switching parameters for {len(regime_params)} firms")
-    except FileNotFoundError:
-        print(f"✗ File '{regime_params_file}' not found!")
-        return pd.DataFrame()
+    # Check for new 'nu' columns from updated estimator
+    if 'regime_0_nu' not in regime_params.columns:
+        print("⚠ Warning: 'regime_0_nu' not found in parameters from parallel function. Using default df=100 (Normal approx).")
+        regime_params['regime_0_nu'] = 100.0
+        regime_params['regime_1_nu'] = 100.0
+
+    print(f"✓ Loaded regime-switching parameters for {len(regime_params)} firms")
     
     # Create parameters dictionary for faster lookup
     regime_params_dict = {}
@@ -409,33 +440,43 @@ def monte_carlo_regime_switching_1year_parallel(
         }
     
     # Load Merton Data for PD calculation
-    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(garch_file))), 'merged_data_with_merton.csv')
-    if not os.path.exists(merton_file):
-        # Try relative to current script/workspace
-        merton_file = './data/output/merged_data_with_merton.csv'
+    merton_by_date = {}
     
-    merton_lookup = {}
-    if os.path.exists(merton_file):
-        try:
-            df_merton = pd.read_csv(merton_file)
-            df_merton['date'] = pd.to_datetime(df_merton['date'])
-            # Create dict for fast lookup: (gvkey, date) -> {asset_value, liabilities}
-            # Optimize: Group by date first to avoid huge dict?
-            # Or just filter in loop. Let's create a full lookup if memory permits, or per date in loop.
-            # Using per-date filtering in the loop below is better for parallel pickup
-            
-            # Pre-group by date for faster access in loop
-            merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
-        except Exception as e:
-            print(f"⚠ Error loading Merton data: {e}")
-            merton_by_date = {}
+    if merton_df is not None:
+        print(f"✓ Using provided Merton data for PD calculation ({len(merton_df):,} rows)")
+        if 'date' in merton_df.columns:
+             if not pd.api.types.is_datetime64_any_dtype(merton_df['date']):
+                 merton_df = merton_df.copy()
+                 merton_df['date'] = pd.to_datetime(merton_df['date'])
+             merton_by_date = {k: v for k, v in merton_df.groupby('date')}
     else:
-        print(f"⚠ Warning: {merton_file} not found. PD will be NaN.")
-        merton_by_date = {}
+        if isinstance(garch_file, str):
+            merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(garch_file))), 'merged_data_with_merton.csv')
+        else:
+            merton_file = './data/output/merged_data_with_merton.csv'
+            
+        if not os.path.exists(merton_file):
+            merton_file = './data/output/merged_data_with_merton.csv'
+            
+        if os.path.exists(merton_file):
+            try:
+                df_merton = pd.read_csv(merton_file)
+                df_merton['date'] = pd.to_datetime(df_merton['date'])
+                merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+                print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+            except Exception as e:
+                print(f"⚠ Error loading Merton data: {e}")
+                merton_by_date = {}
+        else:
+             print(f"⚠ Warning: {merton_file} not found. PD will be NaN.")
+             merton_by_date = {}
 
     # Load GARCH base data
-    df_garch = pd.read_csv(garch_file)
+    if isinstance(garch_file, str):
+        df_garch = pd.read_csv(garch_file)
+    else:
+        df_garch = garch_file.copy()
+        
     df_garch['date'] = pd.to_datetime(df_garch['date'])
     
     if gvkey_selected is not None:

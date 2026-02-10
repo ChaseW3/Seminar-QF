@@ -72,6 +72,7 @@ def simulate_ms_garch_paths_t_jit(
     This is ~100x faster than the scipy version!
     """
     daily_volatilities = np.zeros((num_days, num_simulations, num_firms))
+    daily_returns = np.zeros((num_days, num_simulations, num_firms))
     regime_paths = np.zeros((num_days, num_simulations, num_firms), dtype=np.int32)
     
     for sim in numba.prange(num_simulations):
@@ -117,6 +118,7 @@ def simulate_ms_garch_paths_t_jit(
                 #Cap extreme innovations to prevent temporary spikes
                 z = max(min(z, 5.0), -5.0)  # Cap at ±5 sigma
                 eps = sigma * z
+                daily_returns[day, sim, f] = eps
                 eps2_prev[f] = eps * eps
                 
                 # Regime transition
@@ -127,7 +129,7 @@ def simulate_ms_garch_paths_t_jit(
                     if np.random.uniform() > p11[f]:
                         regime[f] = 0
     
-    return daily_volatilities, regime_paths
+    return daily_volatilities, regime_paths, daily_returns
 
 
 @numba.jit(nopython=True, parallel=True)
@@ -284,6 +286,8 @@ def simulate_ms_garch_paths_t_dist(
         Simulated daily volatilities (σ_t, not σ²_t)
     regime_paths : array (num_days, num_simulations, num_firms)
         Regime states (0 or 1)
+    daily_returns : array (num_days, num_simulations, num_firms)
+        Simulated returns (innovations)
     """
     # Use the fast JIT-compiled version
     return simulate_ms_garch_paths_t_jit(
@@ -464,7 +468,7 @@ def monte_carlo_ms_garch_1year(
                 initial_regime_probs_arr[f_idx] = 0.5
         
         # RUN MONTE CARLO SIMULATION with t-distribution
-        daily_vols, regime_paths = simulate_ms_garch_paths_t_dist(
+        daily_vols, regime_paths, daily_sim_returns = simulate_ms_garch_paths_t_dist(
             omega_0_arr, omega_1_arr, alpha_0_arr, alpha_1_arr, beta_0_arr, beta_1_arr,
             mu_0_arr, mu_1_arr, p00_arr, p11_arr, nu_0_arr, nu_1_arr,
             initial_sigma2_arr, initial_regime_probs_arr,
@@ -475,15 +479,17 @@ def monte_carlo_ms_garch_1year(
         # daily_vols shape: (num_days, num_simulations, num_firms)
         
         # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
-        # 1. Generate random innovations (standard normal) for Asset Returns
-        z_innovations = np.random.standard_normal(daily_vols.shape)
-        
-        # 2. Calculate daily asset returns: R_t ~ N(0, sigma_t)
-        assets_daily_returns = daily_vols * z_innovations
+        # 1. Use simulated returns directly
+        # 2. Calculate daily asset returns: R_t from simulation
+        assets_daily_returns = daily_sim_returns
         
         # 3. Calculate yearly cumulative return for each path
-        # V_end = V_start * prod(1 + R_t)
-        # R_yearly = V_end/V_start - 1 = prod(1 + R_t) - 1
+        # V_end = V_start * prod(1 + R_t) - using simple returns approximation if wanted, 
+        # or exp(sum(log_ret)) - here we just use what was there before but using OUR returns
+        # The previous code used random Z. Now we use consistent Z.
+        # But wait, previous code used (1 + R). 
+        # Our returns are shocks `sigma * Z`. 
+        # So (1+shock) is consistent.
         path_cumulative_returns = np.prod(1.0 + assets_daily_returns, axis=0) - 1.0  # Shape: (num_simulations, num_firms)
         
         # 4. Calculate Variance of yearly returns across simulations
@@ -498,12 +504,53 @@ def monte_carlo_ms_garch_1year(
         
         # APPEND RESULTS
         for firm_idx, firm in enumerate(firms_on_date):
+            
+            # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
+            mc_spread = np.nan
+            mc_debt_value = np.nan
+            
+            # Look up merton data
+            firm_merton_data = None
+            if date in merton_by_date:
+                df_md = merton_by_date[date]
+                fr = df_md[df_md['gvkey'] == firm]
+                if not fr.empty:
+                    firm_merton_data = fr.iloc[0]
+            
+            if firm_merton_data is not None:
+                asset_value = firm_merton_data.get('asset_value', np.nan)
+                debt_face = firm_merton_data.get('liabilities_total', np.nan)
+                rf_rate = firm_merton_data.get('risk_free_rate', 0.04)
+                
+                if not np.isnan(asset_value) and not np.isnan(debt_face):
+                     # Extract firm paths
+                     firm_daily_returns = daily_sim_returns[:, :, firm_idx]
+                     
+                     # Construct Asset Paths (Consistent with User Request)
+                     cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
+                     
+                     V_T_paths = asset_value * cum_returns_path[-1, :]
+                     
+                     payoffs = np.minimum(V_T_paths, debt_face)
+                     expected_payoff = np.mean(payoffs)
+                     
+                     T_years = num_days / 252.0
+                     discount_factor = np.exp(-rf_rate * T_years)
+                     risky_debt_value = discount_factor * expected_payoff
+                     
+                     if risky_debt_value > 0 and debt_face > 0:
+                         implied_yield = -1.0/T_years * np.log(risky_debt_value / debt_face)
+                         mc_spread = implied_yield - rf_rate
+                         mc_debt_value = risky_debt_value
+            
             results_list.append({
                 'gvkey': firm,
                 'date': date,
                 'mc_msgarch_integrated_variance': integrated_variances[firm_idx],
                 'mc_msgarch_fraction_regime_0': mean_regime_0[firm_idx], 
-                'mc_msgarch_fraction_regime_1': mean_regime_1[firm_idx]
+                'mc_msgarch_fraction_regime_1': mean_regime_1[firm_idx],
+                'mc_msgarch_implied_spread': mc_spread,
+                'mc_msgarch_debt_value': mc_debt_value
             })
     
     results_df = pd.DataFrame(results_list)
@@ -634,6 +681,41 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
             regime_0_frac = np.mean(firm_regimes == 0)
             regime_1_frac = np.mean(firm_regimes == 1)
             
+            # PD and Spread Calculation
+            pd_value = np.nan
+            mc_spread = np.nan
+            mc_debt_value = np.nan
+            
+            if firm in merton_data_dict:
+                m_data = merton_data_dict[firm]
+                v0 = m_data.get('asset_value', np.nan)
+                liability = m_data.get('liabilities_total', np.nan)
+                rf_rate = m_data.get('risk_free_rate', np.nan)
+                
+                # Adjust units if needed (ensure decimal)
+                if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
+                    rf_rate = rf_rate / 100.0
+
+                if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
+                     # Asset Paths: V_t = V0 * cumulative_prod(1+R)
+                     cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0)
+                     asset_paths = v0 * cum_returns_path
+                     
+                     path_defaulted = np.any(asset_paths < liability, axis=0)
+                     pd_value = np.mean(path_defaulted)
+                     
+                     if not np.isnan(rf_rate):
+                         V_T = asset_paths[-1, :]
+                         expected_payoff = np.mean(np.minimum(V_T, liability))
+                         T_years = num_days / 252.0
+                         discount_factor = np.exp(-rf_rate * T_years)
+                         debt_val = expected_payoff * discount_factor
+                         
+                         if debt_val > 0 and liability > 0:
+                             ytm = -np.log(debt_val / liability) / T_years
+                             mc_spread = max(ytm - rf_rate, 0.0)
+                             mc_debt_value = debt_val
+            
             results_list.append({
                 'gvkey': firm,
                 'date': date,
@@ -645,7 +727,10 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
                 'mc_msgarch_p95_daily_volatility': np.percentile(firm_vols, 95),
                 'mc_msgarch_p05_daily_volatility': np.percentile(firm_vols, 5),
                 'mc_msgarch_frac_regime_0': regime_0_frac,
-                'mc_msgarch_frac_regime_1': regime_1_frac
+                'mc_msgarch_frac_regime_1': regime_1_frac,
+                'mc_msgarch_probability_of_default': pd_value,
+                'mc_msgarch_implied_spread': mc_spread,
+                'mc_msgarch_debt_value': mc_debt_value
             })
             
         except Exception as e:
@@ -657,7 +742,7 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
 
 def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file, 
                                        gvkey_selected=None, num_simulations=1000, 
-                                       num_days=252, n_jobs=-1):
+                                       num_days=252, n_jobs=-1, merton_df=None):
     """
     Parallelized Monte Carlo MS-GARCH forecast for 1 year.
     
@@ -665,10 +750,10 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
     
     Parameters:
     -----------
-    daily_returns_file : str
-        CSV file with daily returns and MS-GARCH volatilities
-    ms_garch_params_file : str
-        CSV file with MS-GARCH model parameters
+    daily_returns_file : str or pd.DataFrame
+        CSV file or DataFrame with daily returns and MS-GARCH volatilities
+    ms_garch_params_file : str or pd.DataFrame
+        CSV file or DataFrame with MS-GARCH model parameters
     gvkey_selected : list or None
         List of gvkeys to process, or None for all firms
     num_simulations : int
@@ -677,17 +762,27 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
         Forecast horizon in trading days (252 = 1 year)
     n_jobs : int
         Number of parallel jobs (-1 = use all cores)
+    merton_df : pd.DataFrame, optional
+        Pre-loaded Merton data to avoid reloading
         
     Returns:
     --------
     pd.DataFrame
         Results with Monte Carlo volatility and regime statistics per firm per date
     """
-    print(f"Loading daily returns from {daily_returns_file}...")
-    df = pd.read_csv(daily_returns_file)
+    if isinstance(daily_returns_file, str):
+        print(f"Loading daily returns from {daily_returns_file}...")
+        df = pd.read_csv(daily_returns_file)
+    else:
+        print(f"Using provided daily returns DataFrame...")
+        df = daily_returns_file.copy()
     
-    print(f"Loading MS-GARCH parameters from {ms_garch_params_file}...")
-    params_df = pd.read_csv(ms_garch_params_file)
+    if isinstance(ms_garch_params_file, str):
+        print(f"Loading MS-GARCH parameters from {ms_garch_params_file}...")
+        params_df = pd.read_csv(ms_garch_params_file)
+    else:
+        print(f"Using provided MS-GARCH parameters DataFrame...")
+        params_df = ms_garch_params_file.copy()
     
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'])
@@ -720,20 +815,33 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
     start_time = pd.Timestamp.now()
     
     # Load Merton Data for PD calculation
-    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(daily_returns_file))), 'merged_data_with_merton.csv')
-    if not os.path.exists(merton_file):
-        merton_file = './data/output/merged_data_with_merton.csv'
-
     merton_by_date = {}
-    if os.path.exists(merton_file):
-        try:
-            df_merton = pd.read_csv(merton_file)
-            df_merton['date'] = pd.to_datetime(df_merton['date'])
-            merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
-        except Exception as e:
-            print(f"⚠ Error loading Merton data: {e}")
-            merton_by_date = {}
+    
+    if merton_df is not None:
+        print(f"✓ Using provided Merton data for PD calculation ({len(merton_df):,} rows)")
+        if 'date' in merton_df.columns:
+             if not pd.api.types.is_datetime64_any_dtype(merton_df['date']):
+                 merton_df = merton_df.copy()
+                 merton_df['date'] = pd.to_datetime(merton_df['date'])
+             merton_by_date = {k: v for k, v in merton_df.groupby('date')}
+    else:
+        if isinstance(daily_returns_file, str):
+            merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(daily_returns_file))), 'merged_data_with_merton.csv')
+        else:
+             merton_file = './data/output/merged_data_with_merton.csv'
+             
+        if not os.path.exists(merton_file):
+            merton_file = './data/output/merged_data_with_merton.csv'
+
+        if os.path.exists(merton_file):
+            try:
+                df_merton = pd.read_csv(merton_file)
+                df_merton['date'] = pd.to_datetime(df_merton['date'])
+                merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+                print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+            except Exception as e:
+                print(f"⚠ Error loading Merton data: {e}")
+                merton_by_date = {}
     
     # Prepare date groups for parallel processing
     date_groups = []

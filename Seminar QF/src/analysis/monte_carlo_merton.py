@@ -47,16 +47,24 @@ def simulate_constant_vol_paths(sigma_daily_arr, num_simulations, num_days, num_
     daily_volatilities : np.ndarray
         Shape (num_days, num_simulations, num_firms)
         Each element is the constant daily volatility
+    daily_returns : np.ndarray
+        Shape (num_days, num_simulations, num_firms)
+        Simulated returns (innovations) = sigma * Z
     """
     daily_volatilities = np.zeros((num_days, num_simulations, num_firms))
+    daily_returns = np.zeros((num_days, num_simulations, num_firms))
     
     # Fill with constant volatility
     for firm_idx in numba.prange(num_firms):
+        sigma = sigma_daily_arr[firm_idx]
         for sim in range(num_simulations):
             for day in range(num_days):
-                daily_volatilities[day, sim, firm_idx] = sigma_daily_arr[firm_idx]
+                # Standard normal innovation
+                z = np.random.standard_normal()
+                daily_volatilities[day, sim, firm_idx] = sigma
+                daily_returns[day, sim, firm_idx] = sigma * z
     
-    return daily_volatilities
+    return daily_volatilities, daily_returns
 
 
 def _process_single_date_merton_mc(date_data, num_simulations, num_days):
@@ -110,7 +118,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
     sigma_daily_arr = np.array([merton_params[f]['sigma_daily'] for f in firms_on_date])
     
     # Run Monte Carlo simulation with constant volatility
-    daily_vols = simulate_constant_vol_paths(
+    daily_vols, daily_sim_returns = simulate_constant_vol_paths(
         sigma_daily_arr, num_simulations, num_days, len(firms_on_date)
     )
     
@@ -118,23 +126,63 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
     for firm_idx, firm in enumerate(firms_on_date):
         firm_data = df_date[df_date['gvkey'] == firm].iloc[0]
         firm_daily_vols = daily_vols[:, :, firm_idx]  # shape: (num_days, num_simulations)
+        firm_daily_returns = daily_sim_returns[:, :, firm_idx]
         
         # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
-        # 1. Generate random innovations (standard normal) for Asset Returns
-        z_innovations = np.random.standard_normal(firm_daily_vols.shape)
-        
-        # 2. Daily returns: R_t ~ N(0, sigma_t)
-        firm_daily_returns = firm_daily_vols * z_innovations
+        # Using the returns from the simulation (which match the volatility path in general models)
         
         # 3. Cumulative yearly return
-        # V_end = V_start * prod(1 + R_t)
-        # R_yearly = V_end/V_start - 1 = prod(1 + R_t) - 1
-        firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0
+        # Using Log Returns logic usually: V_T = V_0 * exp(sum(r_t))
+        # Here firm_daily_returns are shocks = sigma * Z.
+        # Drift should be applied. 
+        # For variance calc: returns are just sum(sigma*Z) approx? 
+        # The existing code used prod(1+R)-1. Let's stick closer to geometric brownian motion standard.
+        # But to match previous logic's variance calc, we can keep using simple returns if needed, 
+        # but for Pricing we need consistent V_T.
         
-        # 4. Variance of yearly returns
-        integrated_variance = np.var(firm_cumulative_returns, ddof=1)
+        # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
+        # Extract parameters
+        asset_value = firm_data.get('asset_value', np.nan)
+        debt_face = firm_data.get('liabilities_total', np.nan) # K
+        rf_rate = firm_data.get('risk_free_rate', np.nan) # r_f
         
-        # Annualized volatility from simulation (backward calculation from yearly variance)
+        # Adjust units if needed (ensure decimal)
+        if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
+            rf_rate = rf_rate / 100.0
+        
+        # If we have necessary data
+        mc_spread = np.nan
+        mc_debt_value = np.nan
+        if not np.isnan(asset_value) and not np.isnan(debt_face) and not np.isnan(rf_rate):
+            # Calculate Terminal Asset Value V_T
+            # Simplified Method 1: Use cumprod of simulated returns (V_T = V0 * prod(1+R))
+            # No Ito correction drift term as requested
+            
+            # Re-calculate cumulative returns path for pricing if not already done
+            if 'cum_returns_path' not in locals():
+                cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0)
+            
+            # Terminal values for each path
+            V_T_paths = asset_value * cum_returns_path[-1, :]
+            
+            # Calculate Risky Debt Value
+            # D = e^(-rT) * E[min(V_T, K)]
+            payoffs = np.minimum(V_T_paths, debt_face)
+            expected_payoff = np.mean(payoffs)
+            
+            T_years = num_days / 252.0
+            discount_factor = np.exp(-rf_rate * T_years)
+            risky_debt_value = discount_factor * expected_payoff
+            
+            # Calculate Implied Yield and Spread
+            # y = -1/T * ln(D/K)
+            if risky_debt_value > 0 and debt_face > 0:
+                implied_yield = -1.0/T_years * np.log(risky_debt_value / debt_face)
+                mc_spread = implied_yield - rf_rate
+                mc_debt_value = risky_debt_value
+        
+        # Legacy Variance (if needed, or just use V_T variance)
+        integrated_variance = np.var(np.sum(firm_daily_returns, axis=0), ddof=1)
         annualized_volatility = np.sqrt(integrated_variance)
         
         # PROBABILITY OF DEFAULT CALCULATION
@@ -161,7 +209,9 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
             'merton_mc_annualized_volatility': annualized_volatility,
             'merton_mc_mean_daily_volatility': np.mean(mean_path),
             'merton_mc_constant_annual_vol': merton_params[firm]['sigma_annual'],
-            'merton_mc_probability_of_default': pd_value
+            'merton_mc_probability_of_default': pd_value,
+            'merton_mc_implied_spread': mc_spread,
+            'merton_mc_debt_value': mc_debt_value
         })
     
     return results_list
