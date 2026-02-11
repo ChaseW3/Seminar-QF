@@ -58,11 +58,6 @@ def run_garch_estimation(daily_returns_df):
             # Scale returns to percentage locally if not already scaled
             returns = firm_ts["asset_return_daily"].values * SCALE_FACTOR
         
-        # WINSORIZATION: Clip extreme returns to prevent optimization failure
-        # Threshold: 30% daily return (approx 30 sigma event)
-        # Prevents single outliers from exploding volatility persistence
-        returns = np.clip(returns, -30.0, 30.0)
-        
         try:
             # Use Student's t distribution to handle fat tails
             am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)

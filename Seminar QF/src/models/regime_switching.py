@@ -38,7 +38,7 @@ def _numba_gammaln(x):
 @njit(cache=True)
 def _t_log_likelihood(x, nu, sigma2):
     """Compute log-likelihood of t-distribution (Numba JIT compiled)."""
-    if sigma2 <= 0 or nu <= 2: return -1e10
+    if sigma2 <= 0 or nu <= 2.001: return -1e10 # Strict check
     const = _numba_gammaln((nu + 1) / 2) - _numba_gammaln(nu / 2) - 0.5 * np.log((nu - 2) * np.pi * sigma2)
     kernel = -((nu + 1) / 2) * np.log(1 + x**2 / ((nu - 2) * sigma2))
     return const + kernel
@@ -108,42 +108,113 @@ class MarkovSwitchingTDist:
         self.params = {}
         self.probs = None
         
-    def fit(self, returns):
-        var = np.var(returns)
-        mean = np.mean(returns)
+    def fit(self, returns, n_restarts=10):
+        returns_arr = np.ascontiguousarray(returns)
+        var = np.var(returns_arr)
+        mean = np.mean(returns_arr)
+        std = np.std(returns_arr)
         
-        # [mu0, mu1, log(sigma2_0), log(sigma2_1), logit(p00), logit(p11), log(nu0-2), log(nu1-2)]
-        x0 = np.array([
-            mean, mean, 
-            np.log(var * 0.5), np.log(var * 2.0),
-            2.0, 2.0,
-            np.log(8.0), np.log(4.0)
+        # 1. Smart Initialization using Rolling Volatility
+        # Calculate rolling volatility to identify regime levels
+        try:
+            # Simple approximate rolling vol
+            n = len(returns_arr)
+            window = min(20, max(5, n // 10))
+            # Use numpy for rolling std to avoid pandas overhead/dependency issues here if possible, 
+            # but pandas is already imported.
+            rolling_std = pd.Series(returns_arr).rolling(window=window).std().fillna(std)
+            
+            # Use 20th and 80th percentiles for low/high vol regimes
+            vol_low = np.percentile(rolling_std, 20)
+            vol_high = np.percentile(rolling_std, 80)
+            
+            sigma2_0_init = max(vol_low**2, 1e-6)
+            sigma2_1_init = max(vol_high**2, 1e-6)
+            
+            # Determine mu init from quantiles if requested, but for daily returns mean is stable
+            mu_0_init = mean 
+            mu_1_init = mean
+            
+        except Exception:
+            sigma2_0_init = var * 0.5
+            sigma2_1_init = var * 2.0
+            mu_0_init = mean
+            mu_1_init = mean
+            
+        # Target nu values (degrees of freedom)
+        # We now constrain nu >= 2.0 (standard t-distribution condition)
+        nu_0_target = 10.0
+        nu_1_target = 6.0
+        
+        # Initial Parameter Vector Construction
+        # Transformation:
+        # sigma2 = exp(x)
+        # p = expit(x)
+        # nu = 2 + exp(x)
+        
+        x0_base = np.array([
+            mu_0_init, mu_1_init, 
+            np.log(sigma2_0_init), np.log(sigma2_1_init),
+            2.0, 2.0, # logit(p) ≈ 0.88 (strong persistence)
+            np.log(max(nu_0_target - 2.0, 1e-4)), np.log(max(nu_1_target - 2.0, 1e-4))
         ])
         
-        returns_arr = np.ascontiguousarray(returns)
-        
+        # Objective Function
         def neg_log_lik(params):
             mu_0, mu_1 = params[0], params[1]
             sigma2_0, sigma2_1 = np.exp(params[2]), np.exp(params[3])
             p00, p11 = expit(params[4]), expit(params[5])
-            nu_0 = 2 + np.exp(params[6])
-            nu_1 = 2 + np.exp(params[7])
             
+            # BOUND CONSTRAINTS
             if p00 < 0.01 or p11 < 0.01: return 1e10
             if p00 > 0.999 or p11 > 0.999: return 1e10
+            
+            # CHANGED: nu >= 2 constraint
+            nu_0 = 2.0 + np.exp(params[6])
+            nu_1 = 2.0 + np.exp(params[7])
+            
+            # Prevent exploding parameters
+            if sigma2_0 > 1000 or sigma2_1 > 1000: return 1e10
             
             ll, _ = hamilton_filter_t_jit(returns_arr, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1)
             return -ll if np.isfinite(ll) else 1e10
 
-        res = minimize(neg_log_lik, x0, method='L-BFGS-B', options={'disp': False, 'maxiter': 500})
+        # Multi-start Optimization
+        best_fun = 1e20
+        best_x = None
         
-        p = res.x
+        # Generate candidates: Base + Random Perturbations
+        candidates = [x0_base]
+        # Generate random restarts
+        np.random.seed(42) # Consistent results
+        for _ in range(n_restarts - 1):
+            perturbation = np.random.normal(0, 0.2, size=len(x0_base))
+            # Don't perturb transition probs too much (indices 4, 5) to keep persistence high
+            perturbation[4] *= 0.5 
+            perturbation[5] *= 0.5
+            candidates.append(x0_base + perturbation)
+            
+        for i, x0_cand in enumerate(candidates):
+            try:
+                res = minimize(neg_log_lik, x0_cand, method='L-BFGS-B', options={'disp': False, 'maxiter': 500})
+                if res.fun < best_fun:
+                    best_fun = res.fun
+                    best_x = res.x
+            except Exception:
+                continue
+                
+        if best_x is None:
+            # Fallback if all failed (using base)
+            best_x = x0_base
+            best_fun = neg_log_lik(x0_base)
+            
+        p = best_x
         self.params = {
             'mu_0': p[0], 'mu_1': p[1],
             'sigma2_0': np.exp(p[2]), 'sigma2_1': np.exp(p[3]),
             'p00': expit(p[4]), 'p11': expit(p[5]),
-            'nu_0': 2 + np.exp(p[6]), 'nu_1': 2 + np.exp(p[7]),
-            'log_likelihood': -res.fun
+            'nu_0': 2.0 + np.exp(p[6]), 'nu_1': 2.0 + np.exp(p[7]), 
+            'log_likelihood': -best_fun
         }
         
         _, probs = hamilton_filter_t_jit(
@@ -193,10 +264,6 @@ def run_regime_switching_estimation(daily_returns_df):
         calc_scale_factor = 100.0
         if not scaled_available:
              returns = returns * calc_scale_factor
-        
-        # WINSORIZATION: Clip extreme returns
-        # Threshold: 30% daily return (returns are scaled by 100)
-        returns = np.clip(returns, -30.0, 30.0)
         
         if len(returns) < 150:
             print(f"Skipping {gvkey}: insufficient data ({len(returns)})")
