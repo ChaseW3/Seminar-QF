@@ -67,11 +67,12 @@ def simulate_garch_paths_t_jit(omega, alpha, beta, sigma_t, nu,
                 # Cap extreme innovations to prevent temporary spikes (consistent with MS-GARCH)
                 z[f] = max(min(z_raw, 5.0), -5.0)  # Cap at ±5 sigma
             
+            # STORE FIRST: sigma is the volatility used to generate THIS day's return
+            daily_volatilities[day, sim, :] = sigma
+            
             r = sigma * z
             sigma_squared = omega + alpha * (r ** 2) + beta * (sigma ** 2)
             sigma = np.sqrt(np.maximum(sigma_squared, 1e-6))
-            
-            daily_volatilities[day, sim, :] = sigma
     
     return daily_volatilities
 
@@ -251,14 +252,15 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
             # 1. Generate random innovations (standard normal) for Asset Returns
             z_innovations = np.random.standard_normal(firm_daily_vols.shape)
             
-            # 2. Daily returns: R_t ~ N(0, sigma_t)
+            # 2. Daily log returns: r_t ~ N(0, sigma_t)
             firm_daily_returns = firm_daily_vols * z_innovations
             
             # 3. Cumulative yearly return
-            firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0
+            # Using Log Returns logic: V_T = V_0 * exp(sum(r_t))
+            cum_log_returns = np.sum(firm_daily_returns, axis=0)
             
-            # 4. Variance of yearly returns
-            integrated_variance = np.var(firm_cumulative_returns, ddof=1)
+            # 4. Variance of cumulative log returns (strictly correct for log-return models)
+            integrated_variance = np.var(cum_log_returns, ddof=1)
             
             # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
             mc_spread = np.nan
@@ -279,9 +281,8 @@ def monte_carlo_garch_1year(garch_file, gvkey_selected=None, num_simulations=100
                 
                 if not np.isnan(asset_value) and not np.isnan(debt_face):
                      # Construct V_T paths
-                     # V_T = V_0 * (1 + cumulative_return)
-                     # firm_cumulative_returns is (prod(1+r) - 1)
-                     V_T_paths = asset_value * (1.0 + firm_cumulative_returns)
+                     # V_T = V_0 * exp(cum_log_returns)
+                     V_T_paths = asset_value * np.exp(cum_log_returns)
                      
                      payoffs = np.minimum(V_T_paths, debt_face)
                      expected_payoff = np.mean(payoffs)

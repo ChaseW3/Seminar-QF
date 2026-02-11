@@ -132,72 +132,57 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
         # Using the returns from the simulation (which match the volatility path in general models)
         
         # 3. Cumulative yearly return
-        # Using Log Returns logic usually: V_T = V_0 * exp(sum(r_t))
-        # Here firm_daily_returns are shocks = sigma * Z.
-        # Drift should be applied. 
-        # For variance calc: returns are just sum(sigma*Z) approx? 
-        # The existing code used prod(1+R)-1. Let's stick closer to geometric brownian motion standard.
-        # But to match previous logic's variance calc, we can keep using simple returns if needed, 
-        # but for Pricing we need consistent V_T.
+        # Using Log Returns logic: V_T = V_0 * exp(sum(r_t))
+        # Here firm_daily_returns are log returns r_t = sigma * Z
         
-        # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
-        # Extract parameters
+        # Cumulative returns path for value/barrier
+        cum_log_returns_path = np.cumsum(firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
+        
+        # Calculate Asset Paths: V_t = V_0 * exp(cum_log_returns)
         asset_value = firm_data.get('asset_value', np.nan)
-        debt_face = firm_data.get('liabilities_total', np.nan) # K
-        rf_rate = firm_data.get('risk_free_rate', np.nan) # r_f
+        v0 = asset_value
+        liability = firm_data.get('liabilities_total', np.nan) # K
         
-        # Adjust units if needed (ensure decimal)
-        if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
-            rf_rate = rf_rate / 100.0
-        
-        # If we have necessary data
-        mc_spread = np.nan
-        mc_debt_value = np.nan
-        if not np.isnan(asset_value) and not np.isnan(debt_face) and not np.isnan(rf_rate):
-            # Calculate Terminal Asset Value V_T
-            # Simplified Method 1: Use cumprod of simulated returns (V_T = V0 * prod(1+R))
-            # No Ito correction drift term as requested
-            
-            # Re-calculate cumulative returns path for pricing if not already done
-            if 'cum_returns_path' not in locals():
-                cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0)
-            
-            # Terminal values for each path
-            V_T_paths = asset_value * cum_returns_path[-1, :]
-            
-            # Calculate Risky Debt Value
-            # D = e^(-rT) * E[min(V_T, K)]
-            payoffs = np.minimum(V_T_paths, debt_face)
-            expected_payoff = np.mean(payoffs)
-            
-            T_years = num_days / 252.0
-            discount_factor = np.exp(-rf_rate * T_years)
-            risky_debt_value = discount_factor * expected_payoff
-            
-            # Calculate Implied Yield and Spread
-            # y = -1/T * ln(D/K)
-            if risky_debt_value > 0 and debt_face > 0:
-                implied_yield = -1.0/T_years * np.log(risky_debt_value / debt_face)
-                mc_spread = implied_yield - rf_rate
-                mc_debt_value = risky_debt_value
-        
-        # Legacy Variance (if needed, or just use V_T variance)
-        integrated_variance = np.var(np.sum(firm_daily_returns, axis=0), ddof=1)
+        # Legacy Variance 
+        # For log returns, integrated variance = Variance(Sum(r_t))
+        # This matches the true definition in continuous time models
+        log_return_T = np.sum(firm_daily_returns, axis=0)
+        integrated_variance = np.var(log_return_T, ddof=1)
         annualized_volatility = np.sqrt(integrated_variance)
         
         # PROBABILITY OF DEFAULT CALCULATION
         pd_value = np.nan
-        v0 = firm_data.get('asset_value', np.nan)
-        liability = firm_data.get('liabilities_total', np.nan)
+        mc_spread = np.nan
+        mc_debt_value = np.nan
         
         if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
-             # Asset Paths: V_t = V0 * cumulative_prod(1+R)
-             cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
-             asset_paths = v0 * cum_returns_path
+             # Asset Paths
+             asset_paths = v0 * np.exp(cum_log_returns_path)
              
              # Default condition: Asset < Liability at any time step
              path_defaulted = np.any(asset_paths < liability, axis=0) # shape: (num_simulations,)
              pd_value = np.mean(path_defaulted)
+             
+             # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
+             rf_rate = firm_data.get('risk_free_rate', np.nan)
+             if not np.isnan(rf_rate):
+                if abs(rf_rate) > 0.5: rf_rate = rf_rate / 100.0
+                
+                # Terminal values
+                V_T_paths = asset_paths[-1, :]
+                 
+                # D = e^(-rT) * E[min(V_T, K)]
+                payoffs = np.minimum(V_T_paths, liability)
+                expected_payoff = np.mean(payoffs)
+                
+                T_years = num_days / 252.0
+                discount_factor = np.exp(-rf_rate * T_years)
+                risky_debt_value = discount_factor * expected_payoff
+                
+                if risky_debt_value > 0 and liability > 0:
+                    implied_yield = -1.0/T_years * np.log(risky_debt_value / liability)
+                    mc_spread = implied_yield - rf_rate
+                    mc_debt_value = risky_debt_value
 
         # Also calculate mean volatility path for verification
         mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)

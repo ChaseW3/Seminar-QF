@@ -479,23 +479,16 @@ def monte_carlo_ms_garch_1year(
         # daily_vols shape: (num_days, num_simulations, num_firms)
         
         # YEARLY VARIANCE CALCULATION (Asset Value Simulation Method)
-        # 1. Use simulated returns directly
-        # 2. Calculate daily asset returns: R_t from simulation
+        # 1. Use simulated returns directly (t-distributed shocks)
         assets_daily_returns = daily_sim_returns
         
-        # 3. Calculate yearly cumulative return for each path
-        # V_end = V_start * prod(1 + R_t) - using simple returns approximation if wanted, 
-        # or exp(sum(log_ret)) - here we just use what was there before but using OUR returns
-        # The previous code used random Z. Now we use consistent Z.
-        # But wait, previous code used (1 + R). 
-        # Our returns are shocks `sigma * Z`. 
-        # So (1+shock) is consistent.
-        path_cumulative_returns = np.prod(1.0 + assets_daily_returns, axis=0) - 1.0  # Shape: (num_simulations, num_firms)
+        # 2. Cumulative yearly return using LOG RETURNS summation
+        # V_T = V_0 * exp(sum(r_t))
+        cum_log_returns = np.sum(assets_daily_returns, axis=0) # Shape: (num_simulations, num_firms)
         
-        # 4. Calculate Variance of yearly returns across simulations
-        daily_variances = np.var(path_cumulative_returns, axis=0, ddof=1)  # Shape: (num_firms,)
-        # Note: We assign to 'integrated_variances' variable to match expected downstream name
-        integrated_variances = daily_variances
+        # 3. Calculate Variance of Cumulative Log Returns
+        # This is the strictly correct "Integrated Variance" for diffusion processes
+        integrated_variances = np.var(cum_log_returns, axis=0, ddof=1)  # Shape: (num_firms,)
 
         
         # Calculate regime statistics
@@ -527,9 +520,10 @@ def monte_carlo_ms_garch_1year(
                      firm_daily_returns = daily_sim_returns[:, :, firm_idx]
                      
                      # Construct Asset Paths (Consistent with User Request)
-                     cum_returns_path = np.cumprod(1.0 + firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
+                     cum_log_returns_path = np.cumsum(firm_daily_returns, axis=0) # shape: (num_days, num_simulations)
                      
-                     V_T_paths = asset_value * cum_returns_path[-1, :]
+                     # Final Asset Value V_T = V0 * exp(cum_log_returns)
+                     V_T_paths = asset_value * np.exp(cum_log_returns_path[-1, :])
                      
                      payoffs = np.minimum(V_T_paths, debt_face)
                      expected_payoff = np.mean(payoffs)

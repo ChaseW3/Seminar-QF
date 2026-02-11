@@ -191,8 +191,9 @@ def monte_carlo_regime_switching_1year(
         
         # CALCULATE STATISTICS
         # Use generated daily_returns which now include t-distributed shocks
-        path_cumulative_returns = np.prod(1.0 + daily_returns, axis=0) - 1.0 
-        integrated_variances = np.var(path_cumulative_returns, axis=0, ddof=1)
+        # Use LOG returns summation for strictly correct accumulation
+        path_cumulative_log_returns = np.sum(daily_returns, axis=0)
+        integrated_variances = np.var(path_cumulative_log_returns, axis=0, ddof=1)
         
         mean_daily_vols = np.mean(daily_vols, axis=(0,1))
         mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
@@ -218,8 +219,8 @@ def monte_carlo_regime_switching_1year(
     if hasattr(results_df, 'year'):
          for year in sorted(results_df['year'].unique()):
             print(f"  {year}: {len(results_df[results_df['year'] == year]):,} rows")
-    
-    return results_df
+
+    # Sample statistics (first 3 firms)
     print(f"Sample statistics (first 3 firms):")
     for firm in results_df['gvkey'].unique()[:3]:
         firm_data = results_df[results_df['gvkey'] == firm]
@@ -307,12 +308,14 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     # Use returns from simulation which include t-distribution and AR dynamics
     assets_daily_returns = daily_returns
     
-    # Cumulative returns: V_t = V_0 * prod(1+R)
+    # Cumulative returns: V_t = V_0 * exp(sum(r))
     # Shape: (num_days, num_simulations, num_firms)
-    cumulative_returns = np.cumprod(1.0 + assets_daily_returns, axis=0)
+    cumulative_log_returns = np.cumsum(assets_daily_returns, axis=0)
+    cumulative_returns = np.exp(cumulative_log_returns)
     
-    path_cumulative_returns = cumulative_returns[-1, :, :] - 1.0
-    integrated_variances = np.var(path_cumulative_returns, axis=0, ddof=1)
+    # Variance of the CUMULATIVE LOG RETURN (annual variance)
+    path_cumulative_log_return_final = cumulative_log_returns[-1, :, :]
+    integrated_variances = np.var(path_cumulative_log_return_final, axis=0, ddof=1)
     
     # Other stats
     mean_daily_vols = np.mean(daily_vols, axis=(0, 1))
