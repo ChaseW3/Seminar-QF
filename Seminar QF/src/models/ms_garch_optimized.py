@@ -950,100 +950,171 @@ def run_ms_garch_estimation_optimized(data_df,
     # Process each firm
     for i, gvkey in enumerate(firms):
         if verbose:
-            print(f"[{i+1}/{len(firms)}] Processing {gvkey}")
+            print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M)...")
         
+        # try:  <-- REMOVED OUTER TRY
+        firm_data = data_df[data_df[gvkey_column] == gvkey].copy()
+        
+        # Ensure date column
+        if 'date' not in firm_data.columns:
+                if isinstance(firm_data.index, pd.DatetimeIndex):
+                    firm_data['date'] = firm_data.index
+        
+        firm_data['date'] = pd.to_datetime(firm_data['date'])
+        firm_data = firm_data.sort_values('date')
+        
+        # Generate Month Ends
+        start_date = firm_data['date'].min()
+        end_date = firm_data['date'].max()
         try:
-            firm_data = data_df[data_df[gvkey_column] == gvkey].copy()
-            
-            # Use centrally scaled returns if available
-            # We enforce using returns around ~1.0 scale (percentage) for optimizer stability
-            # If input is already scaled (e.g. 1.0%), use it.
-            # If input is raw (e.g. 0.01), scale it by 100.
-            
-            scale_factor = 1.0
-            
-            if "asset_return_daily_scaled" in firm_data.columns:
-                returns = firm_data["asset_return_daily_scaled"].dropna().values
-                scale_factor = 100.0 # It means data IS scaled by 100, so we unscale by 100 later
-            else:
-                returns = firm_data[return_column].dropna().values
-                # Check scale by looking at std dev. If < 0.1, assume it's raw and scale it.
-                if np.std(returns) < 0.1:
-                    returns = returns * 100.0
-                    scale_factor = 100.0
-            
-            if len(returns) < 100:
-                if verbose:
-                    print(f"  Skipping: insufficient data ({len(returns)} observations)")
+            estimation_start = start_date + pd.DateOffset(months=12)
+            if estimation_start >= end_date:
                 continue
-            
-            # Initialize and fit OPTIMIZED MS-GARCH
-            model = MSGARCHOptimized()
-            params = model.fit(returns, verbose=verbose)
-            
-            if params is None:
-                if verbose:
-                    print(f"  MS-GARCH estimation failed for {gvkey}")
-                continue
-            
-            # Get model results
-            vol_series = model.get_volatility_series()
-            regime_probs = model.get_regime_probabilities()
-            
-            # Unscale parameters for saving (so they match RAW return scale)
-            if scale_factor != 1.0:
-                params['omega_0'] /= (scale_factor ** 2)
-                params['omega_1'] /= (scale_factor ** 2)
-                params['mu_0'] /= scale_factor
-                params['mu_1'] /= scale_factor
-                
-                # Unscale volatility series
-                vol_series /= scale_factor
-                
-                # Update model's conditional vol (just in case)
-                model.conditional_vol = vol_series
-            
-            # Store parameters
-            params['gvkey'] = gvkey
-            params['log_likelihood'] = model.log_likelihood - len(returns) * np.log(scale_factor) if scale_factor != 1.0 else model.log_likelihood
-            params['aic'] = 2 * 12 - 2 * params['log_likelihood']
-            params['bic'] = np.log(len(returns)) * 12 - 2 * params['log_likelihood']
-            params['n_obs'] = len(returns)
-            all_params.append(params)
-            
-            # Add volatility to data
-            # Use return_column for indexing alignment
-            target_col = "asset_return_daily_scaled" if "asset_return_daily_scaled" in firm_data.columns else return_column
-            valid_idx = firm_data[target_col].notna()
-            
-            firm_idx = data_with_vol[gvkey_column] == gvkey
-            vol_idx = np.where(firm_idx)[0]
-            valid_positions = np.where(valid_idx.values)[0]
-            
-            for j, pos in enumerate(valid_positions):
-                if j < len(vol_series):
-                    data_with_vol.loc[data_with_vol.index[vol_idx[pos]], 'ms_garch_volatility'] = vol_series[j]
-                    data_with_vol.loc[data_with_vol.index[vol_idx[pos]], 'ms_garch_regime_prob'] = regime_probs[j, 1]
-            
-            if verbose:
-                print(f"  ✓ Successfully estimated MS-GARCH for {gvkey}\n")
-                
+            month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
         except Exception as e:
-            if verbose:
-                print(f"  ✗ Error estimating MS-GARCH for {gvkey}: {str(e)}\n")
+            print(f"Error defining date range for {gvkey}: {e}")
             continue
+
+            
+        for date_point in month_ends:
+            try:  # <-- ADDED INNER TRY
+                # Select all data up to this point
+                data_up_to_point = firm_data[firm_data['date'] <= date_point]
+
+                # Require at least 252 trading days of history
+                if len(data_up_to_point) < 252:
+                    continue
+
+                # Take the exact last 252 trading days for the window
+                window_df = data_up_to_point.iloc[-252:].copy()
+                
+                # Additional data quality checks
+                valid_count = window_df['asset_return_daily_scaled'].notna().sum() if 'asset_return_daily_scaled' in window_df.columns else window_df['asset_return_daily'].notna().sum()
+                
+                if valid_count < 200: 
+                    continue
+                
+                # Use centrally scaled returns if available
+                scale_factor = 1.0
+                
+                if "asset_return_daily_scaled" in window_df.columns:
+                    returns = window_df["asset_return_daily_scaled"].dropna().values
+                    scale_factor = 100.0 # It means data IS scaled by 100, so we unscale by 100 later
+                else:
+                    returns = window_df[return_column].dropna().values
+                    # Check scale by looking at std dev. If < 0.1, assume it's raw and scale it.
+                    if np.std(returns) < 0.1:
+                        returns = returns * 100.0
+                        scale_factor = 100.0
+                
+                if len(returns) < 100:
+                    continue
+                
+                # Initialize and fit OPTIMIZED MS-GARCH
+                model = MSGARCHOptimized()
+                # Run silently for rolling windows to avoid spam
+                params = model.fit(returns, verbose=False)
+                
+                if params is None:
+                    continue
+                
+                # Get model results
+                vol_series = model.get_volatility_series()
+                regime_probs = model.get_regime_probabilities()
+                
+                # Unscale parameters for saving (so they match RAW return scale)
+                if scale_factor != 1.0:
+                    params['omega_0'] /= (scale_factor ** 2)
+                    params['omega_1'] /= (scale_factor ** 2)
+                    params['mu_0'] /= scale_factor
+                    params['mu_1'] /= scale_factor
+                    
+                    # Unscale volatility series
+                    vol_series /= scale_factor
+                
+                # Use Last Trading Date for the "Date" field to ensure merge/saving works
+                last_trading_date = window_df['date'].max()
+
+                # Stitch volatility and probabilities (new month only)
+                # Determine indices for the most recent month
+                prev_month_end = date_point - pd.DateOffset(months=1)
+                
+                window_indices = window_df.index
+                
+                # Filter return/vol series to valid rows used in estimation
+                if "asset_return_daily_scaled" in window_df.columns:
+                        valid_mask = window_df["asset_return_daily_scaled"].notna()
+                else: 
+                        valid_mask = window_df[return_column].notna()
+                        
+                valid_indices = window_df.index[valid_mask]
+                valid_dates = window_df.loc[valid_mask, 'date']
+                
+                # Only update rows > prev_month_end
+                new_month_mask = valid_dates > prev_month_end
+                
+                if new_month_mask.any():
+                    update_indices = valid_indices[new_month_mask]
+                    update_vol = vol_series[new_month_mask.values]
+                    update_probs = regime_probs[new_month_mask.values]
+                    
+                    data_with_vol.loc[update_indices, 'ms_garch_volatility'] = update_vol
+                    data_with_vol.loc[update_indices, 'ms_garch_regime_prob'] = update_probs[:, 1] # Prob of regime 1
+
+                # Store parameters
+                params['gvkey'] = gvkey
+                params['date'] = last_trading_date # Use LAST TRADING DATE
+                params['log_likelihood'] = model.log_likelihood - len(returns) * np.log(scale_factor) if scale_factor != 1.0 else model.log_likelihood
+                params['aic'] = 2 * 12 - 2 * params['log_likelihood']
+                params['bic'] = np.log(len(returns)) * 12 - 2 * params['log_likelihood']
+                params['n_obs'] = len(returns)
+                all_params.append(params)
+            
+            except Exception as e:
+                if verbose:
+                    print(f"  ✗ Error estimating MS-GARCH for {gvkey} on {date_point}: {str(e)}")
+                continue
+
+        if verbose:
+            print(f"  ✓ Estimated MS-GARCH rolling parameters for {gvkey}")
+                
+        # except Exception as e:  <-- REMOVED OUTER EXCEPT
+        #    if verbose:
+        #        print(f"  ✗ Error estimating MS-GARCH for {gvkey}: {str(e)}\n")
+        #    continue
     
     # Save parameters
     if len(all_params) > 0:
         params_df = pd.DataFrame(all_params)
-        cols = ['gvkey', 'omega_0', 'alpha_0', 'beta_0', 'omega_1', 'alpha_1', 'beta_1',
+        # Include 'date' in columns
+        cols = ['gvkey', 'date', 'omega_0', 'alpha_0', 'beta_0', 'omega_1', 'alpha_1', 'beta_1',
                 'mu_0', 'mu_1', 'p00', 'p11', 'nu_0', 'nu_1', 'log_likelihood', 'aic', 'bic', 'n_obs']
+        # Select columns that exist
         params_df = params_df[[c for c in cols if c in params_df.columns]]
         params_df.to_csv(output_file, index=False)
         
         if verbose:
             print(f"\n✓ MS-GARCH parameters saved to {output_file}")
-            print(f"✓ Successfully estimated: {len(params_df)} firms")
+            print(f"✓ Successfully estimated: {len(params_df)} firm-months")
+            
+        # Merge rolling parameters back into daily dataframe (Forward fill)
+        data_with_vol['date'] = pd.to_datetime(data_with_vol['date'])
+        
+        # Merge columns (params)
+        merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'log_likelihood', 'aic', 'bic', 'n_obs']]
+        
+        # Drop existing
+        data_with_vol = data_with_vol.drop(columns=[c for c in merge_cols if c in data_with_vol.columns])
+        
+        merge_df = params_df[['gvkey', 'date'] + merge_cols]
+        data_with_vol = pd.merge(data_with_vol, merge_df, on=['gvkey', 'date'], how='left')
+        
+        # FFill
+        data_with_vol = data_with_vol.sort_values(['gvkey', 'date'])
+        data_with_vol[merge_cols] = data_with_vol.groupby('gvkey')[merge_cols].ffill()
+        
+        if verbose:
+             print("  ✓ Merged rolling MS-GARCH parameters into daily returns data")
     
     if verbose:
         print("\n" + "="*80)

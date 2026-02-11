@@ -42,72 +42,107 @@ def run_garch_estimation(daily_returns_df):
     
     for i, gvkey in enumerate(firms):
         mask = df_out["gvkey"] == gvkey
-        firm_ts = df_out.loc[mask]
+        firm_ts = df_out.loc[mask].copy()
         
-        # Check for sufficient data
-        # Prefer scaled returns if available
-        if "asset_return_daily_scaled" in firm_ts.columns:
-            firm_ts = firm_ts.dropna(subset=["asset_return_daily_scaled"])
-            if len(firm_ts) < 50:
-                continue
-            returns = firm_ts["asset_return_daily_scaled"].values
-        else:
-            firm_ts = firm_ts.dropna(subset=["asset_return_daily"])
-            if len(firm_ts) < 50:
-                continue
-            # Scale returns to percentage locally if not already scaled
-            returns = firm_ts["asset_return_daily"].values * SCALE_FACTOR
+        # Ensure date column is datetime
+        if 'date' not in firm_ts.columns:
+             # Try index if it is datetime
+             if isinstance(firm_ts.index, pd.DatetimeIndex):
+                 firm_ts['date'] = firm_ts.index
+             else:
+                 print(f"Skipping {gvkey}: No date column found")
+                 continue
+                 
+        firm_ts['date'] = pd.to_datetime(firm_ts['date'])
+        firm_ts = firm_ts.sort_values('date')
         
+        # Determine rolling windows (Monthly)
+        start_date = firm_ts['date'].min()
+        end_date = firm_ts['date'].max()
+        
+        # Determine rolling windows (Monthly)
+        start_date = firm_ts['date'].min()
+        end_date = firm_ts['date'].max()
+        
+        # Start 12 months in to ensure full window
         try:
-            # Use Student's t distribution to handle fat tails
-            am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
-            res = am.fit(disp='off', show_warning=False)
-            
-            # Extract parameters (scaled)
-            omega = res.params['omega']
-            alpha = res.params['alpha[1]']
-            beta = res.params['beta[1]']
-            nu = res.params.get('nu', np.nan)  # Degrees of freedom for t-distribution
-            
-            # Get conditional volatility (scaled)
-            cond_vol_scaled = np.asarray(res.conditional_volatility)
-            
-            # Rescale volatility back to original scale
-            cond_vol = cond_vol_scaled / SCALE_FACTOR
-            
-            # Rescale omega back
-            omega = omega / (SCALE_FACTOR ** 2)
-            
-            if np.any(np.isnan(cond_vol)) or np.any(cond_vol < 0):
+            # Shift minimal start date to ensure at least 12 months history
+            # But the actual window selection will enforce "last 252 available days"
+            estimation_start = start_date + pd.DateOffset(months=12)
+            if estimation_start >= end_date:
                 continue
-            
-            df_out.loc[firm_ts.index, "garch_volatility"] = cond_vol
-            df_out.loc[firm_ts.index, "garch_omega"] = omega
-            df_out.loc[firm_ts.index, "garch_alpha"] = alpha
-            df_out.loc[firm_ts.index, "garch_beta"] = beta
-            df_out.loc[firm_ts.index, "garch_nu"] = nu  # Save degrees of freedom
-            
-            # Store parameters for this firm
-            params_row = {
-                'gvkey': gvkey,
-                'omega': omega,
-                'alpha': alpha,
-                'beta': beta,
-                'nu': nu,
-                'persistence': alpha + beta,
-                'unconditional_variance': omega / (1 - alpha - beta) if (alpha + beta) < 1 else np.nan,
-                'log_likelihood': float(res.llf) if hasattr(res, 'llf') else np.nan,
-                'aic': float(res.aic) if hasattr(res, 'aic') else np.nan,
-                'bic': float(res.bic) if hasattr(res, 'bic') else np.nan,
-                'num_observations': len(returns)
-            }
-            params_list.append(params_row)
-            
+            month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
         except Exception as e:
+            print(f"Error defining date range for {gvkey}: {e}")
             continue
+
             
-        if (i + 1) % 10 == 0:
-            print(f"Processed GARCH for {i+1} firms...")
+        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M Window)...")
+
+            
+        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M Window)...")
+        
+        for date_point in month_ends:
+            # Select all data up to this point
+            data_up_to_point = firm_ts[firm_ts['date'] <= date_point]
+
+            # Require at least 252 trading days of history
+            if len(data_up_to_point) < 252:
+                continue
+
+            # Take the exact last 252 trading days for the window
+            window_df = data_up_to_point.iloc[-252:].copy()
+            
+            # Additional check for missing values inside the window
+            if window_df['asset_return_daily'].isna().sum() > 20: 
+                 # Skip if too many missing returns in the 252-day window
+                 continue
+                 
+            last_trading_date = window_df['date'].max()
+  
+            if "asset_return_daily_scaled" in window_df.columns:
+                returns = window_df["asset_return_daily_scaled"].dropna().values
+            else:
+                window_df = window_df.dropna(subset=["asset_return_daily"])
+                # After dropping NaNs, ensure we still have enough data points for estimation
+                if len(window_df) < 200: continue 
+                # Scale returns to percentage locally if not already scaled
+                returns = window_df["asset_return_daily"].values * SCALE_FACTOR
+            
+            try:
+                # Use Student's t distribution to handle fat tails
+                am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
+                res = am.fit(disp='off', show_warning=False)
+                
+                # Extract parameters (scaled)
+                omega = res.params['omega']
+                alpha = res.params['alpha[1]']
+                beta = res.params['beta[1]']
+                nu = res.params.get('nu', np.nan)  # Degrees of freedom for t-distribution
+                
+                # Rescale omega back
+                omega = omega / (SCALE_FACTOR ** 2)
+                
+                # Store parameters for this window
+                params_row = {
+                    'gvkey': gvkey,
+                    'date': last_trading_date,  # Use LAST TRADING DATE to ensure merge match
+                    'omega': omega,
+                    'alpha': alpha,
+                    'beta': beta,
+                    'nu': nu,
+                    'persistence': alpha + beta,
+                    'unconditional_variance': omega / (1 - alpha - beta) if (alpha + beta) < 1 else np.nan,
+                    'log_likelihood': getattr(res, 'loglikelihood', getattr(res, 'llf', np.nan)),
+                    'aic': getattr(res, 'aic', np.nan),
+                    'bic': getattr(res, 'bic', np.nan),
+                    'num_observations': len(returns)
+                }
+                params_list.append(params_row)
+                
+            except Exception as e:
+                print(f"Error estimating GARCH for {gvkey} on {date_point}: {e}")
+                continue
 
     print("GARCH estimation complete.")
     
@@ -117,8 +152,36 @@ def run_garch_estimation(daily_returns_df):
         output_path = OUTPUT_DIR / 'garch_parameters.csv'
         params_df.to_csv(output_path, index=False)
         print(f"\n✓ Saved GARCH parameters to '{output_path}'")
-        print(f"  Successfully estimated {len(params_list)} firms")
-        print(f"  Mean persistence (α+β): {params_df['persistence'].mean():.4f}")
-        print(f"  Mean degrees of freedom (ν): {params_df['nu'].mean():.2f}")
-    
+        
+        # Merge rolling parameters back into daily dataframe
+        
+        # Ensure date type
+        df_out['date'] = pd.to_datetime(df_out['date'])
+        
+        # Prepare params for merge (rename to garch_ prefix)
+        merge_df = params_df[['gvkey', 'date', 'omega', 'alpha', 'beta', 'nu']].rename(columns={
+            'omega': 'garch_omega',
+            'alpha': 'garch_alpha',
+            'beta': 'garch_beta',
+            'nu': 'garch_nu'
+        })
+        
+        # Drop existing columns to avoid conflicts
+        drop_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu', 'garch_volatility']
+        df_out = df_out.drop(columns=[c for c in drop_cols if c in df_out.columns])
+        
+        # Merge on date (month-ends only match initially)
+        df_out = pd.merge(df_out, merge_df, on=['gvkey', 'date'], how='left')
+        
+        # Forward fill parameters per firm
+        df_out = df_out.sort_values(['gvkey', 'date'])
+        fill_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu']
+        df_out[fill_cols] = df_out.groupby('gvkey')[fill_cols].ffill()
+        
+        # Calculate approximate volatility (unconditional) for plotting/checking
+        # Valid only where params exist
+        df_out['garch_volatility'] = np.sqrt(
+            df_out['garch_omega'] / (1 - df_out['garch_alpha'] - df_out['garch_beta'])
+        )
+        
     return df_out

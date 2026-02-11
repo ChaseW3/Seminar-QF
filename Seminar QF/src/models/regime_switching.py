@@ -249,72 +249,157 @@ def run_regime_switching_estimation(daily_returns_df):
     
     for i, gvkey in enumerate(firms):
         firm_mask = df_out["gvkey"] == gvkey
-        firm_df = df_out.loc[firm_mask].sort_values("date")
+        firm_df = df_out.loc[firm_mask].copy()
+        
+        # Ensure date format
+        if 'date' not in firm_df.columns:
+            # Try index
+            if isinstance(firm_df.index, pd.DatetimeIndex):
+                firm_df['date'] = firm_df.index
+        
+        firm_df['date'] = pd.to_datetime(firm_df['date'])
+        firm_df = firm_df.sort_values("date")
         
         scaled_available = "asset_return_daily_scaled" in firm_df.columns
         target_col = "asset_return_daily_scaled" if scaled_available else "asset_return_daily"
         
-        valid_mask = firm_df[target_col].notna()
-        returns = firm_df.loc[valid_mask, target_col].values
-        valid_indices = firm_df.loc[valid_mask].index
-        
-        # Scale factor for converting parameters back to decimal scale
-        # If using pre-scaled data (×100), need to divide parameters by 100
-        # If using raw data, scale it by 100 for estimation, then divide by 100
-        calc_scale_factor = 100.0
-        if not scaled_available:
-             returns = returns * calc_scale_factor
-        
-        if len(returns) < 150:
-            print(f"Skipping {gvkey}: insufficient data ({len(returns)})")
-            continue
-            
+        # Monthly Rolling Window
+        start_date = firm_df['date'].min()
+        end_date = firm_df['date'].max()
         try:
-            model = MarkovSwitchingTDist()
-            params, probs = model.fit(returns)
-            
-            # Map regimes: 0 = LOW, 1 = HIGH Volatility
-            p_sigma0 = params['sigma2_0']
-            p_sigma1 = params['sigma2_1']
-            
-            if p_sigma0 > p_sigma1:
-                 params['sigma2_0'], params['sigma2_1'] = params['sigma2_1'], params['sigma2_0']
-                 params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
-                 params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
-                 params['p00'], params['p11'] = params['p11'], params['p00']
-                 probs[:, [0, 1]] = probs[:, [1, 0]]
-            
-            count = 0
-            for idx in valid_indices:
-                df_out.loc[idx, "regime_probability_0"] = probs[count, 0]
-                df_out.loc[idx, "regime_probability_1"] = probs[count, 1]
-                df_out.loc[idx, "regime_state"] = 0 if probs[count, 0] > 0.5 else 1
-                count += 1
-            
-            params_list.append({
-                'gvkey': gvkey,
-                'regime_0_mean': params['mu_0'] / calc_scale_factor,
-                'regime_1_mean': params['mu_1'] / calc_scale_factor,
-                'regime_0_vol': np.sqrt(params['sigma2_0']) / calc_scale_factor,
-                'regime_1_vol': np.sqrt(params['sigma2_1']) / calc_scale_factor,
-                'regime_0_nu': params['nu_0'],
-                'regime_1_nu': params['nu_1'], 
-                'transition_prob_00': params['p00'],
-                'transition_prob_01': 1 - params['p00'],
-                'transition_prob_10': 1 - params['p11'],
-                'transition_prob_11': params['p11'],
-                'regime_0_ar': 0.0,
-                'regime_1_ar': 0.0
-            })
-            
-            print(f"  Processed {gvkey} (Reg0 Vol: {np.sqrt(params['sigma2_0'])/calc_scale_factor:.4f}, Nu: {params['nu_0']:.2f})")
-            
+            estimation_start = start_date + pd.DateOffset(months=12)
+            if estimation_start >= end_date:
+                continue
+            month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
         except Exception as e:
-            print(f"Error {gvkey}: {e}")
+            print(f"Error defining date range for {gvkey}: {e}")
             continue
 
+             
+        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M)...")
+        
+        for date_point in month_ends:
+            # Select all data up to this point
+            data_up_to_point = firm_df[firm_df['date'] <= date_point]
+
+            # Require at least 252 trading days of history is available
+            if len(data_up_to_point) < 252:
+                continue
+
+            # Take the exact last 252 trading days for the window
+            window_df = data_up_to_point.iloc[-252:].copy()
+            
+            # Additional check for missing values inside the window
+            if window_df[target_col].isna().sum() > 20: 
+                 # Skip if too many missing returns in the 252-day window
+                 continue
+            
+            valid_mask = window_df[target_col].notna()
+            # If not enough valid points after dropping NaNs, skip
+            if valid_mask.sum() < 200:
+                continue
+                
+            returns = window_df.loc[valid_mask, target_col].values
+
+            # CRITICAL FIX: Use the last actual trading date from this window
+            last_trading_date = window_df['date'].max()
+            
+            # Scale factor for converting parameters back to decimal scale
+            calc_scale_factor = 100.0
+            if not scaled_available:
+                 returns = returns * calc_scale_factor
+            
+            try:
+                model = MarkovSwitchingTDist()
+                params, probs = model.fit(returns)
+                
+                # Map regimes: 0 = LOW, 1 = HIGH Volatility
+                p_sigma0 = params['sigma2_0']
+                p_sigma1 = params['sigma2_1']
+                
+                if p_sigma0 > p_sigma1:
+                     params['sigma2_0'], params['sigma2_1'] = params['sigma2_1'], params['sigma2_0']
+                     params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
+                     params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
+                     params['p00'], params['p11'] = params['p11'], params['p00']
+                     # Swap probabilities too as we are saving them
+                     probs[:, [0, 1]] = probs[:, [1, 0]]
+                
+                # Stitch probabilities into df_out (for the newest month in the window)
+                # This approximates the "out-of-sample" filtered probability history
+                prev_month_end = date_point - pd.DateOffset(months=1)
+                
+                # Map back to indices
+                # window_df has the data for the window. valid_mask selects rows with valid returns.
+                window_indices = window_df.index[valid_mask]
+                window_dates = window_df.loc[valid_mask, 'date']
+                
+                # Identify rows belonging to the most recent month
+                new_month_mask = window_dates > prev_month_end
+                
+                if new_month_mask.any():
+                    update_indices = window_indices[new_month_mask]
+                    update_probs = probs[new_month_mask.values]
+                    
+                    df_out.loc[update_indices, "regime_probability_0"] = update_probs[:, 0]
+                    df_out.loc[update_indices, "regime_probability_1"] = update_probs[:, 1]
+                    df_out.loc[update_indices, "regime_state"] = np.where(update_probs[:, 0] > 0.5, 0, 1)
+
+                # Store params
+                params_list.append({
+                    'gvkey': gvkey,
+                    'date': last_trading_date, # Use LAST TRADING DATE
+                    'regime_0_mean': params['mu_0'] / calc_scale_factor,
+                    'regime_1_mean': params['mu_1'] / calc_scale_factor,
+                    'regime_0_vol': np.sqrt(params['sigma2_0']) / calc_scale_factor,
+                    'regime_1_vol': np.sqrt(params['sigma2_1']) / calc_scale_factor,
+                    'regime_0_nu': params['nu_0'],
+                    'regime_1_nu': params['nu_1'], 
+                    'transition_prob_00': params['p00'],
+                    'transition_prob_01': 1 - params['p00'],
+                    'transition_prob_10': 1 - params['p11'],
+                    'transition_prob_11': params['p11'],
+                    'regime_0_ar': 0.0,
+                    'regime_1_ar': 0.0
+                })
+                
+                # print(f"  Processed {gvkey} window ending {date_point.date()}")
+                
+            except Exception as e:
+                # print(f"Error {gvkey}: {e}")
+                continue
+
     if params_list:
-        pd.DataFrame(params_list).to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
+        params_df = pd.DataFrame(params_list)
+        params_df.to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
         print("Saved regime_switching_parameters.csv")
+        
+        # Merge rolling parameters back into daily dataframe
+        # Ensure date type
+        df_out['date'] = pd.to_datetime(df_out['date'])
+        
+        # Determine cols to merge (exclude gvkey, date)
+        # We rename them to be clear they are the parameters active for that time
+        # Actually in RS model result summary, we might use them.
+        # Let's keep names but forward fill.
+        
+        # Columns in params_list: 
+        # regime_0_mean, regime_1_mean, regime_0_vol, regime_1_vol, 
+        # regime_0_nu, regime_1_nu, transition_prob_00, ...
+        
+        merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'regime_0_ar', 'regime_1_ar']]
+        
+        # Drop existing if any
+        df_out = df_out.drop(columns=[c for c in merge_cols if c in df_out.columns])
+        
+        # Merge on date (month-ends)
+        merge_df = params_df[['gvkey', 'date'] + merge_cols]
+        df_out = pd.merge(df_out, merge_df, on=['gvkey', 'date'], how='left')
+        
+        # Forward fill per firm
+        df_out = df_out.sort_values(['gvkey', 'date'])
+        df_out[merge_cols] = df_out.groupby('gvkey')[merge_cols].ffill()
+        
+        print(f"  Merged rolling RS parameters into daily returns data (Forward Filled)")
     
     return df_out
