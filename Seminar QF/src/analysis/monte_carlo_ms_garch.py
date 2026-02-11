@@ -351,17 +351,33 @@ def monte_carlo_ms_garch_1year(
         return pd.DataFrame()
     
     # Load Merton Data for PD calculation
-    merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(ms_garch_params_file))), 'data', 'output', 'merged_data_with_merton.csv')
-    if not os.path.exists(merton_file):
-         merton_file = './data/output/merged_data_with_merton.csv'
+    merton_file = None
+    # Try to find the file in several locations
+    potential_paths = []
+    
+    if isinstance(ms_garch_params_file, str):
+        # Same directory as input file
+        potential_paths.append(os.path.join(os.path.dirname(ms_garch_params_file), 'merged_data_with_merton.csv'))
+        # Common project structure paths
+        potential_paths.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(ms_garch_params_file))), 'data', 'output', 'merged_data_with_merton.csv'))
+    
+    # Add standard relative paths
+    potential_paths.append('./data/output/merged_data_with_merton.csv')
+    potential_paths.append('./Seminar QF/data/output/merged_data_with_merton.csv')
+    potential_paths.append('../data/output/merged_data_with_merton.csv')
+    
+    for path in potential_paths:
+        if os.path.exists(path):
+            merton_file = path
+            break
 
     merton_by_date = {}
-    if os.path.exists(merton_file):
+    if merton_file and os.path.exists(merton_file):
         try:
             df_merton = pd.read_csv(merton_file)
             df_merton['date'] = pd.to_datetime(df_merton['date'])
             merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+            print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows) from {merton_file}")
         except Exception as e:
             print(f"⚠ Error loading Merton data: {e}")
             merton_by_date = {}
@@ -817,23 +833,38 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
                  merton_df['date'] = pd.to_datetime(merton_df['date'])
              merton_by_date = {k: v for k, v in merton_df.groupby('date')}
     else:
-        if isinstance(daily_returns_file, str):
-            merton_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(daily_returns_file))), 'merged_data_with_merton.csv')
-        else:
-             merton_file = './data/output/merged_data_with_merton.csv'
-             
-        if not os.path.exists(merton_file):
-            merton_file = './data/output/merged_data_with_merton.csv'
+        merton_file = None
+        # Try to find the file in several locations
+        potential_paths = []
 
-        if os.path.exists(merton_file):
+        if isinstance(daily_returns_file, str):
+            # Same directory as input file
+            potential_paths.append(os.path.join(os.path.dirname(daily_returns_file), 'merged_data_with_merton.csv'))
+            # Common project structure paths
+            potential_paths.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(daily_returns_file))), 'data', 'output', 'merged_data_with_merton.csv'))
+        
+        # Add standard relative paths
+        potential_paths.append('./data/output/merged_data_with_merton.csv')
+        potential_paths.append('./Seminar QF/data/output/merged_data_with_merton.csv')
+        potential_paths.append('../data/output/merged_data_with_merton.csv')
+        
+        for path in potential_paths:
+            if os.path.exists(path):
+                merton_file = path
+                break
+
+        if merton_file and os.path.exists(merton_file):
             try:
                 df_merton = pd.read_csv(merton_file)
                 df_merton['date'] = pd.to_datetime(df_merton['date'])
                 merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-                print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows)")
+                print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows) from {merton_file}")
             except Exception as e:
                 print(f"⚠ Error loading Merton data: {e}")
                 merton_by_date = {}
+        else:
+             print(f"⚠ Warning: Merton data file not found (checked {len(potential_paths)} locations). PD will be NaN.")
+             merton_by_date = {}
     
     # Prepare date groups for parallel processing
     date_groups = []
@@ -848,7 +879,8 @@ def monte_carlo_ms_garch_1year_parallel(daily_returns_file, ms_garch_params_file
                 for _, row in df_m_relevant.iterrows():
                     merton_date_dict[row['gvkey']] = {
                         'asset_value': row['asset_value'],
-                        'liabilities_total': row['liabilities_total']
+                        'liabilities_total': row['liabilities_total'],
+                        'risk_free_rate': row['risk_free_rate']
                     }
             date_groups.append((date, group, msgarch_params, merton_date_dict))
     else:
