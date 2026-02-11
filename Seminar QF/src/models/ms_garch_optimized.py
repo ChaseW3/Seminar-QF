@@ -15,7 +15,7 @@ Expected speedup: 5-15x faster than original implementation
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from scipy.special import expit, gammaln
+from scipy.special import expit
 from numba import njit
 import math
 import warnings

@@ -19,7 +19,6 @@ import numpy as np
 import os
 from datetime import timedelta
 import numba
-from scipy import stats
 from joblib import Parallel, delayed
 
 # Cache directory removed

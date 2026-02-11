@@ -2,11 +2,8 @@
 
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
 from scipy.special import ndtr
 from joblib import Parallel, delayed
-import os
-import pickle
 import time
 from datetime import timedelta
 try:
