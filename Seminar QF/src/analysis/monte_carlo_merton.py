@@ -150,7 +150,12 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
         integrated_variance = np.var(log_return_T, ddof=1)
         annualized_volatility = np.sqrt(integrated_variance)
         
-        # PROBABILITY OF DEFAULT CALCULATION
+        # PROBABILITY OF DEFAULT & SPREAD CALCULATION (1Y, 3Y, 5Y)
+        mc_spread_1y, mc_spread_3y, mc_spread_5y = np.nan, np.nan, np.nan
+        mc_debt_1y, mc_debt_3y, mc_debt_5y = np.nan, np.nan, np.nan
+        pd_value_1y, pd_value_3y, pd_value_5y = np.nan, np.nan, np.nan
+        
+        # Legacy/Compatibility variables (will use 1Y)
         pd_value = np.nan
         mc_spread = np.nan
         mc_debt_value = np.nan
@@ -159,30 +164,72 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
              # Asset Paths
              asset_paths = v0 * np.exp(cum_log_returns_path)
              
-             # Default condition: Asset < Liability at any time step
-             path_defaulted = np.any(asset_paths < liability, axis=0) # shape: (num_simulations,)
-             pd_value = np.mean(path_defaulted)
-             
-             # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
              rf_rate = firm_data.get('risk_free_rate', np.nan)
-             if not np.isnan(rf_rate):
-                if abs(rf_rate) > 0.5: rf_rate = rf_rate / 100.0
-                
-                # Terminal values
-                V_T_paths = asset_paths[-1, :]
+             if not np.isnan(rf_rate) and abs(rf_rate) > 0.5: 
+                 rf_rate = rf_rate / 100.0
+
+             horizons = {
+                 '1y': min(252, num_days),
+                 '3y': min(252*3, num_days),
+                 '5y': min(252*5, num_days)
+             }
+             
+             # --- 1 Year ---
+             idx_1y = horizons['1y'] - 1
+             if idx_1y < asset_paths.shape[0]:
+                 # PD: Any touch below barrier up to horizon
+                 pd_value_1y = np.mean(np.any(asset_paths[:idx_1y+1, :] < liability, axis=0))
                  
-                # D = e^(-rT) * E[min(V_T, K)]
-                payoffs = np.minimum(V_T_paths, liability)
-                expected_payoff = np.mean(payoffs)
-                
-                T_years = num_days / 252.0
-                discount_factor = np.exp(-rf_rate * T_years)
-                risky_debt_value = discount_factor * expected_payoff
-                
-                if risky_debt_value > 0 and liability > 0:
-                    implied_yield = -1.0/T_years * np.log(risky_debt_value / liability)
-                    mc_spread = implied_yield - rf_rate
-                    mc_debt_value = risky_debt_value
+                 if not np.isnan(rf_rate):
+                     V_T = asset_paths[idx_1y, :]
+                     expected_payoff = np.mean(np.minimum(V_T, liability))
+                     T_years = horizons['1y'] / 252.0
+                     discount_factor = np.exp(-rf_rate * T_years)
+                     debt_val = expected_payoff * discount_factor
+                     
+                     if debt_val > 0 and liability > 0:
+                         ytm = -np.log(debt_val / liability) / T_years
+                         mc_spread_1y = max(ytm - rf_rate, 0.0)
+                         mc_debt_1y = debt_val
+
+             # --- 3 Year ---
+             idx_3y = horizons['3y'] - 1
+             if idx_3y < asset_paths.shape[0]:
+                 pd_value_3y = np.mean(np.any(asset_paths[:idx_3y+1, :] < liability, axis=0))
+                 
+                 if not np.isnan(rf_rate):
+                     V_T = asset_paths[idx_3y, :]
+                     expected_payoff = np.mean(np.minimum(V_T, liability))
+                     T_years = horizons['3y'] / 252.0
+                     discount_factor = np.exp(-rf_rate * T_years)
+                     debt_val = expected_payoff * discount_factor
+                     
+                     if debt_val > 0 and liability > 0:
+                         ytm = -np.log(debt_val / liability) / T_years
+                         mc_spread_3y = max(ytm - rf_rate, 0.0)
+                         mc_debt_3y = debt_val
+
+             # --- 5 Year ---
+             idx_5y = horizons['5y'] - 1
+             if idx_5y < asset_paths.shape[0]:
+                 pd_value_5y = np.mean(np.any(asset_paths[:idx_5y+1, :] < liability, axis=0))
+                 
+                 if not np.isnan(rf_rate):
+                     V_T = asset_paths[idx_5y, :]
+                     expected_payoff = np.mean(np.minimum(V_T, liability))
+                     T_years = horizons['5y'] / 252.0
+                     discount_factor = np.exp(-rf_rate * T_years)
+                     debt_val = expected_payoff * discount_factor
+                     
+                     if debt_val > 0 and liability > 0:
+                         ytm = -np.log(debt_val / liability) / T_years
+                         mc_spread_5y = max(ytm - rf_rate, 0.0)
+                         mc_debt_5y = debt_val
+
+             # Set legacy values to 1Y results
+             pd_value = pd_value_1y
+             mc_spread = mc_spread_1y
+             mc_debt_value = mc_debt_1y
 
         # Also calculate mean volatility path for verification
         mean_path = np.mean(firm_daily_vols, axis=1)  # shape: (num_days,)
@@ -195,6 +242,15 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
             'merton_mc_mean_daily_volatility': np.mean(mean_path),
             'merton_mc_constant_annual_vol': merton_params[firm]['sigma_annual'],
             'merton_mc_probability_of_default': pd_value,
+            'merton_mc_pd_1y': pd_value_1y,
+            'merton_mc_pd_3y': pd_value_3y,
+            'merton_mc_pd_5y': pd_value_5y,
+            'merton_mc_implied_spread_1y': mc_spread_1y,
+            'merton_mc_implied_spread_3y': mc_spread_3y,
+            'merton_mc_implied_spread_5y': mc_spread_5y,
+            'merton_mc_debt_value_1y': mc_debt_1y,
+            'merton_mc_debt_value_3y': mc_debt_3y,
+            'merton_mc_debt_value_5y': mc_debt_5y,
             'merton_mc_implied_spread': mc_spread,
             'merton_mc_debt_value': mc_debt_value
         })
@@ -203,7 +259,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
 
 
 def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, 
-                                       num_simulations=1000, num_days=252, n_jobs=-1):
+                                       num_simulations=1000, num_days=1260, n_jobs=-1):
     """
     Monte Carlo with constant Merton volatility (1-year horizon, parallelized).
     
@@ -223,7 +279,7 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None,
     num_simulations : int
         Number of Monte Carlo paths (default: 1000)
     num_days : int
-        Forecast horizon in days (default: 252 = 1 year)
+        Forecast horizon in days (default: 1260 = 5 years)
     n_jobs : int
         Number of parallel jobs (default: -1 = all cores)
     
@@ -231,13 +287,13 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None,
     --------
     pd.DataFrame with columns:
         - gvkey, date
-        - merton_mc_integrated_variance: IV = Σ E[σ²] over 252 days
+        - merton_mc_integrated_variance: IV = Σ E[σ²] over horizon
         - merton_mc_annualized_volatility: sqrt(IV) (should equal asset_volatility)
         - merton_mc_mean_daily_volatility: Mean daily volatility
         - merton_mc_constant_annual_vol: Original Merton annual volatility
     """
     print(f"\n{'='*80}")
-    print("MONTE CARLO: MERTON CONSTANT VOLATILITY (1-Year Forecast)")
+    print("MONTE CARLO: MERTON CONSTANT VOLATILITY (5-Year Forecast)")
     print(f"{'='*80}\n")
     
     start_time = datetime.now()
@@ -268,7 +324,7 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None,
     print(f"  Total observations: {len(df):,}")
     print(f"\nMonte Carlo settings:")
     print(f"  Simulations per firm-date: {num_simulations}")
-    print(f"  Forecast horizon: {num_days} days (1 year)")
+    print(f"  Forecast horizon: {num_days} days (5 years)")
     print(f"  Parallel jobs: {n_jobs if n_jobs > 0 else 'All cores'}")
     print(f"\nStarting simulation...\n")
     

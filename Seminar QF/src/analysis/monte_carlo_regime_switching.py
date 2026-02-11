@@ -100,6 +100,131 @@ def simulate_regime_switching_paths_vectorized(
     return daily_volatilities, regime_paths, daily_returns
 
 
+@numba.jit(nopython=True, parallel=True)
+def simulate_regime_switching_paths_fully_optimized(
+    mu_0, mu_1, ar_0, ar_1, sigma_0, sigma_1, nu_0, nu_1,
+    trans_00, trans_01, trans_10, trans_11,
+    num_simulations, num_firms, horizon_days, initial_regime_probs,
+    v0_arr, liability_arr
+):
+    """
+    FULLY OPTIMIZED regime-switching Monte Carlo simulation with T-DISTRIBUTION.
+    
+    Calculates EVERYTHING in one pass without storing full paths:
+    - Terminal volatilities at 1y/3y/5y
+    - Volatility statistics (mean/std/max/min)
+    - Path-dependent default probabilities
+    - Terminal asset values for CDS pricing
+    - Regime statistics
+    
+    Memory usage: ~400x less than naive approach!
+    """
+    max_days = np.max(horizon_days)
+    n_horizons = len(horizon_days)
+    
+    # Terminal values at horizons only
+    terminal_vols = np.zeros((n_horizons, num_simulations, num_firms))
+    terminal_assets = np.zeros((n_horizons, num_simulations, num_firms))
+    default_indicators = np.zeros((n_horizons, num_simulations, num_firms))
+    regime_fractions = np.zeros((2, num_simulations, num_firms))  # [regime_0_frac, regime_1_frac]
+    
+    # Statistics accumulators
+    vol_means = np.zeros((num_simulations, num_firms))
+    vol_stds_accum = np.zeros((num_simulations, num_firms))
+    vol_maxs = np.zeros((num_simulations, num_firms))
+    vol_mins = np.zeros((num_simulations, num_firms))
+    
+    for sim in numba.prange(num_simulations):
+        # Initialize regime (0 or 1)
+        regime = np.zeros(num_firms, dtype=np.int32)
+        for f in range(num_firms):
+            if np.random.uniform(0.0, 1.0) < initial_regime_probs[f]:
+                regime[f] = 1
+        
+        r_prev = np.zeros(num_firms)
+        asset_value = v0_arr.copy()
+        defaulted = np.zeros(num_firms)
+        regime_0_count = np.zeros(num_firms)
+        regime_1_count = np.zeros(num_firms)
+        
+        # Initialize statistics
+        for f in range(num_firms):
+            if regime[f] == 0:
+                sigma_init = sigma_0[f]
+            else:
+                sigma_init = sigma_1[f]
+            vol_maxs[sim, f] = sigma_init
+            vol_mins[sim, f] = sigma_init
+        
+        for day in range(max_days):
+            # Regime transitions
+            for f in range(num_firms):
+                # Track regime time
+                if regime[f] == 0:
+                    regime_0_count[f] += 1.0
+                    if np.random.uniform(0.0, 1.0) < trans_01[f]:
+                        regime[f] = 1
+                else:
+                    regime_1_count[f] += 1.0
+                    if np.random.uniform(0.0, 1.0) < trans_10[f]:
+                        regime[f] = 0
+            
+            for f in range(num_firms):
+                # Get parameters based on current regime
+                if regime[f] == 0:
+                    mu = mu_0[f]
+                    ar = ar_0[f]
+                    sigma = sigma_0[f]
+                    nu = nu_0[f]
+                else:
+                    mu = mu_1[f]
+                    ar = ar_1[f]
+                    sigma = sigma_1[f]
+                    nu = nu_1[f]
+                
+                # Update running vol statistics (Welford's algorithm)
+                old_mean = vol_means[sim, f]
+                vol_means[sim, f] += (sigma - old_mean) / (day + 1)
+                vol_stds_accum[sim, f] += (sigma - old_mean) * (sigma - vol_means[sim, f])
+                
+                if sigma > vol_maxs[sim, f]:
+                    vol_maxs[sim, f] = sigma
+                if sigma < vol_mins[sim, f]:
+                    vol_mins[sim, f] = sigma
+                
+                # Generate t-distributed innovation
+                z_raw = sample_standardized_t(nu)
+                z = max(min(z_raw, 5.0), -5.0)  # Cap innovations
+                
+                # AR(1) return
+                r_curr = mu + ar * r_prev[f] + sigma * z
+                r_prev[f] = r_curr
+                
+                # Simulate asset return (log prices)
+                asset_value[f] *= np.exp(r_curr)
+                
+                # Check for default
+                if asset_value[f] < liability_arr[f]:
+                    defaulted[f] = 1.0
+                
+                # Store terminal values at horizons
+                for h_idx in range(n_horizons):
+                    if day == horizon_days[h_idx] - 1:
+                        terminal_vols[h_idx, sim, f] = sigma
+                        terminal_assets[h_idx, sim, f] = asset_value[f]
+                        default_indicators[h_idx, sim, f] = defaulted[f]
+        
+        # Finalize statistics
+        for f in range(num_firms):
+            vol_stds_accum[sim, f] = np.sqrt(vol_stds_accum[sim, f] / max_days)
+            total_days = regime_0_count[f] + regime_1_count[f]
+            regime_fractions[0, sim, f] = regime_0_count[f] / total_days
+            regime_fractions[1, sim, f] = regime_1_count[f] / total_days
+    
+    return (terminal_vols, terminal_assets, default_indicators,
+            vol_means, vol_stds_accum, vol_maxs, vol_mins, regime_fractions)
+
+
 def monte_carlo_regime_switching_1year(
     garch_file, 
     regime_params_file,
@@ -241,7 +366,10 @@ def monte_carlo_regime_switching_1year(
 
 def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     """
-    Process Monte Carlo regime-switching simulation for a single date (for parallelization).
+    OPTIMIZED Process Monte Carlo regime-switching simulation for a single date.
+    
+    Now only stores terminal values at 1y/3y/5y horizons instead of all daily values!
+    Memory usage reduced by ~400x.
     """
     # Unpack updated tuple
     if len(date_data) == 5:
@@ -259,7 +387,6 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     # Prepare arrays for vectorized simulation
     n_firms = len(firms_on_date)
     mu_0_arr = np.zeros(n_firms)
-
     mu_1_arr = np.zeros(n_firms)
     ar_0_arr = np.zeros(n_firms)
     ar_1_arr = np.zeros(n_firms)
@@ -271,6 +398,9 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     trans_01_arr = np.zeros(n_firms)
     trans_10_arr = np.zeros(n_firms)
     trans_11_arr = np.zeros(n_firms)
+    v0_arr = np.zeros(n_firms)
+    liability_arr = np.zeros(n_firms)
+    rf_rate_arr = np.full(n_firms, np.nan)
     
     valid_firms = []
     for f_idx, firm in enumerate(firms_on_date):
@@ -289,6 +419,23 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
         trans_01_arr[f_idx] = params['transition_prob_01']
         trans_10_arr[f_idx] = params['transition_prob_10']
         trans_11_arr[f_idx] = params['transition_prob_11']
+        
+        # Prepare Merton parameters
+        if firm in merton_data_dict:
+            m_data = merton_data_dict[firm]
+            v0_raw = m_data.get('asset_value', 0.0)
+            liability_raw = m_data.get('liabilities_total', 0.0)
+            rf = m_data.get('risk_free_rate', np.nan)
+            
+            # Adjust units if needed (ensure decimal)
+            if not np.isnan(rf) and abs(rf) > 0.5:
+                rf = rf / 100.0
+            
+            if not np.isnan(v0_raw) and not np.isnan(liability_raw) and v0_raw > 0:
+                v0_arr[f_idx] = v0_raw
+                liability_arr[f_idx] = liability_raw
+                rf_rate_arr[f_idx] = rf
+        
         valid_firms.append((f_idx, firm))
     
     if len(valid_firms) == 0:
@@ -297,88 +444,110 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     # Initial regime probabilities
     initial_regime_probs = np.full(n_firms, 0.5)
     
-    # Run vectorized Monte Carlo
-    daily_vols, regime_paths, daily_returns = simulate_regime_switching_paths_vectorized(
-        mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr, nu_0_arr, nu_1_arr,
-        trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
-        num_simulations, num_days, n_firms, initial_regime_probs
-    )
+    # Define horizons: 1y, 3y, 5y (trading days)
+    horizon_days = np.array([252, 756, 1260], dtype=np.int32)
     
-    # YEARLY VARIANCE & PD CALCULATION (Asset Value Simulation Method)
-    # Use returns from simulation which include t-distribution and AR dynamics
-    assets_daily_returns = daily_returns
+    # Run FULLY OPTIMIZED vectorized Monte Carlo - calculates EVERYTHING in one pass!
+    (terminal_vols, terminal_assets, default_indicators,
+     vol_means, vol_stds, vol_maxs, vol_mins, regime_fractions) = \
+        simulate_regime_switching_paths_fully_optimized(
+            mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr, nu_0_arr, nu_1_arr,
+            trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
+            num_simulations, n_firms, horizon_days, initial_regime_probs,
+            v0_arr, liability_arr
+        )
     
-    # Cumulative returns: V_t = V_0 * exp(sum(r))
-    # Shape: (num_days, num_simulations, num_firms)
-    cumulative_log_returns = np.cumsum(assets_daily_returns, axis=0)
-    cumulative_returns = np.exp(cumulative_log_returns)
-    
-    # Variance of the CUMULATIVE LOG RETURN (annual variance)
-    path_cumulative_log_return_final = cumulative_log_returns[-1, :, :]
-    integrated_variances = np.var(path_cumulative_log_return_final, axis=0, ddof=1)
-    
-    # Other stats
-    mean_daily_vols = np.mean(daily_vols, axis=(0, 1))
-    mean_regime_0 = np.mean(regime_paths == 0, axis=(0, 1))
-    mean_regime_1 = np.mean(regime_paths == 1, axis=(0, 1))
-    
-    # Append results for valid firms
+    # Extract results for valid firms
     for f_idx, firm in valid_firms:
-        # Calculate Probability of Default (PD)
-        pd_value = np.nan
-        mc_spread = np.nan
-        mc_debt_value = np.nan
+        # Extract terminal values at each horizon for this firm
+        firm_vols_1y = terminal_vols[0, :, f_idx]  # shape: (num_simulations,)
+        firm_vols_3y = terminal_vols[1, :, f_idx]
+        firm_vols_5y = terminal_vols[2, :, f_idx]
         
-        if firm in merton_data_dict:
-             m_data = merton_data_dict[firm]
-             v0 = m_data.get('asset_value', np.nan)
-             liability = m_data.get('liabilities_total', np.nan)
-             rf = m_data.get('risk_free_rate', np.nan)
-             
-             # Adjust units if needed (ensure decimal)
-             if not np.isnan(rf) and abs(rf) > 0.5:
-                 rf = rf / 100.0
-             
-             if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
-                 # Calculate asset paths: V_t = V_0 * cumulative_returns[t]
-                 # cumulative_returns shape: (num_days, num_simulations, n_firms)
-                 firm_cum_returns = cumulative_returns[:, :, f_idx]
-                 
-                 firm_asset_paths = v0 * firm_cum_returns
-                 
-                 # Check default condition (Asset < Liability) at any point
-                 is_below_barrier = firm_asset_paths < liability
-                 
-                 # Did default happen at any time step?
-                 path_defaulted = np.any(is_below_barrier, axis=0)
-                 
-                 pd_value = np.mean(path_defaulted)
-                 
-                 # ---- METHOD 1: MC PRICING OF RISKY DEBT ----
-                 # Simplified Method: Use Terminal Value from same paths as PD
-                 V_T_paths = firm_asset_paths[-1, :]
-                 
-                 # Price Debt: D = e^(-rT) * E[min(V_T, K)]
-                 payoffs = np.minimum(V_T_paths, liability)
-                 
-                 discount_factor = np.exp(-rf * num_days/252)
-                 expected_payoff = np.mean(payoffs)
-                 D = discount_factor * expected_payoff
-                 
-                 if D > 0:
-                     mc_spread = -1.0/(num_days/252) * np.log(D/liability) - rf
-                     mc_debt_value = D
+        firm_assets_1y = terminal_assets[0, :, f_idx]
+        firm_assets_3y = terminal_assets[1, :, f_idx]
+        firm_assets_5y = terminal_assets[2, :, f_idx]
+        
+        firm_defaulted_1y = default_indicators[0, :, f_idx]
+        firm_defaulted_3y = default_indicators[1, :, f_idx]
+        firm_defaulted_5y = default_indicators[2, :, f_idx]
+        
+        # Get summary statistics
+        firm_vol_mean = np.mean(vol_means[:, f_idx])
+        firm_vol_std = np.mean(vol_stds[:, f_idx])
+        firm_vol_max = np.max(vol_maxs[:, f_idx])
+        firm_vol_min = np.min(vol_mins[:, f_idx])
+        
+        # Integrated variance from 5-year terminal values
+        integrated_variance = np.var(firm_vols_5y, ddof=1)
+        
+        # Regime fractions
+        regime_0_frac = np.mean(regime_fractions[0, :, f_idx])
+        regime_1_frac = np.mean(regime_fractions[1, :, f_idx])
+        
+        # Calculate PD from pre-computed default indicators
+        pd_value_1y = np.mean(firm_defaulted_1y)
+        pd_value_3y = np.mean(firm_defaulted_3y)
+        pd_value_5y = np.mean(firm_defaulted_5y)
+        
+        # Calculate CDS spreads
+        mc_spread_1y, mc_spread_3y, mc_spread_5y = np.nan, np.nan, np.nan
+        mc_debt_1y, mc_debt_3y, mc_debt_5y = np.nan, np.nan, np.nan
+        
+        if v0_arr[f_idx] > 0 and liability_arr[f_idx] > 0 and not np.isnan(rf_rate_arr[f_idx]):
+            rf = rf_rate_arr[f_idx]
+            liability = liability_arr[f_idx]
+            
+            # 1-Year CDS Spread
+            expected_payoff_1y = np.mean(np.minimum(firm_assets_1y, liability))
+            T_years = 1.0
+            discount_factor = np.exp(-rf * T_years)
+            debt_val_1y = expected_payoff_1y * discount_factor
+            if debt_val_1y > 0 and liability > 0:
+                ytm = -np.log(debt_val_1y / liability) / T_years
+                mc_spread_1y = max(ytm - rf, 0.0)
+                mc_debt_1y = debt_val_1y
+            
+            # 3-Year CDS Spread
+            expected_payoff_3y = np.mean(np.minimum(firm_assets_3y, liability))
+            T_years = 3.0
+            discount_factor = np.exp(-rf * T_years)
+            debt_val_3y = expected_payoff_3y * discount_factor
+            if debt_val_3y > 0 and liability > 0:
+                ytm = -np.log(debt_val_3y / liability) / T_years
+                mc_spread_3y = max(ytm - rf, 0.0)
+                mc_debt_3y = debt_val_3y
+            
+            # 5-Year CDS Spread
+            expected_payoff_5y = np.mean(np.minimum(firm_assets_5y, liability))
+            T_years = 5.0
+            discount_factor = np.exp(-rf * T_years)
+            debt_val_5y = expected_payoff_5y * discount_factor
+            if debt_val_5y > 0 and liability > 0:
+                ytm = -np.log(debt_val_5y / liability) / T_years
+                mc_spread_5y = max(ytm - rf, 0.0)
+                mc_debt_5y = debt_val_5y
+        
+        # Legacy compatibility
+        pd_value = pd_value_1y
 
         results_list.append({
             'gvkey': firm,
             'date': date,
-            'rs_integrated_variance': integrated_variances[f_idx],
-            'rs_mean_daily_volatility': mean_daily_vols[f_idx],
-            'rs_fraction_regime_0': mean_regime_0[f_idx],
-            'rs_fraction_regime_1': mean_regime_1[f_idx],
+            'rs_integrated_variance': integrated_variance,
+            'rs_mean_daily_volatility': firm_vol_mean,
+            'rs_fraction_regime_0': regime_0_frac,
+            'rs_fraction_regime_1': regime_1_frac,
             'rs_probability_of_default': pd_value,
-            'rs_implied_spread': mc_spread,
-            'rs_debt_value': mc_debt_value
+            'rs_pd_1y': pd_value_1y,
+            'rs_pd_3y': pd_value_3y,
+            'rs_pd_5y': pd_value_5y,
+            'rs_implied_spread_1y': mc_spread_1y,
+            'rs_implied_spread_3y': mc_spread_3y,
+            'rs_implied_spread_5y': mc_spread_5y,
+            'rs_debt_value_1y': mc_debt_1y,
+            'rs_debt_value_3y': mc_debt_3y,
+            'rs_debt_value_5y': mc_debt_5y,
         })
     
     return results_list
@@ -389,12 +558,12 @@ def monte_carlo_regime_switching_1year_parallel(
     regime_params_file,
     gvkey_selected=None, 
     num_simulations=1000, 
-    num_days=252,
+    num_days=1260,
     n_jobs=-1,
     merton_df=None
 ):
     """
-    PARALLELIZED Monte Carlo regime-switching forecast for 1 year.
+    PARALLELIZED Monte Carlo regime-switching forecast for 1-5 years (default 1260 days/5 years).
     
     This version processes different dates in parallel for significant speedup.
     """
