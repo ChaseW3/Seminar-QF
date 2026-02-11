@@ -22,7 +22,7 @@ import numba
 from scipy import stats
 from joblib import Parallel, delayed
 
-os.makedirs('./intermediates/', exist_ok=True)
+# Cache directory removed
 
 
 # =============================================================================
@@ -647,7 +647,7 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
             
             # Run MS-GARCH Monte Carlo with t-distribution
             # NOTE: JIT function expects arrays, so wrap scalars in np.array([...])
-            daily_vols, regime_paths = simulate_ms_garch_paths_t_dist(
+            daily_vols, regime_paths, daily_sim_returns = simulate_ms_garch_paths_t_dist(
                 np.array([params['omega_0']]), np.array([params['omega_1']]),
                 np.array([params['alpha_0']]), np.array([params['alpha_1']]),
                 np.array([params['beta_0']]), np.array([params['beta_1']]),
@@ -662,13 +662,12 @@ def _process_single_date_msgarch_mc(date_data, num_simulations, num_days):
             # Extract firm results (firm index 0 since processing one firm)
             firm_vols = daily_vols[:, :, 0]  # shape: (num_days, num_simulations)
             firm_regimes = regime_paths[:, :, 0]  # shape: (num_days, num_simulations)
+            firm_daily_returns = daily_sim_returns[:, :, 0] # Use simulated returns (t-distributed)
             
             # Calculate statistics - ASSET VALUE SIMULATION METHOD
-            # 1. Generate random innovations (standard normal)
-            z_innovations = np.random.standard_normal(firm_vols.shape)
-            
-            # 2. Daily returns: R_t ~ N(0, sigma_t)
-            firm_daily_returns = firm_vols * z_innovations
+            # 1. Use simulated returns directly
+            # 2. Calculate daily asset returns: R_t from simulation
+            # (No need to regenerate z_innovations here, we use the ones from simulation)
             
             # 3. Cumulative yearly return
             firm_cumulative_returns = np.prod(1.0 + firm_daily_returns, axis=0) - 1.0

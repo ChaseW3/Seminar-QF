@@ -29,8 +29,7 @@ import time
 from datetime import timedelta
 from scipy.special import ndtr
 
-CACHE_DIR = './intermediates/'
-os.makedirs(CACHE_DIR, exist_ok=True)
+# Cache directory removed
 
 
 class CDSSpreadCalculator:

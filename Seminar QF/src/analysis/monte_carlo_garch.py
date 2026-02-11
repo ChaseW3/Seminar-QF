@@ -8,7 +8,7 @@ import numba
 from scipy import stats
 from joblib import Parallel, delayed
 
-os.makedirs('./intermediates/', exist_ok=True)
+# Cache directory removed
 
 
 # =============================================================================

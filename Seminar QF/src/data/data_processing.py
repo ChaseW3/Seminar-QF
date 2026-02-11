@@ -23,9 +23,6 @@ SHEET_EQUITY = 0
 SHEET_LIABILITY = 1
 MIN_OBSERVATIONS = 150
 T_HORIZON = 1.0
-CACHE_DIR = config.INTERMEDIATES_DIR
-
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 def load_interest_rates():
@@ -338,14 +335,13 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
     return results
 
 
-def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=True):
+def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False):
     """
     Runs the rolling window iterative Merton model on DAILY data (OPTIMIZED).
     
     Uses:
     - Vectorization with NumPy for speed
     - Parallelization with joblib over firms
-    - Caching of results
     - EXACT scipy.special.ndtr (no approximation)
     
     Parameters:
@@ -357,7 +353,7 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=True)
     n_jobs : int
         Number of parallel jobs. -1 = use all cores
     use_cache : bool
-        Whether to use cached results if available
+        Deprecated. Caching has been removed.
     
     Returns:
     --------
@@ -370,26 +366,6 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=True)
     print(f"\n{'='*80}")
     print("MERTON MODEL ESTIMATION (Vectorized + Parallelized - EXACT ndtr)")
     print(f"{'='*80}\n")
-    
-    # Check cache
-    cache_file = os.path.join(CACHE_DIR, 'merton_results_cache.pkl')
-    if use_cache and os.path.exists(cache_file):
-        print("Loading cached Merton results...")
-        try:
-            merton_results = pd.read_pickle(cache_file)
-            print(f"✓ Loaded {len(merton_results):,} cached results\n")
-            df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
-            
-            daily_returns_df = merton_results.copy().sort_values(["gvkey", "date"])
-            daily_returns_df["asset_return_daily"] = daily_returns_df.groupby("gvkey")["asset_value"].transform(
-                lambda x: np.log(x / x.shift(1))
-            )
-            daily_returns_df["asset_volatility"] = daily_returns_df["asset_volatility"] / np.sqrt(252)
-            daily_returns_df = daily_returns_df[["gvkey", "date", "asset_return_daily", "asset_value", "asset_volatility"]].dropna()
-            
-            return df_merged, daily_returns_df
-        except Exception as e:
-            print(f"⚠ Cache load failed ({e}), recomputing...\n")
     
     # Filter valid data
     solver_df = df.dropna(subset=["mkt_cap", "liabilities_total"]).copy()
@@ -431,11 +407,6 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=True)
     parallel_time = time.time() - start_parallel
     print(f"\n✓ Parallel Merton complete in {timedelta(seconds=int(parallel_time))}\n")
     
-    # Cache results
-    print(f"Caching {len(merton_results):,} Merton results...")
-    merton_results.to_pickle(cache_file)
-    print(f"✓ Cached to: {cache_file}\n")
-    
     # Merge back to main DF
     df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
     
@@ -444,7 +415,35 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=True)
     daily_returns_df["asset_return_daily"] = daily_returns_df.groupby("gvkey")["asset_value"].transform(
         lambda x: np.log(x / x.shift(1))
     )
+
+    # --- DIAGNOSTICS FOR EXTREME RETURNS ---
+    print("\n" + "="*60)
+    print("EXTREME ASSET RETURN DIAGNOSTICS")
+    print("="*60)
     
+    # Check absolute returns > 30%, 40%, 50%
+    diag_df = daily_returns_df.dropna(subset=['asset_return_daily'])
+    
+    for threshold in [0.30, 0.40, 0.50]:
+        # Using ABSOLUTE return to catch both crashes and surges
+        extreme_rows = diag_df[diag_df['asset_return_daily'].abs() > threshold]
+        
+        print(f"\n[Threshold: Absolute Return > {threshold*100:.0f}%]")
+        if extreme_rows.empty:
+            print("  No extreme returns found at this level.")
+        else:
+            print(f"  Found {len(extreme_rows)} instances:")
+            # Group by firm for organized output
+            for gvkey, group in extreme_rows.groupby('gvkey'):
+                print(f"  • Firm {gvkey}:")
+                for _, row in group.iterrows():
+                    ret_val = row['asset_return_daily']
+                    date_str = pd.Timestamp(row['date']).strftime('%Y-%m-%d')
+                    print(f"      {date_str}: {ret_val*100:+.2f}%")
+    
+    print("="*60 + "\n")
+    # ---------------------------------------
+
     # ADD SCALE RETURNS (Multiply by 100) for numerical stability in optimization
     # This centralized scaling ensures all models work on the same scaled data
     daily_returns_df["asset_return_daily_scaled"] = daily_returns_df["asset_return_daily"] * 100.0
