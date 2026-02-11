@@ -194,15 +194,6 @@ def run_regime_switching_estimation(daily_returns_df):
         if not scaled_available:
              returns = returns * calc_scale_factor
         
-        # Winsorize extreme outliers to prevent numerical instability
-        # Threshold: ±50% daily return (±50 on scaled data)
-        # More aggressive to handle firms with multiple extreme events
-        outlier_threshold = 50.0
-        n_outliers = np.sum(np.abs(returns) > outlier_threshold)
-        if n_outliers > 0:
-            print(f"  {gvkey}: Winsorizing {n_outliers} outliers (>±{outlier_threshold}%)")
-            returns = np.clip(returns, -outlier_threshold, outlier_threshold)
-        
         if len(returns) < 150:
             print(f"Skipping {gvkey}: insufficient data ({len(returns)})")
             continue

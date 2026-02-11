@@ -18,24 +18,23 @@ os.makedirs('./intermediates/', exist_ok=True)
 @numba.jit(nopython=True)
 def sample_standardized_t(nu):
     """
-    OPTIMIZED: Generate a standardized t-distributed random variable using Numba.
+    Generate a standardized t-distributed random variable using Numba.
     
-    For nu < 30, uses simple variance scaling approximation: N(0, nu/(nu-2))
-    For nu >= 30, uses standard normal (t-dist converges to normal)
-    
-    This avoids the expensive loop-based chi-squared generation while maintaining
-    accurate heavy-tail properties for regime-switching models.
+    Uses the representation: t(ν) = Z / sqrt(V/ν) where Z ~ N(0,1), V ~ χ²(ν)
+    Then standardizes so variance = 1: multiply by sqrt((ν-2)/ν)
     """
     if nu <= 2:
         return np.random.standard_normal()
-    elif nu >= 30:
-        # For large df, t-distribution is approximately normal
-        return np.random.standard_normal()
-    else:
-        # For moderate df, use variance-scaled normal as approximation
-        # This captures the heavy tails without expensive chi-squared sampling
-        scale = np.sqrt(nu / (nu - 2.0))
-        return np.random.standard_normal() * scale
+    
+    z = np.random.standard_normal()
+    v = 0.0
+    nu_int = int(nu)
+    for _ in range(nu_int):
+        v += np.random.standard_normal() ** 2
+    
+    t_sample = z / np.sqrt(v / nu)
+    scale = np.sqrt((nu - 2) / nu)
+    return t_sample * scale
 
 @numba.jit(nopython=True, parallel=True)
 def simulate_regime_switching_paths_vectorized(
@@ -44,21 +43,12 @@ def simulate_regime_switching_paths_vectorized(
     num_simulations, num_days, num_firms, initial_regime_probs
 ):
     """
-    OPTIMIZED: Vectorized regime-switching Monte Carlo simulation with T-DISTRIBUTION.
-    
-    Key optimizations:
-    1. Pre-generate all random numbers (regime transitions and innovations)
-    2. Vectorized regime transition logic using boolean masks
-    3. Efficient t-distribution sampling (no chi-squared loops)
+    Vectorized regime-switching Monte Carlo simulation with T-DISTRIBUTION.
     """
     
     daily_volatilities = np.zeros((num_days, num_simulations, num_firms))
     daily_returns = np.zeros((num_days, num_simulations, num_firms))
     regime_paths = np.zeros((num_days, num_simulations, num_firms), dtype=np.int32)
-    
-    # OPTIMIZATION 1: Pre-generate ALL random numbers for regime transitions
-    # Shape: (num_days, num_simulations, num_firms)
-    regime_rand = np.random.uniform(0.0, 1.0, (num_days, num_simulations, num_firms))
     
     for sim in numba.prange(num_simulations):
         # Initialize regime (0 or 1)
@@ -72,15 +62,13 @@ def simulate_regime_switching_paths_vectorized(
         r_prev = np.zeros(num_firms)
         
         for day in range(num_days):
-            # OPTIMIZATION 2: Vectorized regime transitions using pre-generated random numbers
-            # Use boolean masks instead of loops
+            # Regime transitions
             for f in range(num_firms):
-                rand_val = regime_rand[day, sim, f]
                 if regime[f] == 0:
-                    if rand_val < trans_01[f]:
+                    if np.random.uniform(0.0, 1.0) < trans_01[f]:
                         regime[f] = 1
                 else:
-                    if rand_val < trans_10[f]:
+                    if np.random.uniform(0.0, 1.0) < trans_10[f]:
                         regime[f] = 0
             
             for f in range(num_firms):
@@ -95,7 +83,7 @@ def simulate_regime_switching_paths_vectorized(
                     sigma = sigma_1[f]
                     nu = nu_1[f]
                     
-                # Generate t-distributed innovation (now optimized - no loops)
+                # Generate t-distributed innovation
                 z = sample_standardized_t(nu)
                 # Cap innovations
                 z = max(min(z, 5.0), -5.0)

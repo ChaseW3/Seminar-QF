@@ -149,14 +149,12 @@ def load_and_preprocess_data():
     return df
 
 
-def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=200, tol=1e-5):
+def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=100, tol=1e-4):
     """
     Vectorized Newton-Raphson solver for Merton model (EXACT - NO APPROXIMATION).
     
     Uses scipy.special.ndtr for EXACT normal CDF (not approximation).
     NO Numba JIT - uses pure NumPy for vectorization.
-    
-    IMPROVED: Better initialization and constraints for highly leveraged firms.
     
     Parameters:
     -----------
@@ -165,8 +163,8 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=2
     sigma_A : float, Initial asset volatility (daily)
     r : float, Risk-free rate
     T_val : float, Time horizon (252 for 1 year daily)
-    max_iter : int, Max iterations for Newton-Raphson (increased to 200)
-    tol : float, Convergence tolerance (tightened to 1e-5)
+    max_iter : int, Max iterations for Newton-Raphson
+    tol : float, Convergence tolerance
     
     Returns:
     --------
@@ -174,45 +172,14 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=2
     sigma_A_current : float, Final asset volatility (daily)
     """
     
-    # IMPROVED INITIALIZATION for highly leveraged firms
-    # Strategy: Start conservatively with V_A slightly above liabilities
-    # rather than E + B which can be unstable when E << B
-    leverage_ratio = B_vec / E_vec
-    
-    # Three-tier initialization based on leverage severity
-    ultra_high_leverage_mask = leverage_ratio > 30  # BNP, Intesa level
-    high_leverage_mask = (leverage_ratio > 20) & (leverage_ratio <= 30)
-    normal_leverage_mask = leverage_ratio <= 20
-    
-    V_A_vec = np.zeros_like(E_vec, dtype=np.float64)
-    
-    # Ultra-high leverage (>30×): Start at E + B (traditional, more stable)
-    # Paradoxically, starting too close to debt causes instability for ultra-high leverage
-    V_A_vec[ultra_high_leverage_mask] = (E_vec[ultra_high_leverage_mask] + 
-                                          B_vec[ultra_high_leverage_mask])
-    
-    # High leverage (20-30×): Start 5% above debt
-    V_A_vec[high_leverage_mask] = B_vec[high_leverage_mask] * 1.05
-    
-    # Normal leverage (<20×): Traditional initialization
-    V_A_vec[normal_leverage_mask] = (E_vec[normal_leverage_mask] + 
-                                      B_vec[normal_leverage_mask])
-    
-    V_A_vec = np.maximum(V_A_vec, E_vec + B_vec * 0.01)  # Ensure V_A >= E + 1% of debt
-    
+    V_A_vec = E_vec.astype(np.float64) + B_vec.astype(np.float64)  # Initial guess
     sigma_A_current = np.float64(sigma_A)
-    
-    # Store previous V_A to detect oscillations
-    V_A_prev = V_A_vec.copy()
-    # Store previous V_A to detect oscillations
-    V_A_prev = V_A_vec.copy()
     
     for k in range(max_iter):
         sigma_A_old = sigma_A_current
         
         # Inner Loop: Newton-Raphson for V_A (vectorized)
-        # Increased inner iterations for better convergence
-        for inner_iter in range(10):
+        for _ in range(5):
             V_A_vec = np.maximum(V_A_vec, 1e-4)
             sig_sqrt_T = sigma_A_current * np.sqrt(T_val)
             sig2_half = 0.5 * sigma_A_current ** 2
@@ -233,61 +200,9 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=2
             safe_mask = f_prime > 1e-5
             step[safe_mask] = f_val[safe_mask] / f_prime[safe_mask]
             
-            # DAMPING for stability: Use smaller steps for highly leveraged firms
-            damping_factor = np.ones_like(V_A_vec)
-            damping_factor[ultra_high_leverage_mask] = 0.3  # 30% step for ultra-high leverage (>30×)
-            damping_factor[high_leverage_mask] = 0.5  # 50% step size for high leverage (20-30×)
-            
-            V_A_vec = V_A_vec - damping_factor * step
-            
-            # CONSTRAINT: Stricter bounds for ultra-high leverage firms
-            # Keep V_A within reasonable range to prevent jumping between equilibria
-            V_A_min = E_vec + B_vec * 0.01
-            
-            # Maximum V_A depends on leverage:
-            # Ultra-high leverage: Cap at E + 2×B (very tight constraint)
-            # High leverage: Cap at E + 3×B  
-            # Normal: Cap at 2×(E + B)
-            V_A_max = np.zeros_like(V_A_vec)
-            V_A_max[ultra_high_leverage_mask] = (E_vec[ultra_high_leverage_mask] + 
-                                                  2.0 * B_vec[ultra_high_leverage_mask])
-            V_A_max[high_leverage_mask] = (E_vec[high_leverage_mask] + 
-                                           3.0 * B_vec[high_leverage_mask])
-            V_A_max[normal_leverage_mask] = 2.0 * (E_vec[normal_leverage_mask] + 
-                                                    B_vec[normal_leverage_mask])
-            
-            V_A_vec = np.clip(V_A_vec, V_A_min, V_A_max)
-            
-            # Check for convergence in inner loop
-            if inner_iter > 0 and np.max(np.abs(step)) < 1e-6:
-                break
+            V_A_vec = V_A_vec - step
         
         V_A_vec = np.maximum(V_A_vec, 1e-4)
-        
-        # Detect oscillation: if V_A is jumping back and forth, average the solutions
-        # More aggressive averaging for ultra-high leverage firms
-        if k > 0:
-            oscillation = np.abs(V_A_vec - V_A_prev) / V_A_prev
-            
-            # Ultra-high leverage: Average if change > 20%
-            # High leverage: Average if change > 30%
-            # Normal: Average if change > 50%
-            oscillating_mask = np.zeros_like(V_A_vec, dtype=bool)
-            oscillating_mask[ultra_high_leverage_mask] = oscillation[ultra_high_leverage_mask] > 0.2
-            oscillating_mask[high_leverage_mask] = oscillation[high_leverage_mask] > 0.3
-            oscillating_mask[normal_leverage_mask] = oscillation[normal_leverage_mask] > 0.5
-            
-            if np.any(oscillating_mask):
-                # Average current and previous to stabilize
-                # Use weighted average favoring previous solution for ultra-high leverage
-                weight_current = np.ones_like(V_A_vec) * 0.5
-                weight_current[ultra_high_leverage_mask] = 0.3  # Favor previous solution more
-                weight_current[high_leverage_mask] = 0.4
-                
-                V_A_vec[oscillating_mask] = (weight_current[oscillating_mask] * V_A_vec[oscillating_mask] + 
-                                              (1 - weight_current[oscillating_mask]) * V_A_prev[oscillating_mask])
-        
-        V_A_prev = V_A_vec.copy()
         
         # Outer Update: sigma_A from asset returns (daily)
         log_V_A = np.log(V_A_vec)
@@ -298,18 +213,6 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=2
         if np.sum(valid_mask) >= 10:
             # Calculate annualized volatility from daily returns (assuming 252 trading days)
             sigma_A_new = np.std(ret_A[valid_mask]) * np.sqrt(252)
-            
-            # CONSTRAINT: Tighter volatility bounds for ultra-high leverage firms
-            # These firms need much more conservative volatility estimates
-            if np.any(ultra_high_leverage_mask):
-                # Ultra-high leverage (>30×): Cap at 50% annual volatility
-                sigma_A_new = np.clip(sigma_A_new, 0.005, 0.5)
-            elif np.any(high_leverage_mask):
-                # High leverage (20-30×): Cap at 100% annual volatility  
-                sigma_A_new = np.clip(sigma_A_new, 0.005, 1.0)
-            else:
-                # Normal: Allow up to 200% annual volatility
-                sigma_A_new = np.clip(sigma_A_new, 0.005, 2.0)
             
             # Check convergence
             if abs(sigma_A_new - sigma_A_old) < tol:
@@ -373,9 +276,8 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         # Use T = 365/360 consistent with ACT/360 money market convention for rates
         T_val = 1
         try:
-            # IMPROVED: More iterations and tighter tolerance for better convergence
             V_A_vec, sigma_A = merton_newton_raphson_vectorized(
-                E_vec, B_vec, sigma_E_annual, r_annual, T_val, max_iter=200, tol=1e-5
+                E_vec, B_vec, sigma_E_annual, r_annual, T_val, max_iter=100, tol=1e-4
             )
         except Exception as e:
             print(f"    ⚠ Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
