@@ -172,7 +172,7 @@ def load_and_preprocess_data():
     return df
 
 
-def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=100, tol=1e-4):
+def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=1000, tol=1e-6):
     """
     Vectorized Newton-Raphson solver for Merton model (EXACT - NO APPROXIMATION).
     
@@ -195,14 +195,19 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=1
     sigma_A_current : float, Final asset volatility (daily)
     """
     
-    V_A_vec = E_vec.astype(np.float64) + B_vec.astype(np.float64)  # Initial guess
+    # Better initial guess for V_A: Equity + Present Value of Debt (Risk-free proxy)
+    # This is closer to the true asset value than E + B (which overestimates)
+    # V_A ~ E + B * exp(-rT)
+    V_A_vec = E_vec.astype(np.float64) + B_vec.astype(np.float64) * np.exp(-r * T_val)
+    
     sigma_A_current = np.float64(sigma_A)
     
     for k in range(max_iter):
         sigma_A_old = sigma_A_current
         
         # Inner Loop: Newton-Raphson for V_A (vectorized)
-        for _ in range(5):
+        # Increased iterations for stability
+        for _ in range(20):
             V_A_vec = np.maximum(V_A_vec, 1e-4)
             sig_sqrt_T = sigma_A_current * np.sqrt(T_val)
             sig2_half = 0.5 * sigma_A_current ** 2
@@ -309,7 +314,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         T_val = 1
         try:
             V_A_vec, sigma_A = merton_newton_raphson_vectorized(
-                E_vec, B_vec, sigma_E_annual, r_annual, T_val, max_iter=100, tol=1e-4
+                E_vec, B_vec, sigma_E_annual, r_annual, T_val, max_iter=1000, tol=1e-6
             )
         except Exception as e:
             print(f"    ⚠ Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
