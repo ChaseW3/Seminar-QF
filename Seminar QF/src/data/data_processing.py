@@ -145,6 +145,29 @@ def load_and_preprocess_data():
     df = df.sort_values(["gvkey", "date"])
 
     print("Loaded liability data")
+
+    # --- MERGE INTEREST RATES ---
+    print("Merging interest rates from ECB data...")
+    try:
+        rates_df = load_interest_rates()
+        df['month_year'] = df['date'].dt.strftime('%Y-%m')
+        
+        # Merge rates (left join to keep all equity rows)
+        df = pd.merge(df, rates_df, on='month_year', how='left')
+        
+        # Check for missing rates
+        missing_count = df['risk_free_rate'].isna().sum()
+        if missing_count > 0:
+            print(f"Warning: {missing_count} rows have missing interest rates. Filling with forward/backward fill...")
+            df['risk_free_rate'] = df['risk_free_rate'].ffill().bfill().fillna(0.03) # Default 3% if all else fails
+        
+        df = df.drop(columns=['month_year'])
+        print(f"Successfully merged interest rates. Range: {df['risk_free_rate'].min():.4f} to {df['risk_free_rate'].max():.4f}")
+    except Exception as e:
+        print(f"⚠ Error merging interest rates: {e}")
+        # Ensure column exists even if merge failed to prevent downstream errors
+        if 'risk_free_rate' not in df.columns:
+            df['risk_free_rate'] = 0.03
     
     return df
 
@@ -247,8 +270,17 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
             continue
         
         # Get interest rate
-        month_str = pd.Timestamp(date_t).strftime('%Y-%m')
-        r_annual = interest_rates_dict.get(month_str, 0.05)
+        if 'risk_free_rate' in window_df.columns:
+            # Use the rate from the DataFrame (Point-In-Time) for the valuation date
+            r_vals = window_df.loc[window_df['date'] == date_t, 'risk_free_rate'].values
+            if len(r_vals) > 0:
+                r_annual = float(r_vals[0])
+            else:
+                month_str = pd.Timestamp(date_t).strftime('%Y-%m')
+                r_annual = interest_rates_dict.get(month_str, 0.05)
+        else:
+            month_str = pd.Timestamp(date_t).strftime('%Y-%m')
+            r_annual = interest_rates_dict.get(month_str, 0.05)
         
         # Inputs - liabilities already scaled in load_data()
         E_vec = window_df["mkt_cap"].values.astype(np.float64)
