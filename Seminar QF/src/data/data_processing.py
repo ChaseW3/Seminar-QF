@@ -122,7 +122,7 @@ def load_and_preprocess_data():
     # Merge strategy: Point-in-Time (PIT) using fdate
     # CRITICAL FIX: fdate represents when liability data becomes AVAILABLE
     # The liability value should apply to the period BEFORE that fdate
-    # direction='forward' means: use the NEXT available fdate's liability value
+    # direction='backward' means: use the PREVIOUS available fdate's liability value
     # This ensures liability from fdate 2011-12-31 applies to dates BEFORE 2011-12-31
     print("Merging liabilities using Point-in-Time (fdate) logic (backward-looking)...")
     
@@ -132,7 +132,7 @@ def load_and_preprocess_data():
         left_on="date", 
         right_on="fdate", 
         by="gvkey", 
-        direction="forward"  # Use NEXT fdate (so liability applies to period before fdate)
+        direction="backward"  # Use NEXT fdate (so liability applies to period before fdate)
     )
     
     # Sort back by firm and date
