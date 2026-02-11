@@ -194,6 +194,10 @@ def run_regime_switching_estimation(daily_returns_df):
         if not scaled_available:
              returns = returns * calc_scale_factor
         
+        # WINSORIZATION: Clip extreme returns
+        # Threshold: 30% daily return (returns are scaled by 100)
+        returns = np.clip(returns, -30.0, 30.0)
+        
         if len(returns) < 150:
             print(f"Skipping {gvkey}: insufficient data ({len(returns)})")
             continue

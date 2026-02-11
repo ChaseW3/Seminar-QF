@@ -972,6 +972,10 @@ def run_ms_garch_estimation_optimized(data_df,
                     returns = returns * 100.0
                     scale_factor = 100.0
             
+            # WINSORIZATION: Clip extreme returns
+            # Threshold: 30% daily return (returns are now scaled by 100)
+            returns = np.clip(returns, -30.0, 30.0)
+
             if len(returns) < 100:
                 if verbose:
                     print(f"  Skipping: insufficient data ({len(returns)} observations)")
