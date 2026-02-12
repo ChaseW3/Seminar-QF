@@ -177,8 +177,9 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
              # --- 1 Year ---
              idx_1y = horizons['1y'] - 1
              if idx_1y < asset_paths.shape[0]:
-                 # PD: Any touch below barrier up to horizon
-                 pd_value_1y = np.mean(np.any(asset_paths[:idx_1y+1, :] < liability, axis=0))
+                 # PD: Terminal Value ONLY (Merton)
+                 # Was: np.mean(np.any(asset_paths[:idx_1y+1, :] < liability, axis=0))
+                 pd_value_1y = np.mean(asset_paths[idx_1y, :] < liability)
                  
                  if not np.isnan(rf_rate):
                      V_T = asset_paths[idx_1y, :]
@@ -195,7 +196,8 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
              # --- 3 Year ---
              idx_3y = horizons['3y'] - 1
              if idx_3y < asset_paths.shape[0]:
-                 pd_value_3y = np.mean(np.any(asset_paths[:idx_3y+1, :] < liability, axis=0))
+                 # PD: Terminal Value ONLY (Merton)
+                 pd_value_3y = np.mean(asset_paths[idx_3y, :] < liability)
                  
                  if not np.isnan(rf_rate):
                      V_T = asset_paths[idx_3y, :]
@@ -212,7 +214,8 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
              # --- 5 Year ---
              idx_5y = horizons['5y'] - 1
              if idx_5y < asset_paths.shape[0]:
-                 pd_value_5y = np.mean(np.any(asset_paths[:idx_5y+1, :] < liability, axis=0))
+                 # PD: Terminal Value ONLY (Merton)
+                 pd_value_5y = np.mean(asset_paths[idx_5y, :] < liability)
                  
                  if not np.isnan(rf_rate):
                      V_T = asset_paths[idx_5y, :]
@@ -242,9 +245,12 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
             'merton_mc_mean_daily_volatility': np.mean(mean_path),
             'merton_mc_constant_annual_vol': merton_params[firm]['sigma_annual'],
             'merton_mc_probability_of_default': pd_value,
-            'merton_mc_pd_1y': pd_value_1y,
+            'merton_mc_pd_1y': pd_value_1y, # Now Terminal PD
             'merton_mc_pd_3y': pd_value_3y,
             'merton_mc_pd_5y': pd_value_5y,
+            'merton_mc_pd_terminal_1y': pd_value_1y, # Explicitly named
+            'merton_mc_pd_terminal_3y': pd_value_3y,
+            'merton_mc_pd_terminal_5y': pd_value_5y,
             'merton_mc_implied_spread_1y': mc_spread_1y,
             'merton_mc_implied_spread_3y': mc_spread_3y,
             'merton_mc_implied_spread_5y': mc_spread_5y,
@@ -466,6 +472,39 @@ def monte_carlo_merton_1year(merton_file, gvkey_selected=None,
 
 
 if __name__ == "__main__":
+    # --- Guardrail Test: Verify PD Logic ---
+    print("\n--- PD Logic Guardrail Test ---")
+    # Setup simple case
+    v0_test = 100.0
+    K_test = 80.0
+    sigma_daily_test = 0.02 # High Volatility
+    num_sims_test = 5000
+    num_days_test = 252
+    
+    # Manual simulation for validation
+    np.random.seed(42)
+    drift_test = -0.5 * sigma_daily_test**2
+    shocks_test = np.random.normal(0, 1, (num_days_test, num_sims_test))
+    log_returns_test = drift_test + sigma_daily_test * shocks_test
+    cum_returns_test = np.cumsum(log_returns_test, axis=0)
+    asset_paths_test = v0_test * np.exp(cum_returns_test)
+    
+    # 1. Terminal PD: V_T < K
+    pd_terminal_test = np.mean(asset_paths_test[-1, :] < K_test)
+    
+    # 2. Barrier PD: min(V_t) < K (First Passage)
+    pd_barrier_test = np.mean(np.min(asset_paths_test, axis=0) < K_test)
+    
+    print(f"Parameters: V0={v0_test}, K={K_test}, sigma={sigma_daily_test}, T={num_days_test}")
+    print(f"PD Terminal (Merton): {pd_terminal_test:.4f}")
+    print(f"PD Barrier (First Passage): {pd_barrier_test:.4f}")
+    
+    if pd_barrier_test >= pd_terminal_test:
+        print("✓ Guardrail Passed: Barrier PD >= Terminal PD")
+    else:
+        print("! WARNING: Barrier PD < Terminal PD (Unexpected)")
+    print("-------------------------------\n")
+
     # Example usage
     merton_file = "data/intermediates/merged_data_with_merton.csv"
     

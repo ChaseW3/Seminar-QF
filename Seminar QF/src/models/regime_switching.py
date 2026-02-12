@@ -7,6 +7,9 @@ from scipy.optimize import minimize
 from scipy.special import expit
 from numba import njit
 import sys
+# Parallel imports removed for performance optimization (overhead > benefit for this model)
+# from joblib import Parallel, delayed
+# import multiprocessing
 
 # Import config for output paths
 try:
@@ -44,12 +47,14 @@ def _t_log_likelihood(x, nu, sigma2):
     return const + kernel
 
 @njit(cache=True)
-def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
+def hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
     """
-    Hamilton filter for Regime Switching with t-distribution and CONSTANT volatility per regime.
+    Hamilton filter for Regime Switching with t-distribution.
+    Returns likelihood, filtered probabilities, AND predicted probabilities (needed for smoothing).
     """
     T = len(returns)
     filtered_prob = np.zeros((T, 2))
+    predicted_prob = np.zeros((T, 2))
     log_likelihood = 0.0
     
     P = np.array([[p00, 1 - p00], [1 - p11, p11]])
@@ -65,6 +70,11 @@ def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_
     for t in range(T):
         r = returns[t]
         
+        # 1. Prediction Step
+        pred_prob = P.T @ prev_filtered
+        predicted_prob[t, :] = pred_prob
+        
+        # 2. Update Step
         eps_0 = r - mu_0
         eps_1 = r - mu_1
         
@@ -79,7 +89,6 @@ def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_
             lik_0 = np.exp(ll_0 - max_ll)
             lik_1 = np.exp(ll_1 - max_ll)
             
-        pred_prob = P.T @ prev_filtered
         joint_0 = lik_0 * pred_prob[0]
         joint_1 = lik_1 * pred_prob[1]
         
@@ -95,141 +104,384 @@ def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_
         
         prev_filtered = filtered_prob[t, :]
         
-    return log_likelihood, filtered_prob
+    return log_likelihood, filtered_prob, predicted_prob
+
+@njit(cache=True)
+def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
+    """Wrapper for backward compatibility if needed, returns just LL and filtered."""
+    ll, filt, _ = hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1)
+    return ll, filt
+
+@njit(cache=True)
+def kim_smoother_t_jit(filtered_prob, predicted_prob, p00, p11):
+    """
+    Kim Smoother (Backward pass) for Regime Switching.
+    Calculates P(S_t = i | Y_T) (smoothed probabilities).
+    """
+    T = filtered_prob.shape[0]
+    smoothed_prob = np.zeros((T, 2))
+    
+    # Initialize with last filtered probability
+    smoothed_prob[T-1, :] = filtered_prob[T-1, :]
+    
+    P = np.array([[p00, 1 - p00], [1 - p11, p11]])
+    
+    # Backward recursion
+    for t in range(T - 2, -1, -1):
+        for i in range(2):
+            sum_val = 0.0
+            for j in range(2):
+                # Avoid division by zero
+                denom = predicted_prob[t+1, j]
+                if denom < 1e-100: 
+                    denom = 1e-100
+                
+                # Formula: smoothed[t, i] = filtered[t, i] * sum_j ( P_ij * smoothed[t+1, j] / predicted[t+1, j] )
+                sum_val += P[i, j] * smoothed_prob[t+1, j] / denom
+                
+            smoothed_prob[t, i] = filtered_prob[t, i] * sum_val
+            
+    return smoothed_prob
+
+@njit(cache=True)
+def calculate_expected_transitions_jit(smoothed_prob, filtered_prob, predicted_prob, p00, p11):
+    """
+    Calculate expected transitions (soft counts) for M-Step update of Transition Matrix.
+    xi_{t}(i,j) = P(S_t=i, S_{t+1}=j | Y)
+    Returns numerator accumulators for p00 and p11.
+    """
+    T = smoothed_prob.shape[0]
+    P = np.array([[p00, 1 - p00], [1 - p11, p11]])
+    
+    sum_xi_00 = 0.0
+    sum_xi_0_all = 0.0
+    sum_xi_11 = 0.0
+    sum_xi_1_all = 0.0
+    
+    # We need to compute xi_t for t = 0 to T-2
+    for t in range(T - 1):
+        # Calculate xi matrix for time t
+        for j in range(2):
+            denom = predicted_prob[t+1, j]
+            if denom < 1e-100: denom = 1e-100
+            
+            term_j = smoothed_prob[t+1, j] / denom
+            
+            # For i=0
+            xi_0j = term_j * P[0, j] * filtered_prob[t, 0]
+            sum_xi_0_all += xi_0j
+            if j == 0:
+                sum_xi_00 += xi_0j
+                
+            # For i=1
+            xi_1j = term_j * P[1, j] * filtered_prob[t, 1]
+            sum_xi_1_all += xi_1j
+            if j == 1:
+                sum_xi_11 += xi_1j
+                
+    return sum_xi_00, sum_xi_0_all, sum_xi_11, sum_xi_1_all
+
+@njit(cache=True)
+def _t_log_likelihood_sum(params_arr, returns, weights):
+    """
+    Weighted Negative Log-Likelihood for a Single Regime (t-distribution).
+    params_arr: [mu, log_sigma2, log(nu-2)]
+    """
+    mu = params_arr[0]
+    # Bound checks hard-coded or handled by optimizer bounds, but here for safety in JIT
+    sigma2 = np.exp(params_arr[1])
+    nu = 2.0 + np.exp(params_arr[2])
+    
+    total_wll = 0.0
+    for t in range(len(returns)):
+        if weights[t] > 1e-8: # Optimization: skip tiny weights
+            ll = _t_log_likelihood(returns[t] - mu, nu, sigma2)
+            total_wll += weights[t] * ll
+            
+    return -total_wll # Return negative for minimization
 
 # =============================================================================
 # ESTIMATION CLASS
 # =============================================================================
 
 class MarkovSwitchingTDist:
-    """Custom Estimator for Markov Switching Model with t-distribution."""
+    """Custom Estimator for Markov Switching Model with t-distribution using EM Algorithm."""
     
     def __init__(self):
         self.params = {}
         self.probs = None
         
-    def fit(self, returns, n_restarts=10):
+    def fit(self, returns, max_iter=500, tol=1e-5, n_init=1, init_params=None):
+        """
+        Fits the model using Expectation Maximization (EM).
+        """
         returns_arr = np.ascontiguousarray(returns)
         var = np.var(returns_arr)
         mean = np.mean(returns_arr)
         std = np.std(returns_arr)
         
-        # 1. Smart Initialization using Rolling Volatility
-        # Calculate rolling volatility to identify regime levels
+        # 1. Initialization
+        if init_params is not None:
+             current_params = init_params.copy()
+        else:
+            try:
+                n = len(returns_arr)
+                window = min(20, max(5, n // 10))
+                rolling_std = pd.Series(returns_arr).rolling(window=window).std().fillna(std)
+                vol_low = np.percentile(rolling_std, 20)
+                vol_high = np.percentile(rolling_std, 80)
+                sigma2_0_init = max(vol_low**2, 1e-6)
+                sigma2_1_init = max(vol_high**2, 1e-6)
+            except Exception:
+                sigma2_0_init = var * 0.5
+                sigma2_1_init = var * 2.0
+                
+            # Initial guess
+            # Perturb means slightly to distinguish regimes during EM and improve convergence
+            current_params = {
+                'mu_0': mean - 0.2 * std, 
+                'mu_1': mean + 0.2 * std,
+                'sigma2_0': sigma2_0_init, 'sigma2_1': sigma2_1_init,
+                'p00': 0.9, 'p11': 0.9,
+                'nu_0': 10.0, 'nu_1': 6.0
+            }
+        
+        best_overall_ll = -np.inf
+        
+        prev_ll = -np.inf
+        
+        for iteration in range(max_iter):
+            # ==================
+            # E-STEP
+            # ==================
+            
+            # 1. Run Filter
+            ll_curr, filt_prob, pred_prob = hamilton_filter_t_details_jit(
+                returns_arr,
+                current_params['mu_0'], current_params['mu_1'],
+                current_params['sigma2_0'], current_params['sigma2_1'],
+                current_params['p00'], current_params['p11'],
+                current_params['nu_0'], current_params['nu_1']
+            )
+            
+            # Check convergence
+            if abs(ll_curr - prev_ll) < tol and iteration > 0:
+                # if iteration > 5:
+                #     print(f"      Converged in {iteration} iterations (LL: {ll_curr:.2f})")
+                break
+            
+            if iteration > 0 and iteration % 50 == 0:
+                 print(f"      EM Iteration {iteration} (LL: {ll_curr:.4f})")
+                
+            prev_ll = ll_curr
+            
+            # 2. Run Smoother
+            smoothed_prob = kim_smoother_t_jit(
+                filt_prob, pred_prob, 
+                current_params['p00'], current_params['p11']
+            )
+            
+            # ==================
+            # M-STEP
+            # ==================
+            
+            # 1. Update Transition Probabilities
+            sum_xi_00, sum_xi_0_all, sum_xi_11, sum_xi_1_all = calculate_expected_transitions_jit(
+                smoothed_prob, filt_prob, pred_prob,
+                current_params['p00'], current_params['p11']
+            )
+            
+            # Add priors/smoothing to transitions to prevent 0 or 1
+            new_p00 = (sum_xi_00 + 0.1) / (sum_xi_0_all + 0.2)
+            new_p11 = (sum_xi_11 + 0.1) / (sum_xi_1_all + 0.2)
+            
+            current_params['p00'] = min(max(new_p00, 0.01), 0.999)
+            current_params['p11'] = min(max(new_p11, 0.01), 0.999)
+            
+            # 2. Update Emission Parameters (Weighted MLE for t-dist)
+            # Optimization method needed to wrap JIT
+            def optimize_regime(weights, current_mu, current_sigma2, current_nu):
+                # Initial guess for this regime
+                x0_regime = np.array([
+                    current_mu, 
+                    np.log(current_sigma2), 
+                    np.log(max(current_nu - 2.0, 1e-4))
+                ])
+                
+                # Bounds
+                b_regime = [
+                    (None, None), # mu
+                    (-15, 10),    # log_sigma2
+                    (-10, 6)      # log(nu-2)
+                ]
+                
+                # Wrapper for JIT objective
+                def obj_func(x):
+                    return _t_log_likelihood_sum(x, returns_arr, weights)
+                
+                try:
+                    res = minimize(obj_func, x0_regime, method='L-BFGS-B', bounds=b_regime)
+                    if res.success or res.fun < 1e10:
+                        return res.x
+                except:
+                    pass
+                return x0_regime # Fallback
+            
+            # Update Regime 0
+            p0 = optimize_regime(smoothed_prob[:, 0], current_params['mu_0'], current_params['sigma2_0'], current_params['nu_0'])
+            current_params['mu_0'] = p0[0]
+            current_params['sigma2_0'] = np.exp(p0[1])
+            current_params['nu_0'] = 2.0 + np.exp(p0[2])
+            
+            # Update Regime 1
+            p1 = optimize_regime(smoothed_prob[:, 1], current_params['mu_1'], current_params['sigma2_1'], current_params['nu_1'])
+            current_params['mu_1'] = p1[0]
+            current_params['sigma2_1'] = np.exp(p1[1])
+            current_params['nu_1'] = 2.0 + np.exp(p1[2])
+            
+        # Final pass to get probabilities with final params
+        final_ll, final_filt, final_pred = hamilton_filter_t_details_jit(
+            returns_arr,
+            current_params['mu_0'], current_params['mu_1'],
+            current_params['sigma2_0'], current_params['sigma2_1'],
+            current_params['p00'], current_params['p11'],
+            current_params['nu_0'], current_params['nu_1']
+        )
+        final_smoothed = kim_smoother_t_jit(final_filt, final_pred, current_params['p00'], current_params['p11'])
+        
+        current_params['log_likelihood'] = final_ll
+        self.params = current_params
+        self.probs = final_smoothed
+        
+        return self.params, self.probs
+
+def _process_single_firm(gvkey, firm_df):
+    """
+    Helper function to process a single firm for regime switching estimation.
+    Designed for parallel execution.
+    """
+    # Work on a copy to avoid Shared Memory issues
+    firm_df = firm_df.copy()
+    
+    # Ensure date format
+    if 'date' not in firm_df.columns:
+        if isinstance(firm_df.index, pd.DatetimeIndex):
+            firm_df['date'] = firm_df.index
+    firm_df['date'] = pd.to_datetime(firm_df['date'])
+    firm_df = firm_df.sort_values("date")
+    
+    scaled_available = "asset_return_daily_scaled" in firm_df.columns
+    target_col = "asset_return_daily_scaled" if scaled_available else "asset_return_daily"
+    
+    # Monthly Rolling Window
+    start_date = firm_df['date'].min()
+    end_date = firm_df['date'].max()
+    params_list = []
+    
+    try:
+        estimation_start = start_date + pd.DateOffset(months=12)
+        if estimation_start >= end_date:
+            return firm_df, params_list
+        month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
+    except Exception:
+        return firm_df, params_list
+
+    last_params = None
+
+    for date_point in month_ends:
+        # Select all data up to this point
+        data_up_to_point = firm_df[firm_df['date'] <= date_point]
+
+        # Require at least 252 trading days of history
+        if len(data_up_to_point) < 252:
+            continue
+
+        if len(params_list) % 12 == 0:
+            print(f"    > Date: {date_point.date()} (Window {len(params_list)})")
+
+        # Take the exact last 252 trading days for the window
+        window_df = data_up_to_point.iloc[-252:].copy()
+        
+        # Check for missing values
+        if window_df[target_col].isna().sum() > 20: 
+             continue
+        
+        valid_mask = window_df[target_col].notna()
+        if valid_mask.sum() < 200:
+            continue
+            
+        returns = window_df.loc[valid_mask, target_col].values
+
+        # Use the last actual trading date
+        last_trading_date = window_df['date'].max()
+        
+        # Scale for calculation if needed
+        calc_scale_factor = 100.0
+        if not scaled_available:
+             returns = returns * calc_scale_factor
+        
         try:
-            # Simple approximate rolling vol
-            n = len(returns_arr)
-            window = min(20, max(5, n // 10))
-            # Use numpy for rolling std to avoid pandas overhead/dependency issues here if possible, 
-            # but pandas is already imported.
-            rolling_std = pd.Series(returns_arr).rolling(window=window).std().fillna(std)
+            model = MarkovSwitchingTDist()
+            params, probs = model.fit(returns, init_params=last_params)
             
-            # Use 20th and 80th percentiles for low/high vol regimes
-            vol_low = np.percentile(rolling_std, 20)
-            vol_high = np.percentile(rolling_std, 80)
+            # Map regimes: 0 = LOW, 1 = HIGH Volatility
+            p_sigma0 = params['sigma2_0']
+            p_sigma1 = params['sigma2_1']
             
-            sigma2_0_init = max(vol_low**2, 1e-6)
-            sigma2_1_init = max(vol_high**2, 1e-6)
+            if p_sigma0 > p_sigma1:
+                 params['sigma2_0'], params['sigma2_1'] = params['sigma2_1'], params['sigma2_0']
+                 params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
+                 params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
+                 params['p00'], params['p11'] = params['p11'], params['p00']
+                 # Swap probabilities
+                 probs[:, [0, 1]] = probs[:, [1, 0]]
             
-            # Determine mu init from quantiles if requested, but for daily returns mean is stable
-            mu_0_init = mean 
-            mu_1_init = mean
+            last_params = params
+
+            # Stitch probabilities into firm_df (for the newest month)
+            prev_month_end = date_point - pd.DateOffset(months=1)
+            
+            # Map back to indices (in firm_df)
+            window_indices = window_df.index[valid_mask]
+            window_dates = window_df.loc[valid_mask, 'date']
+            
+            new_month_mask = window_dates > prev_month_end
+            
+            if new_month_mask.any():
+                update_indices = window_indices[new_month_mask]
+                update_probs = probs[new_month_mask.values]
+                
+                firm_df.loc[update_indices, "regime_probability_0"] = update_probs[:, 0]
+                firm_df.loc[update_indices, "regime_probability_1"] = update_probs[:, 1]
+                firm_df.loc[update_indices, "regime_state"] = np.where(update_probs[:, 0] > 0.5, 0, 1)
+
+            # Store params
+            params_list.append({
+                'gvkey': gvkey,
+                'date': last_trading_date, 
+                'regime_0_mean': params['mu_0'] / calc_scale_factor,
+                'regime_1_mean': params['mu_1'] / calc_scale_factor,
+                'regime_0_vol': np.sqrt(params['sigma2_0']) / calc_scale_factor,
+                'regime_1_vol': np.sqrt(params['sigma2_1']) / calc_scale_factor,
+                'regime_0_nu': params['nu_0'],
+                'regime_1_nu': params['nu_1'], 
+                'transition_prob_00': params['p00'],
+                'transition_prob_01': 1 - params['p00'],
+                'transition_prob_10': 1 - params['p11'],
+                'transition_prob_11': params['p11'],
+                'regime_0_ar': 0.0,
+                'regime_1_ar': 0.0
+            })
             
         except Exception:
-            sigma2_0_init = var * 0.5
-            sigma2_1_init = var * 2.0
-            mu_0_init = mean
-            mu_1_init = mean
+            continue
             
-        # Target nu values (degrees of freedom)
-        # We now constrain nu >= 2.0 (standard t-distribution condition)
-        nu_0_target = 10.0
-        nu_1_target = 6.0
-        
-        # Initial Parameter Vector Construction
-        # Transformation:
-        # sigma2 = exp(x)
-        # p = expit(x)
-        # nu = 2 + exp(x)
-        
-        x0_base = np.array([
-            mu_0_init, mu_1_init, 
-            np.log(sigma2_0_init), np.log(sigma2_1_init),
-            2.0, 2.0, # logit(p) ≈ 0.88 (strong persistence)
-            np.log(max(nu_0_target - 2.0, 1e-4)), np.log(max(nu_1_target - 2.0, 1e-4))
-        ])
-        
-        # Objective Function
-        def neg_log_lik(params):
-            mu_0, mu_1 = params[0], params[1]
-            sigma2_0, sigma2_1 = np.exp(params[2]), np.exp(params[3])
-            p00, p11 = expit(params[4]), expit(params[5])
-            
-            # BOUND CONSTRAINTS
-            if p00 < 0.01 or p11 < 0.01: return 1e10
-            if p00 > 0.999 or p11 > 0.999: return 1e10
-            
-            # CHANGED: nu >= 2 constraint
-            nu_0 = 2.0 + np.exp(params[6])
-            nu_1 = 2.0 + np.exp(params[7])
-            
-            # Prevent exploding parameters
-            if sigma2_0 > 1000 or sigma2_1 > 1000: return 1e10
-            
-            ll, _ = hamilton_filter_t_jit(returns_arr, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1)
-            return -ll if np.isfinite(ll) else 1e10
-
-        # Multi-start Optimization
-        best_fun = 1e20
-        best_x = None
-        
-        # Generate candidates: Base + Random Perturbations
-        candidates = [x0_base]
-        # Generate random restarts
-        np.random.seed(42) # Consistent results
-        for _ in range(n_restarts - 1):
-            perturbation = np.random.normal(0, 0.2, size=len(x0_base))
-            # Don't perturb transition probs too much (indices 4, 5) to keep persistence high
-            perturbation[4] *= 0.5 
-            perturbation[5] *= 0.5
-            candidates.append(x0_base + perturbation)
-            
-        for i, x0_cand in enumerate(candidates):
-            try:
-                res = minimize(neg_log_lik, x0_cand, method='L-BFGS-B', options={'disp': False, 'maxiter': 500})
-                if res.fun < best_fun:
-                    best_fun = res.fun
-                    best_x = res.x
-            except Exception:
-                continue
-                
-        if best_x is None:
-            # Fallback if all failed (using base)
-            best_x = x0_base
-            best_fun = neg_log_lik(x0_base)
-            
-        p = best_x
-        self.params = {
-            'mu_0': p[0], 'mu_1': p[1],
-            'sigma2_0': np.exp(p[2]), 'sigma2_1': np.exp(p[3]),
-            'p00': expit(p[4]), 'p11': expit(p[5]),
-            'nu_0': 2.0 + np.exp(p[6]), 'nu_1': 2.0 + np.exp(p[7]), 
-            'log_likelihood': -best_fun
-        }
-        
-        _, probs = hamilton_filter_t_jit(
-            returns_arr, 
-            self.params['mu_0'], self.params['mu_1'], 
-            self.params['sigma2_0'], self.params['sigma2_1'],
-            self.params['p00'], self.params['p11'],
-            self.params['nu_0'], self.params['nu_1']
-        )
-        self.probs = probs
-        return self.params, self.probs
+    print(f"  > Finished Firm {gvkey} ({len(params_list)} windows)")
+    return firm_df, params_list
 
 def run_regime_switching_estimation(daily_returns_df):
     """
-    Estimates a 2-regime Hamilton filter on DAILY asset returns using CUSTOM T-DISTRIBUTION ESTIMATOR.
+    Estimates a 2-regime Hamilton filter on DAILY asset returns using Custom T-Dist, Parallelized.
     """
     print("Estimating Regime Switching Model (2-Regime Markov T-Dist) on DAILY Returns...")
     
@@ -237,155 +489,46 @@ def run_regime_switching_estimation(daily_returns_df):
         print("No daily returns provided.")
         return daily_returns_df
     
+    # Initialize Output Structure
     df_out = daily_returns_df.copy().reset_index(drop=True)
     df_out["regime_state"] = np.nan
     df_out["regime_probability_0"] = np.nan
     df_out["regime_probability_1"] = np.nan
     
     firms = df_out["gvkey"].unique()
-    print(f"Processing Regime Switching for {len(firms)} firms...\\n")
+    # n_cores = multiprocessing.cpu_count()
+    # print(f"Processing Regime Switching for {len(firms)} firms using {n_cores} cores...\\n")
+    print(f"Processing Regime Switching for {len(firms)} firms (Sequential execution)...\\n")
     
-    params_list = []
+    # Run Sequential Execution
+    processed_dfs = []
+    all_params = []
     
     for i, gvkey in enumerate(firms):
-        firm_mask = df_out["gvkey"] == gvkey
-        firm_df = df_out.loc[firm_mask].copy()
-        
-        # Ensure date format
-        if 'date' not in firm_df.columns:
-            # Try index
-            if isinstance(firm_df.index, pd.DatetimeIndex):
-                firm_df['date'] = firm_df.index
-        
-        firm_df['date'] = pd.to_datetime(firm_df['date'])
-        firm_df = firm_df.sort_values("date")
-        
-        scaled_available = "asset_return_daily_scaled" in firm_df.columns
-        target_col = "asset_return_daily_scaled" if scaled_available else "asset_return_daily"
-        
-        # Monthly Rolling Window
-        start_date = firm_df['date'].min()
-        end_date = firm_df['date'].max()
+        print(f"Processing firm {gvkey} ({i+1}/{len(firms)})...")
         try:
-            estimation_start = start_date + pd.DateOffset(months=12)
-            if estimation_start >= end_date:
-                continue
-            month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
+            res_df, res_params = _process_single_firm(gvkey, df_out[df_out["gvkey"] == gvkey])
+            processed_dfs.append(res_df)
+            all_params.extend(res_params)
         except Exception as e:
-            print(f"Error defining date range for {gvkey}: {e}")
+            print(f"Error processing firm {gvkey}: {e}")
             continue
 
-             
-        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M)...")
-        
-        for date_point in month_ends:
-            # Select all data up to this point
-            data_up_to_point = firm_df[firm_df['date'] <= date_point]
+    # Reassemble main dataframe
+    if processed_dfs:
+        df_out = pd.concat(processed_dfs).sort_index()
+    else:
+        print("Warning: No firms processed successfully.")
 
-            # Require at least 252 trading days of history is available
-            if len(data_up_to_point) < 252:
-                continue
-
-            # Take the exact last 252 trading days for the window
-            window_df = data_up_to_point.iloc[-252:].copy()
-            
-            # Additional check for missing values inside the window
-            if window_df[target_col].isna().sum() > 20: 
-                 # Skip if too many missing returns in the 252-day window
-                 continue
-            
-            valid_mask = window_df[target_col].notna()
-            # If not enough valid points after dropping NaNs, skip
-            if valid_mask.sum() < 200:
-                continue
-                
-            returns = window_df.loc[valid_mask, target_col].values
-
-            # CRITICAL FIX: Use the last actual trading date from this window
-            last_trading_date = window_df['date'].max()
-            
-            # Scale factor for converting parameters back to decimal scale
-            calc_scale_factor = 100.0
-            if not scaled_available:
-                 returns = returns * calc_scale_factor
-            
-            try:
-                model = MarkovSwitchingTDist()
-                params, probs = model.fit(returns)
-                
-                # Map regimes: 0 = LOW, 1 = HIGH Volatility
-                p_sigma0 = params['sigma2_0']
-                p_sigma1 = params['sigma2_1']
-                
-                if p_sigma0 > p_sigma1:
-                     params['sigma2_0'], params['sigma2_1'] = params['sigma2_1'], params['sigma2_0']
-                     params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
-                     params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
-                     params['p00'], params['p11'] = params['p11'], params['p00']
-                     # Swap probabilities too as we are saving them
-                     probs[:, [0, 1]] = probs[:, [1, 0]]
-                
-                # Stitch probabilities into df_out (for the newest month in the window)
-                # This approximates the "out-of-sample" filtered probability history
-                prev_month_end = date_point - pd.DateOffset(months=1)
-                
-                # Map back to indices
-                # window_df has the data for the window. valid_mask selects rows with valid returns.
-                window_indices = window_df.index[valid_mask]
-                window_dates = window_df.loc[valid_mask, 'date']
-                
-                # Identify rows belonging to the most recent month
-                new_month_mask = window_dates > prev_month_end
-                
-                if new_month_mask.any():
-                    update_indices = window_indices[new_month_mask]
-                    update_probs = probs[new_month_mask.values]
-                    
-                    df_out.loc[update_indices, "regime_probability_0"] = update_probs[:, 0]
-                    df_out.loc[update_indices, "regime_probability_1"] = update_probs[:, 1]
-                    df_out.loc[update_indices, "regime_state"] = np.where(update_probs[:, 0] > 0.5, 0, 1)
-
-                # Store params
-                params_list.append({
-                    'gvkey': gvkey,
-                    'date': last_trading_date, # Use LAST TRADING DATE
-                    'regime_0_mean': params['mu_0'] / calc_scale_factor,
-                    'regime_1_mean': params['mu_1'] / calc_scale_factor,
-                    'regime_0_vol': np.sqrt(params['sigma2_0']) / calc_scale_factor,
-                    'regime_1_vol': np.sqrt(params['sigma2_1']) / calc_scale_factor,
-                    'regime_0_nu': params['nu_0'],
-                    'regime_1_nu': params['nu_1'], 
-                    'transition_prob_00': params['p00'],
-                    'transition_prob_01': 1 - params['p00'],
-                    'transition_prob_10': 1 - params['p11'],
-                    'transition_prob_11': params['p11'],
-                    'regime_0_ar': 0.0,
-                    'regime_1_ar': 0.0
-                })
-                
-                # print(f"  Processed {gvkey} window ending {date_point.date()}")
-                
-            except Exception as e:
-                # print(f"Error {gvkey}: {e}")
-                continue
-
-    if params_list:
-        params_df = pd.DataFrame(params_list)
+    # Save Parameters and Merge
+    if all_params:
+        params_df = pd.DataFrame(all_params)
         params_df.to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
         print("Saved regime_switching_parameters.csv")
         
         # Merge rolling parameters back into daily dataframe
         # Ensure date type
         df_out['date'] = pd.to_datetime(df_out['date'])
-        
-        # Determine cols to merge (exclude gvkey, date)
-        # We rename them to be clear they are the parameters active for that time
-        # Actually in RS model result summary, we might use them.
-        # Let's keep names but forward fill.
-        
-        # Columns in params_list: 
-        # regime_0_mean, regime_1_mean, regime_0_vol, regime_1_vol, 
-        # regime_0_nu, regime_1_nu, transition_prob_00, ...
         
         merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'regime_0_ar', 'regime_1_ar']]
         

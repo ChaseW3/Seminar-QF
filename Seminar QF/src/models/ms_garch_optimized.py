@@ -328,7 +328,7 @@ class MSGARCHOptimized:
         self.bic = None
         self._garch_warmstart = None
         
-    def fit(self, returns, verbose=True):
+    def fit(self, returns, verbose=True, init_params=None):
         """
         Fit the MS-GARCH model using optimized MLE.
         
@@ -338,12 +338,15 @@ class MSGARCHOptimized:
             Array of returns
         verbose : bool
             Whether to print fitting progress
+        init_params : dict, optional
+            Parameters from previous estimation to use as starting values (warm start)
             
         Returns:
         --------
         dict : Estimated parameters
         """
         self.returns = np.asarray(returns).flatten()
+        self.init_params = init_params
         
         # Remove NaN and infinite values
         valid_mask = np.isfinite(self.returns)
@@ -369,78 +372,96 @@ class MSGARCHOptimized:
             print("  Fitting OPTIMIZED MS-GARCH with t-distribution...")
         
         # =====================================================================
-        # OPTIMIZATION 1: GARCH Warm Start
-        # =====================================================================
-        if verbose:
-            print("    → Getting GARCH(1,1) warm start parameters...")
-        
-        garch_params = get_garch_warm_start(returns)
-        self._garch_warmstart = garch_params
-        
-        if verbose:
-            print(f"    → Warm start: omega={garch_params['omega']:.2e}, "
-                  f"alpha={garch_params['alpha']:.3f}, beta={garch_params['beta']:.3f}, "
-                  f"nu={garch_params['nu']:.1f}")
-        
-        # =====================================================================
-        # OPTIMIZATION 2: Better Initial Parameters from Warm Start
+        # OPTIMIZATION 1: GARCH Warm Start (OR Rolling Warm Start)
         # =====================================================================
         
-        # Use GARCH estimates for both regimes, with adjustments
-        omega_base = garch_params['omega']
-        alpha_base = garch_params['alpha']
-        beta_base = garch_params['beta']
-        nu_base = garch_params['nu']
-        mu_base = garch_params['mu']
+        x0 = None
         
-        # IMPROVED: Create more distinct initial regimes
-        # CONVENTION: Regime 0 = LOW volatility, Regime 1 = HIGH volatility
-        # Regime 0 (low vol): Lower omega, higher persistence (lower alpha, higher beta)
-        # Regime 1 (high vol): Higher omega, lower persistence (higher alpha, lower beta)
-        omega_0_init = omega_base * 0.4  # Lower base volatility (LOW-VOL REGIME)
-        omega_1_init = omega_base * 2.5  # Higher base volatility (HIGH-VOL REGIME)
-        
-        # More differentiated GARCH parameters
-        alpha_0_init = max(alpha_base * 0.5, 0.02)   # Lower alpha for LOW-VOL regime
-        alpha_1_init = min(alpha_base * 1.8, 0.25)   # Higher alpha for HIGH-VOL regime
-        beta_0_init = min(beta_base * 1.05, 0.97)    # Higher beta for LOW-VOL regime
-        beta_1_init = max(beta_base * 0.85, 0.55)    # Lower beta for HIGH-VOL regime
-        
-        # Different means for regimes
-        mu_0_init = mu_base + 0.0002  # Slight positive bias for LOW-VOL
-        mu_1_init = mu_base - 0.0003  # Slight negative bias for HIGH-VOL (crisis)
-        
-        # CRITICAL: Different degrees of freedom for each regime
-        # Regime 0 (LOW vol, calm): Higher ν → thinner tails (closer to normal)
-        # Regime 1 (HIGH vol, stress): Lower ν → fatter tails (more extreme events)
-        nu_0_init = max(min(nu_base * 2.0, 25.0), 12.0)  # High ν: 12-25 range (LOW-VOL)
-        nu_1_init = max(min(nu_base * 0.4, 8.0), 2.5)     # Low ν: 2.5-8 range (HIGH-VOL)
-        
-        if verbose:
-            print(f"    → Initial degrees of freedom: ν₀={nu_0_init:.1f} (low-vol), "
-                  f"ν₁={nu_1_init:.1f} (high-vol)")
-        
-        # CRITICAL: Initialize transition probabilities with HIGH persistence
-        # expit(2.5) ≈ 0.92 - regimes should be persistent, not random
-        # Without this, optimizer converges to p00=p11=0.5 (no regime structure)
-        p00_init_logit = 2.5  # → p00 ≈ 0.92 (stay in regime 0)
-        p11_init_logit = 2.5  # → p11 ≈ 0.92 (stay in regime 1)
-        
-        # Transform initial values for unconstrained optimization
-        x0 = np.array([
-            np.log(max(omega_0_init, 1e-10)),  # log(omega_0)
-            self._alpha_to_unconstrained(alpha_0_init),  # alpha_0
-            self._beta_to_unconstrained(beta_0_init),  # beta_0
-            np.log(max(omega_1_init, 1e-10)),  # log(omega_1)
-            self._alpha_to_unconstrained(alpha_1_init),  # alpha_1
-            self._beta_to_unconstrained(beta_1_init),  # beta_1
-            mu_0_init,  # mu_0
-            mu_1_init,  # mu_1
-            p00_init_logit,  # logit(p00) - HIGH regime persistence
-            p11_init_logit,  # logit(p11) - HIGH regime persistence
-            self._nu_to_unconstrained(nu_0_init),  # nu_0 - HIGH df (thin tails)
-            self._nu_to_unconstrained(nu_1_init)   # nu_1 - LOW df (fat tails)
-        ])
+        # 1A. ROLLING WARM START (Fastest)
+        if self.init_params is not None:
+            if verbose:
+                print("    → Using parameters from previous window (Rolling Warm Start)...")
+            try:
+                p = self.init_params
+                # Transform constrained parameters back to unconstrained space for optimizer
+                x0 = np.array([
+                    np.log(max(p['omega_0'], 1e-10)),
+                    self._alpha_to_unconstrained(p['alpha_0']),
+                    self._beta_to_unconstrained(p['beta_0']),
+                    np.log(max(p['omega_1'], 1e-10)),
+                    self._alpha_to_unconstrained(p['alpha_1']),
+                    self._beta_to_unconstrained(p['beta_1']),
+                    p['mu_0'],
+                    p['mu_1'],
+                    # Handle boundaries for probabilities safely
+                    np.log(max(p['p00'], 0.01) / (1 - min(p['p00'], 0.99))), # logit(p00)
+                    np.log(max(p['p11'], 0.01) / (1 - min(p['p11'], 0.99))), # logit(p11)
+                    self._nu_to_unconstrained(p['nu_0']),
+                    self._nu_to_unconstrained(p['nu_1'])
+                ])
+            except Exception as e:
+                if verbose:
+                    print(f"    ! Warm start transformation failed: {e}. Falling back to GARCH init.")
+                x0 = None
+
+        # 1B. GARCH WARM START (Fallback or First Run)
+        if x0 is None:
+            if verbose:
+                print("    → Getting GARCH(1,1) warm start parameters...")
+            
+            garch_params = get_garch_warm_start(returns)
+            self._garch_warmstart = garch_params
+            
+            if verbose:
+                print(f"    → Warm start: omega={garch_params['omega']:.2e}, "
+                      f"alpha={garch_params['alpha']:.3f}, beta={garch_params['beta']:.3f}, "
+                      f"nu={garch_params['nu']:.1f}")
+            
+            # Use GARCH estimates for both regimes, with adjustments
+            omega_base = garch_params['omega']
+            alpha_base = garch_params['alpha']
+            beta_base = garch_params['beta']
+            nu_base = garch_params['nu']
+            mu_base = garch_params['mu']
+            
+            # IMPROVED: Create more distinct initial regimes
+            # CONVENTION: Regime 0 = LOW volatility, Regime 1 = HIGH volatility
+            omega_0_init = omega_base * 0.4  
+            omega_1_init = omega_base * 2.5 
+            
+            alpha_0_init = max(alpha_base * 0.5, 0.02)
+            alpha_1_init = min(alpha_base * 1.8, 0.25)
+            beta_0_init = min(beta_base * 1.05, 0.97)
+            beta_1_init = max(beta_base * 0.85, 0.55)
+            
+            mu_0_init = mu_base + 0.0002 
+            mu_1_init = mu_base - 0.0003 
+            
+            nu_0_init = max(min(nu_base * 2.0, 25.0), 12.0) 
+            nu_1_init = max(min(nu_base * 0.4, 8.0), 2.5)   
+            
+            p00_init_logit = 2.5 # p00 ~ 0.92
+            p11_init_logit = 2.5 # p11 ~ 0.92
+            
+            # Transform initial values for unconstrained optimization
+            x0 = np.array([
+                np.log(max(omega_0_init, 1e-10)),
+                self._alpha_to_unconstrained(alpha_0_init),
+                self._beta_to_unconstrained(beta_0_init),
+                np.log(max(omega_1_init, 1e-10)),
+                self._alpha_to_unconstrained(alpha_1_init),
+                self._beta_to_unconstrained(beta_1_init),
+                mu_0_init,
+                mu_1_init,
+                p00_init_logit,
+                p11_init_logit,
+                self._nu_to_unconstrained(nu_0_init),
+                self._nu_to_unconstrained(nu_1_init)
+            ])
+            
+            if verbose:
+                print(f"    → Initial degrees of freedom: ν₀={nu_0_init:.1f} (low-vol), "
+                      f"ν₁={nu_1_init:.1f} (high-vol)")
         
         # =====================================================================
         # OPTIMIZATION 3: Cached negative log-likelihood function
@@ -523,44 +544,46 @@ class MSGARCHOptimized:
         
         # PHASE 1: Coarse optimization with multiple starting points
         if verbose:
-            print("    → PHASE 1: Multi-start optimization (3 different initializations)...")
+            print("    → PHASE 1: Multi-start optimization...")
         
         # Starting point 1: Base initialization (from warm start)
         candidates = [('Base', x0)]
         
-        # Starting point 2: More extreme regime differentiation
-        x0_extreme = np.array([
-            np.log(max(omega_base * 0.2, 1e-10)),  # Very low omega for calm regime
-            self._alpha_to_unconstrained(0.02),     # Very low alpha
-            self._beta_to_unconstrained(0.96),      # Very high beta (high persistence)
-            np.log(max(omega_base * 4.0, 1e-10)),   # Very high omega for crisis regime
-            self._alpha_to_unconstrained(0.25),     # High alpha (quick response)
-            self._beta_to_unconstrained(0.60),      # Lower beta
-            mu_base + 0.0008,
-            mu_base - 0.0010,
-            3.0,  # expit(3.0) ≈ 0.95 - very persistent regime 0
-            3.0,  # expit(3.0) ≈ 0.95 - very persistent regime 1
-            self._nu_to_unconstrained(30.0),  # Very HIGH df for low-vol regime
-            self._nu_to_unconstrained(2.8)    # Very LOW df for high-vol regime
-        ])
-        candidates.append(('Extreme', x0_extreme))
-        
-        # Starting point 3: Moderate differentiation (between base and extreme)
-        x0_moderate = np.array([
-            np.log(max(omega_base * 0.5, 1e-10)),
-            self._alpha_to_unconstrained(0.04),
-            self._beta_to_unconstrained(0.94),
-            np.log(max(omega_base * 2.0, 1e-10)),
-            self._alpha_to_unconstrained(0.15),
-            self._beta_to_unconstrained(0.75),
-            mu_base + 0.0003,
-            mu_base - 0.0005,
-            2.0,  # expit(2.0) ≈ 0.88
-            2.0,
-            self._nu_to_unconstrained(18.0),
-            self._nu_to_unconstrained(5.0)
-        ])
-        candidates.append(('Moderate', x0_moderate))
+        # Only add alternative starting points if we DON'T have a valid warm start
+        if self.init_params is None:
+             # Starting point 2: More extreme regime differentiation
+             x0_extreme = np.array([
+                 np.log(max(omega_base * 0.2, 1e-10)),  # Very low omega for calm regime
+                 self._alpha_to_unconstrained(0.02),     # Very low alpha
+                 self._beta_to_unconstrained(0.96),      # Very high beta (high persistence)
+                 np.log(max(omega_base * 4.0, 1e-10)),   # Very high omega for crisis regime
+                 self._alpha_to_unconstrained(0.25),     # High alpha (quick response)
+                 self._beta_to_unconstrained(0.60),      # Lower beta
+                 mu_base + 0.0008,
+                 mu_base - 0.0010,
+                 3.0,  # expit(3.0) ≈ 0.95 - very persistent regime 0
+                 3.0,  # expit(3.0) ≈ 0.95 - very persistent regime 1
+                 self._nu_to_unconstrained(30.0),  # Very HIGH df for low-vol regime
+                 self._nu_to_unconstrained(2.8)    # Very LOW df for high-vol regime
+             ])
+             candidates.append(('Extreme', x0_extreme))
+             
+             # Starting point 3: Moderate differentiation (between base and extreme)
+             x0_moderate = np.array([
+                 np.log(max(omega_base * 0.5, 1e-10)),
+                 self._alpha_to_unconstrained(0.04),
+                 self._beta_to_unconstrained(0.94),
+                 np.log(max(omega_base * 2.0, 1e-10)),
+                 self._alpha_to_unconstrained(0.15),
+                 self._beta_to_unconstrained(0.75),
+                 mu_base + 0.0003,
+                 mu_base - 0.0005,
+                 2.0,  # expit(2.0) ≈ 0.88
+                 2.0,
+                 self._nu_to_unconstrained(18.0),
+                 self._nu_to_unconstrained(5.0)
+             ])
+             candidates.append(('Moderate', x0_moderate))
         
         # Try all candidates with PHASE 1 settings (faster, less precise)
         best_result = None
@@ -975,6 +998,7 @@ def run_ms_garch_estimation_optimized(data_df,
             print(f"Error defining date range for {gvkey}: {e}")
             continue
 
+        last_params_firm = None # Warm start for rolling window set to None for new firm
             
         for date_point in month_ends:
             try:  # <-- ADDED INNER TRY
@@ -1012,11 +1036,31 @@ def run_ms_garch_estimation_optimized(data_df,
                 
                 # Initialize and fit OPTIMIZED MS-GARCH
                 model = MSGARCHOptimized()
+                
+                # Re-scale params if passing from previous window (params are stored unscaled in last_params_firm)
+                init_p = None
+                if last_params_firm is not None:
+                     init_p = last_params_firm.copy()
+                     # Params in last_params_firm are UNSCALED (raw return scale).
+                     # The model estimation happens on SCALED returns (returns * scale_factor).
+                     # So we must RESCALE the parameters before passing them to fit()
+                     if scale_factor != 1.0:
+                        init_p['omega_0'] *= (scale_factor ** 2)
+                        init_p['omega_1'] *= (scale_factor ** 2)
+                        init_p['mu_0'] *= scale_factor
+                        init_p['mu_1'] *= scale_factor
+
                 # Run silently for rolling windows to avoid spam
-                params = model.fit(returns, verbose=False)
+                params = model.fit(returns, verbose=False, init_params=init_p)
                 
                 if params is None:
                     continue
+                
+                last_params_firm = params.copy() # Store the RAW optimizer output (scaled) for next iter
+                # Note: We unscale below for saving, but for warm start next loop we need the SCALED version?
+                # Actually, the logic below unscales `params` IN PLACE for saving. 
+                # So `last_params_firm` will be unscaled version.
+                # That explains why I re-scale above.
                 
                 # Get model results
                 vol_series = model.get_volatility_series()

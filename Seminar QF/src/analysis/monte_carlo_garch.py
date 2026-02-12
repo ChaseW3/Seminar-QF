@@ -9,123 +9,118 @@ from scipy import stats
 from joblib import Parallel, delayed
 
 
-@numba.jit(nopython=True)
-def sample_standardized_t(nu):
+@numba.jit(nopython=True, fastmath=True, cache=True)
+def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr, 
+                                          sigma_arr, nu_arr, mu_arr,
+                                          num_simulations, num_firms,
+                                          horizon_days, v0_arr, liability_arr):
     """
-    Generate a standardized t-distributed random variable using Numba.
-    
-    Uses the representation: t(ν) = Z / sqrt(V/ν) where Z ~ N(0,1), V ~ χ²(ν)
-    Then standardizes so variance = 1: multiply by sqrt((ν-2)/ν)
-    """
-    if nu <= 2:
-        return np.random.standard_normal()
-    
-    # Generate Z ~ N(0,1)
-    z = np.random.standard_normal()
-    
-    # Generate V ~ chi-squared(nu) using sum of squared normals
-    v = 0.0
-    nu_int = int(nu)
-    for _ in range(nu_int):
-        v += np.random.standard_normal() ** 2
-    
-    # t = Z / sqrt(V/nu)
-    t_sample = z / np.sqrt(v / nu)
-    
-    # Standardize so variance = 1 (t(nu) has variance nu/(nu-2))
-    scale = np.sqrt((nu - 2) / nu)
-    return t_sample * scale
-
-
-@numba.jit(nopython=True, parallel=True)
-def simulate_garch_paths_t_jit_fully_optimized(omega, alpha, beta, sigma_t, nu,
-                                               num_simulations, num_firms,
-                                               horizon_days, v0_arr, liability_arr):
-    """
-    Parameters:
-    -----------
-    horizon_days : array of ints, shape (n_horizons,)
-        Time points to store values (e.g., [252, 756, 1260] for 1y, 3y, 5y)
-    v0_arr : array (num_firms,)
-        Initial asset values (from Merton model)
-    liability_arr : array (num_firms,)
-        Liability thresholds for default
-    
-    Returns:
-    --------
-    terminal_vols : array (n_horizons, num_simulations, num_firms)
-        Volatilities at each horizon
-    terminal_assets : array (n_horizons, num_simulations, num_firms)
-        Asset values at each horizon (for CDS pricing)
-    default_indicators : array (n_horizons, num_simulations, num_firms)
-        1 if defaulted by this horizon, 0 otherwise
-    vol_means, vol_stds, vol_maxs, vol_mins : arrays (num_simulations, num_firms)
-        Volatility statistics across all days
+    Vectorized Monte Carlo GARCH simulation.
+    Processes all simulations for a firm simultaneously to leverage SIMD/AVX.
     """
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
-    # Terminal values at horizons only
-    terminal_vols = np.zeros((n_horizons, num_simulations, num_firms))
-    terminal_assets = np.zeros((n_horizons, num_simulations, num_firms))
-    default_indicators = np.zeros((n_horizons, num_simulations, num_firms))
+    # Output arrays: (Horizons, Firms, Sims) allows contiguous writes for sims
+    terminal_vols = np.zeros((n_horizons, num_firms, num_simulations))
+    terminal_assets = np.zeros((n_horizons, num_firms, num_simulations))
+    default_indicators = np.zeros((n_horizons, num_firms, num_simulations))
     
-    # Statistics accumulators
-    vol_means = np.zeros((num_simulations, num_firms))
-    vol_stds_accum = np.zeros((num_simulations, num_firms))
-    vol_maxs = np.zeros((num_simulations, num_firms))
-    vol_mins = np.zeros((num_simulations, num_firms))
+    # Stats: (Firms, Sims)
+    vol_means = np.zeros((num_firms, num_simulations))
+    vol_stds = np.zeros((num_firms, num_simulations))
+    vol_maxs = np.zeros((num_firms, num_simulations))
+    vol_mins = np.zeros((num_firms, num_simulations))
     
-    for sim in numba.prange(num_simulations):
-        sigma = sigma_t.copy()
-        asset_value = v0_arr.copy()
-        defaulted = np.zeros(num_firms)
+    # Pre-compute horizon mask for fast checking
+    is_horizon = np.zeros(max_days, dtype=np.int32)
+    horizon_map = np.full(max_days, -1, dtype=np.int32)
+    for h in range(n_horizons):
+        day_idx = horizon_days[h] - 1
+        if day_idx < max_days:
+            is_horizon[day_idx] = 1
+            horizon_map[day_idx] = h
+
+    # Process firms sequentially (Joblib handles parallel dates)
+    for f in range(num_firms):
+        # Constants
+        omega = omega_arr[f]
+        alpha = alpha_arr[f]
+        beta = beta_arr[f]
+        nu = nu_arr[f]
+        mu = mu_arr[f]
+        v0 = v0_arr[f]
+        liability = liability_arr[f]
         
-        # Initialize statistics
-        for firm in range(num_firms):
-            vol_maxs[sim, firm] = sigma[firm]
-            vol_mins[sim, firm] = sigma[firm]
+        # State Vectors (Size: num_simulations)
+        sigma = np.full(num_simulations, sigma_arr[f])
+        asset = np.full(num_simulations, v0)
+        
+        # Stats State
+        m_old = sigma.copy()
+        s_old = np.zeros(num_simulations)
+        curr_max = sigma.copy()
+        curr_min = sigma.copy()
+        
+        # T-dist parameters
+        check_normal = (nu >= 100)
+        t_factor = np.sqrt((nu - 2) / nu)
         
         for day in range(max_days):
-            for firm in range(num_firms):
-                # Generate t-distributed shock (capped to prevent extreme spikes)
-                eps_raw = sample_standardized_t(nu[firm])
-                eps = max(min(eps_raw, 5.0), -5.0)
-                
-                # Update running vol statistics (Welford's algorithm)
-                old_mean = vol_means[sim, firm]
-                vol_means[sim, firm] += (sigma[firm] - old_mean) / (day + 1)
-                vol_stds_accum[sim, firm] += (sigma[firm] - old_mean) * (sigma[firm] - vol_means[sim, firm])
-                
-                if sigma[firm] > vol_maxs[sim, firm]:
-                    vol_maxs[sim, firm] = sigma[firm]
-                if sigma[firm] < vol_mins[sim, firm]:
-                    vol_mins[sim, firm] = sigma[firm]
-                
-                # Simulate asset return: dV/V = sigma * eps (log price process)
-                log_return = sigma[firm] * eps
-                asset_value[firm] *= np.exp(log_return)
-                
-                # Check for default (path-dependent - default if EVER drop below liability)
-                if asset_value[firm] < liability_arr[firm]:
-                    defaulted[firm] = 1.0
-                
-                # Store terminal values at horizons
-                for h_idx in range(n_horizons):
-                    if day == horizon_days[h_idx] - 1:
-                        terminal_vols[h_idx, sim, firm] = sigma[firm]
-                        terminal_assets[h_idx, sim, firm] = asset_value[firm]
-                        default_indicators[h_idx, sim, firm] = defaulted[firm]
-                
-                # Update GARCH volatility for next period
-                sigma[firm] = np.sqrt(omega[firm] + alpha[firm] * (eps * sigma[firm])**2 + beta[firm] * sigma[firm]**2)
-                sigma[firm] = max(sigma[firm], 1e-6)  # Ensure positivity
+            # 1. Vectorized Random Generation
+            z = np.random.standard_normal(num_simulations)
+            
+            if check_normal:
+                t_sample = z
+            else:
+                # Generate Chi2 via Gamma(nu/2, 2) which is standard method
+                # Ensure nu > 0
+                if nu < 1e-4: 
+                    # Fallback to normal if nu is extremely small/invalid
+                    t_sample = z
+                else:
+                    v = np.random.chisquare(nu, num_simulations)
+                    # Protect against v=0 (very rare but possible with small nu)
+                    v = np.maximum(v, 1e-12)
+                    t_sample = z / np.sqrt(v / nu) * t_factor
+            
+            # 2. Vectorized Updates
+            eps = sigma * t_sample
+            
+            # Update Stats (Inline Welford)
+            curr_max = np.maximum(curr_max, sigma)
+            curr_min = np.minimum(curr_min, sigma)
+            
+            n = day + 1
+            delta = sigma - m_old
+            m_new = m_old + delta / n
+            s_old += delta * (sigma - m_new)
+            m_old = m_new
+
+            # Asset Return
+            log_ret = mu + eps
+            asset *= np.exp(log_ret)
+            
+            # 3. Horizon Check
+            if is_horizon[day]:
+                h = horizon_map[day]
+                terminal_vols[h, f, :] = sigma
+                terminal_assets[h, f, :] = asset
+                # Vectorized default check
+                if liability > 0:
+                    default_indicators[h, f, :] = (asset < liability).astype(np.float64)
+            
+            # 4. GARCH Update (Next Step)
+            sigma2 = omega + alpha * eps**2 + beta * sigma**2
+            sigma = np.sqrt(np.maximum(sigma2, 1e-12))
         
-        # Finalize standard deviation calculation
-        for firm in range(num_firms):
-            vol_stds_accum[sim, firm] = np.sqrt(vol_stds_accum[sim, firm] / max_days)
+        # Finalize Stats
+        vol_means[f, :] = m_old
+        vol_stds[f, :] = np.sqrt(s_old / max_days)
+        vol_maxs[f, :] = curr_max
+        vol_mins[f, :] = curr_min
     
-    return terminal_vols, terminal_assets, default_indicators, vol_means, vol_stds_accum, vol_maxs, vol_mins
+    return terminal_vols, terminal_assets, default_indicators, vol_means, vol_stds, vol_maxs, vol_mins
 
 
 def _process_single_date_garch_mc(date_data, num_simulations, num_days):
@@ -172,7 +167,8 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
             'beta': max(firm_data.get('garch_beta', 0.93), 0.0),
             'sigma': max(firm_data.get('garch_volatility', 0.2), 1e-4),
             'return': firm_data.get('return', 0.0),
-            'nu': firm_data.get('garch_nu', 30.0)  # Degrees of freedom for t-dist
+            'nu': firm_data.get('garch_nu', 30.0),  # Degrees of freedom for t-dist
+            'mu': firm_data.get('garch_mu_daily', 0.0)  # Drift/Mean (decimal units)
         }
     
     # Reorder firms consistently
@@ -184,6 +180,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     beta_arr = np.array([garch_params[f]['beta'] for f in firms_on_date])
     sigma_arr = np.array([garch_params[f]['sigma'] for f in firms_on_date])
     nu_arr = np.array([garch_params[f]['nu'] for f in firms_on_date])
+    mu_arr = np.array([garch_params[f]['mu'] for f in firms_on_date])
     
     # Prepare Merton model parameters for optimized simulation
     v0_arr = np.zeros(len(firms_on_date))
@@ -204,39 +201,36 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     horizon_days = np.array([252, 756, 1260], dtype=np.int32)
     
     # Run FULLY OPTIMIZED simulation - calculates EVERYTHING in one pass!
+    # Output shapes:
+    # terminal_vols: (n_horizons, num_firms, num_simulations)
+    # vol_means: (num_firms, num_simulations)
     terminal_vols, terminal_assets, default_indicators, vol_means, vol_stds, vol_maxs, vol_mins = \
-        simulate_garch_paths_t_jit_fully_optimized(
-            omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr,
+        simulate_garch_paths_t_jit_vectorized(
+            omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr, mu_arr,
             num_simulations, len(firms_on_date), horizon_days,
             v0_arr, liability_arr
         )
-    # terminal_vols, terminal_assets, default_indicators shape: (3, num_simulations, num_firms) for 1y/3y/5y
-    # vol_means, vol_stds, vol_maxs, vol_mins shape: (num_simulations, num_firms)
     
     # For each firm, calculate statistics
     for firm_idx, firm in enumerate(firms_on_date):
-        # Extract terminal values at each horizon for this firm
-        firm_vols_1y = terminal_vols[0, :, firm_idx]  # shape: (num_simulations,)
-        firm_vols_3y = terminal_vols[1, :, firm_idx]
-        firm_vols_5y = terminal_vols[2, :, firm_idx]
+        # Extract terminal values at each horizon for this firm (updated for vectorized shape)
+        firm_vols_1y = terminal_vols[0, firm_idx, :]
+        firm_vols_3y = terminal_vols[1, firm_idx, :]
+        firm_vols_5y = terminal_vols[2, firm_idx, :]
         
-        firm_assets_1y = terminal_assets[0, :, firm_idx]
-        firm_assets_3y = terminal_assets[1, :, firm_idx]
-        firm_assets_5y = terminal_assets[2, :, firm_idx]
+        firm_assets_1y = terminal_assets[0, firm_idx, :]
+        firm_assets_3y = terminal_assets[1, firm_idx, :]
+        firm_assets_5y = terminal_assets[2, firm_idx, :]
         
-        firm_defaulted_1y = default_indicators[0, :, firm_idx]
-        firm_defaulted_3y = default_indicators[1, :, firm_idx]
-        firm_defaulted_5y = default_indicators[2, :, firm_idx]
+        firm_defaulted_1y = default_indicators[0, firm_idx, :]
+        firm_defaulted_3y = default_indicators[1, firm_idx, :]
+        firm_defaulted_5y = default_indicators[2, firm_idx, :]
         
         # Get summary statistics for this firm
-        firm_vol_mean = np.mean(vol_means[:, firm_idx])
-        firm_vol_std = np.mean(vol_stds[:, firm_idx])
-        firm_vol_max = np.max(vol_maxs[:, firm_idx])
-        firm_vol_min = np.min(vol_mins[:, firm_idx])
-        
-        # INTEGRATED VARIANCE CALCULATION using terminal volatilities
-        # For 5-year horizon: use terminal values at 1260 days
-        integrated_variance = np.var(firm_vols_5y, ddof=1)
+        firm_vol_mean = np.mean(vol_means[firm_idx, :])
+        firm_vol_std = np.mean(vol_stds[firm_idx, :])
+        firm_vol_max = np.max(vol_maxs[firm_idx, :])
+        firm_vol_min = np.min(vol_mins[firm_idx, :])
         
         # Calculate PD and CDS spreads from pre-computed values
         pd_value_1y = np.mean(firm_defaulted_1y)
@@ -294,16 +288,18 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
         results_list.append({
             'gvkey': firm,
             'date': date,
-            'mc_garch_integrated_variance': integrated_variance,
             'mc_garch_mean_daily_volatility': firm_vol_mean,
             'mc_garch_std_daily_volatility': firm_vol_std,
             'mc_garch_max_daily_volatility': firm_vol_max,
             'mc_garch_min_daily_volatility': firm_vol_min,
             'mc_garch_p95_daily_volatility': firm_p95,
             'mc_garch_p05_daily_volatility': firm_p05,
-            'mc_garch_pd_1y': pd_value_1y,
+            'mc_garch_pd_1y': pd_value_1y, # Now Terminal PD
             'mc_garch_pd_3y': pd_value_3y,
             'mc_garch_pd_5y': pd_value_5y,
+            'mc_garch_pd_terminal_1y': pd_value_1y, # Explicitly named
+            'mc_garch_pd_terminal_3y': pd_value_3y,
+            'mc_garch_pd_terminal_5y': pd_value_5y,
             'mc_garch_implied_spread_1y': mc_spread_1y,
             'mc_garch_implied_spread_3y': mc_spread_3y,
             'mc_garch_implied_spread_5y': mc_spread_5y,
@@ -434,11 +430,28 @@ def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simula
     
     print(f"\nProcessing {len(date_groups)} dates in parallel...")
     
-    # Parallel processing across dates
-    results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_process_single_date_garch_mc)(date_data, num_simulations, num_days) 
-        for date_data in date_groups
-    )
+    # OPTIMIZATION: Avoid Joblib overhead for single date / Numba interaction
+    use_joblib = True
+    if len(date_groups) == 1:
+        use_joblib = False
+    elif len(date_groups) < n_jobs and n_jobs > 1:
+        # If we have fewer dates than cores, allow Numba to parallelize inside
+        pass
+
+    if use_joblib:
+        # Parallel processing across dates
+        print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
+        results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(_process_single_date_garch_mc)(date_data, num_simulations, num_days) 
+            for date_data in date_groups
+        )
+    else:
+        # Run directly in main process - allows Numba to use all cores effectively
+        print("Optimization: Running simulation directly (avoiding Joblib overhead for single/few batches)")
+        results_nested = [
+            _process_single_date_garch_mc(date_data, num_simulations, num_days)
+            for date_data in date_groups
+        ]
     
     # Flatten results
     results_list = []
@@ -452,8 +465,6 @@ def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simula
     print(f"\n{'='*80}")
     print(f"PARALLELIZED MONTE CARLO GARCH COMPLETE")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
-    print(f"Rows per second: {len(results_df) / total_time:.0f}")
-    print(f"Speedup: ~{n_jobs}x expected on {n_jobs}-core system")
     print(f"{'='*80}\n")
     
     return results_df

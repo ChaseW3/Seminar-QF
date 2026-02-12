@@ -119,9 +119,12 @@ def run_garch_estimation(daily_returns_df):
                 alpha = res.params['alpha[1]']
                 beta = res.params['beta[1]']
                 nu = res.params.get('nu', np.nan)  # Degrees of freedom for t-distribution
-                
+                mu_scaled = res.params.get('mu', 0.0) # Mean/Drift (scaled % units)
+
                 # Rescale omega back
                 omega = omega / (SCALE_FACTOR ** 2)
+                # Rescale mu back (percent -> decimal)
+                mu = mu_scaled / SCALE_FACTOR
                 
                 # Store parameters for this window
                 params_row = {
@@ -131,6 +134,7 @@ def run_garch_estimation(daily_returns_df):
                     'alpha': alpha,
                     'beta': beta,
                     'nu': nu,
+                    'mu': mu, # Decimal daily log return drift
                     'persistence': alpha + beta,
                     'unconditional_variance': omega / (1 - alpha - beta) if (alpha + beta) < 1 else np.nan,
                     'log_likelihood': getattr(res, 'loglikelihood', getattr(res, 'llf', np.nan)),
@@ -159,15 +163,16 @@ def run_garch_estimation(daily_returns_df):
         df_out['date'] = pd.to_datetime(df_out['date'])
         
         # Prepare params for merge (rename to garch_ prefix)
-        merge_df = params_df[['gvkey', 'date', 'omega', 'alpha', 'beta', 'nu']].rename(columns={
+        merge_df = params_df[['gvkey', 'date', 'omega', 'alpha', 'beta', 'nu', 'mu']].rename(columns={
             'omega': 'garch_omega',
             'alpha': 'garch_alpha',
             'beta': 'garch_beta',
-            'nu': 'garch_nu'
+            'nu': 'garch_nu',
+            'mu': 'garch_mu_daily'
         })
         
         # Drop existing columns to avoid conflicts
-        drop_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu', 'garch_volatility']
+        drop_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu', 'garch_mu_daily', 'garch_volatility']
         df_out = df_out.drop(columns=[c for c in drop_cols if c in df_out.columns])
         
         # Merge on date (month-ends only match initially)
@@ -175,7 +180,7 @@ def run_garch_estimation(daily_returns_df):
         
         # Forward fill parameters per firm
         df_out = df_out.sort_values(['gvkey', 'date'])
-        fill_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu']
+        fill_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu', 'garch_mu_daily']
         df_out[fill_cols] = df_out.groupby('gvkey')[fill_cols].ffill()
         
         # Calculate approximate volatility (unconditional) for plotting/checking
