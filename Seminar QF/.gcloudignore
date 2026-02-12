@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+notebooks/
+data/
+*.csv
+*.xlsx
+bin/
+obj/
+*.pkl

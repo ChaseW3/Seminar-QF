@@ -1,0 +1,38 @@
+{
+    "taskGroups": [
+      {
+        "taskSpec": {
+          "runnables": [
+            {
+              "container": {
+                "imageUri": "us-central1-docker.pkg.dev/seminar-qf/batch-images/monte-carlo-garch:latest",
+                "entrypoint": "/bin/bash",
+                "commands": [
+                  "-c",
+                  "python /app/batch_driver.py --input-bucket seminar-qf-batch-data-001 --output-bucket seminar-qf-batch-data-001 --num-simulations 1000"
+                ]
+              }
+            }
+          ],
+          "computeResource": {
+            "cpuMilli": 2000,
+            "memoryMib": 4096
+          }
+        },
+        "taskCount": 1000,
+        "parallelism": 500
+      }
+    ],
+    "allocationPolicy": {
+      "instances": [
+        {
+          "policy": {
+            "provisioningModel": "SPOT"
+          }
+        }
+      ]
+    },
+    "logsPolicy": {
+      "destination": "CLOUD_LOGGING"
+    }
+  }
