@@ -64,7 +64,16 @@ def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr,
         
         # T-dist parameters
         check_normal = (nu >= 100)
-        t_factor = np.sqrt((nu - 2) / nu)
+        
+        if nu > 2.05:
+            t_factor = np.sqrt((nu - 2) / nu)
+        else:
+             # If nu <= 2, variance is undefined/infinite. 
+             # For simulation purposes, we can clamp it or treat it as normal if invalid.
+             # However, standard GARCH-t assumes nu > 2 for existence of variance.
+             # We will clamp nu to be slightly above 2 widely used in finance packages.
+             safe_nu = max(nu, 2.0001)
+             t_factor = np.sqrt((safe_nu - 2) / safe_nu)
         
         for day in range(max_days):
             # 1. Vectorized Random Generation

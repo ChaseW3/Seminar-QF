@@ -60,15 +60,9 @@ def run_garch_estimation(daily_returns_df):
         start_date = firm_ts['date'].min()
         end_date = firm_ts['date'].max()
         
-        # Determine rolling windows (Monthly)
-        start_date = firm_ts['date'].min()
-        end_date = firm_ts['date'].max()
-        
         # Start 12 months in to ensure full window
         try:
-            # Shift minimal start date to ensure at least 12 months history
-            # But the actual window selection will enforce "last 252 available days"
-            estimation_start = start_date + pd.DateOffset(months=12)
+            estimation_start = start_date + pd.DateOffset(months=24)
             if estimation_start >= end_date:
                 continue
             month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -77,25 +71,28 @@ def run_garch_estimation(daily_returns_df):
             continue
 
             
-        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M Window)...")
+        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 24M Window)...")
 
             
-        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M Window)...")
+        print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 24M Window)...")
+        
+        last_params = None
         
         for date_point in month_ends:
             # Select all data up to this point
             data_up_to_point = firm_ts[firm_ts['date'] <= date_point]
 
-            # Require at least 252 trading days of history
-            if len(data_up_to_point) < 252:
+            # Require at least 504 trading days of history
+            if len(data_up_to_point) < 504:
                 continue
 
-            # Take the exact last 252 trading days for the window
-            window_df = data_up_to_point.iloc[-252:].copy()
+            # Take the exact last 504 trading days for the window
+            window_df = data_up_to_point.iloc[-504:].copy()
             
             # Additional check for missing values inside the window
-            if window_df['asset_return_daily'].isna().sum() > 20: 
+            if window_df['asset_return_daily'].isna().sum() > 0: 
                  # Skip if too many missing returns in the 252-day window
+                 print(f"Skipping {gvkey} on {date_point.date()}: Missing returns in window")
                  continue
                  
             last_trading_date = window_df['date'].max()
@@ -112,7 +109,13 @@ def run_garch_estimation(daily_returns_df):
             try:
                 # Use Student's t distribution to handle fat tails
                 am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
-                res = am.fit(disp='off', show_warning=False)
+                
+                # Use parameters from previous month as starting values (warm start)
+                start_vals = last_params.values if last_params is not None else None
+                res = am.fit(starting_values=start_vals, disp='off', show_warning=False)
+                
+                # Update parameters for next iteration (warm start)
+                last_params = res.params
                 
                 # Extract parameters (scaled)
                 omega = res.params['omega']
@@ -167,7 +170,7 @@ def run_garch_estimation(daily_returns_df):
             'omega': 'garch_omega',
             'alpha': 'garch_alpha',
             'beta': 'garch_beta',
-            'nu': 'garch_nu',
+             'nu': 'garch_nu',
             'mu': 'garch_mu_daily'
         })
         

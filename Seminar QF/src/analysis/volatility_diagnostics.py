@@ -190,9 +190,15 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         if 'mc_garch_integrated_variance' in df_mc.columns:
             target_col = 'mc_garch_integrated_variance'
             is_variance = True
+            is_daily_mean = False
+        elif 'mc_garch_mean_daily_volatility' in df_mc.columns:
+            target_col = 'mc_garch_mean_daily_volatility'
+            is_variance = False
+            is_daily_mean = True
         else:
             target_col = 'mc_garch_cumulative_volatility'
             is_variance = False
+            is_daily_mean = False
             
         mc_stats = df_mc.groupby('gvkey').agg({
             target_col: ['mean', 'std', 'min', 'max', 'median']
@@ -205,6 +211,10 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
             # Annualized from Integrated Variance: σ_annual = √IV
             mc_stats['mc_annualized_vol_mean'] = np.sqrt(mc_stats['mc_raw_mean'])
             mc_stats['mc_annualized_vol_max'] = np.sqrt(mc_stats['mc_raw_max'])
+        elif is_daily_mean:
+             # Annualized from Mean Daily Volatility: σ_annual = σ_daily * √252
+             mc_stats['mc_annualized_vol_mean'] = mc_stats['mc_raw_mean'] * np.sqrt(252)
+             mc_stats['mc_annualized_vol_max'] = mc_stats['mc_raw_max'] * np.sqrt(252)
         else:
             # Annualized from cumulative: σ_annual = (cumulative / 252) * √252 = cumulative / √252
             mc_stats['mc_annualized_vol_mean'] = mc_stats['mc_raw_mean'] / np.sqrt(252)
