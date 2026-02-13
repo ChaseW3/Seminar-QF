@@ -228,32 +228,55 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     firms_list = df_firms['gvkey'].tolist()
     num_firms = len(firms_list)
     
-    required_ms_cols = [
-        'ms_garch_omega_0', 'ms_garch_omega_1', 'ms_garch_alpha_0', 'ms_garch_alpha_1',
-        'ms_garch_beta_0', 'ms_garch_beta_1', 'ms_garch_mu_0', 'ms_garch_mu_1',
-        'ms_garch_p00', 'ms_garch_p11', 'ms_garch_nu_0', 'ms_garch_nu_1',
-        'ms_garch_volatility', 'ms_garch_regime_prob'
-    ]
-    if all(col in df_firms.columns for col in required_ms_cols):
-        has_estimated_model_params = df_firms[required_ms_cols].notna().all(axis=1).values
-    else:
-        has_estimated_model_params = np.zeros(num_firms, dtype=bool)
+    def _first_existing_series(candidates, default_value):
+        for col in candidates:
+            if col in df_firms.columns:
+                return df_firms[col], True
+        return pd.Series([default_value] * num_firms), False
+
+    column_candidates = {
+        'omega_0': ['ms_garch_omega_0', 'omega_0'],
+        'omega_1': ['ms_garch_omega_1', 'omega_1'],
+        'alpha_0': ['ms_garch_alpha_0', 'alpha_0'],
+        'alpha_1': ['ms_garch_alpha_1', 'alpha_1'],
+        'beta_0': ['ms_garch_beta_0', 'beta_0'],
+        'beta_1': ['ms_garch_beta_1', 'beta_1'],
+        'mu_0': ['ms_garch_mu_0', 'mu_0'],
+        'mu_1': ['ms_garch_mu_1', 'mu_1'],
+        'p00': ['ms_garch_p00', 'p00'],
+        'p11': ['ms_garch_p11', 'p11'],
+        'nu_0': ['ms_garch_nu_0', 'nu_0'],
+        'nu_1': ['ms_garch_nu_1', 'nu_1'],
+        'volatility': ['ms_garch_volatility'],
+        'regime_prob': ['ms_garch_regime_prob'],
+    }
+
+    series_map = {}
+    has_estimated_model_params = np.ones(num_firms, dtype=bool)
+
+    for key, candidates in column_candidates.items():
+        series, exists = _first_existing_series(candidates, np.nan)
+        series_map[key] = series
+        if exists:
+            has_estimated_model_params &= series.notna().values
+        else:
+            has_estimated_model_params &= False
 
     # Vectorized parameter extraction with defaults and floors
-    omega_0_arr = np.maximum(df_firms.get('ms_garch_omega_0', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
-    omega_1_arr = np.maximum(df_firms.get('ms_garch_omega_1', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
-    alpha_0_arr = np.maximum(df_firms.get('ms_garch_alpha_0', pd.Series([0.05]*num_firms)).fillna(0.05).values, 1e-4)
-    alpha_1_arr = np.maximum(df_firms.get('ms_garch_alpha_1', pd.Series([0.05]*num_firms)).fillna(0.05).values, 1e-4)
-    beta_0_arr = np.maximum(df_firms.get('ms_garch_beta_0', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
-    beta_1_arr = np.maximum(df_firms.get('ms_garch_beta_1', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
-    mu_0_arr = df_firms.get('ms_garch_mu_0', pd.Series([0.0]*num_firms)).fillna(0.0).values
-    mu_1_arr = df_firms.get('ms_garch_mu_1', pd.Series([0.0]*num_firms)).fillna(0.0).values
-    p00_arr = df_firms.get('ms_garch_p00', pd.Series([0.95]*num_firms)).fillna(0.95).values
-    p11_arr = df_firms.get('ms_garch_p11', pd.Series([0.95]*num_firms)).fillna(0.95).values
-    nu_0_arr = df_firms.get('ms_garch_nu_0', pd.Series([30.0]*num_firms)).fillna(30.0).values
-    nu_1_arr = df_firms.get('ms_garch_nu_1', pd.Series([30.0]*num_firms)).fillna(30.0).values
-    sigma_arr = np.maximum(df_firms.get('ms_garch_volatility', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
-    regime_prob_arr = df_firms.get('ms_garch_regime_prob', pd.Series([0.5]*num_firms)).fillna(0.5).values
+    omega_0_arr = np.maximum(series_map['omega_0'].fillna(1e-6).values, 1e-8)
+    omega_1_arr = np.maximum(series_map['omega_1'].fillna(1e-6).values, 1e-8)
+    alpha_0_arr = np.maximum(series_map['alpha_0'].fillna(0.05).values, 1e-4)
+    alpha_1_arr = np.maximum(series_map['alpha_1'].fillna(0.05).values, 1e-4)
+    beta_0_arr = np.maximum(series_map['beta_0'].fillna(0.93).values, 0.0)
+    beta_1_arr = np.maximum(series_map['beta_1'].fillna(0.93).values, 0.0)
+    mu_0_arr = series_map['mu_0'].fillna(0.0).values
+    mu_1_arr = series_map['mu_1'].fillna(0.0).values
+    p00_arr = series_map['p00'].fillna(0.95).values
+    p11_arr = series_map['p11'].fillna(0.95).values
+    nu_0_arr = series_map['nu_0'].fillna(30.0).values
+    nu_1_arr = series_map['nu_1'].fillna(30.0).values
+    sigma_arr = np.maximum(series_map['volatility'].fillna(0.02).values, 1e-4)
+    regime_prob_arr = series_map['regime_prob'].fillna(0.5).values
     
     # Prepare Merton arrays
     v0_arr = np.full(num_firms, np.nan)
