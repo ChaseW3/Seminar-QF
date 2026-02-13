@@ -9,9 +9,9 @@
               "entrypoint": "python",
               "commands": [
                 "/app/batch_driver.py",
-                "--model", "garch",
+                "--model", "regime-switching",
                 "--input-bucket", "seminar-qf-batch-data-001",
-                "--input-file", "data/output/daily_asset_returns_with_garch.csv",
+                "--input-file", "data/output/daily_asset_returns_with_regime.csv",
                 "--merton-file", "data/output/merged_data_with_merton.csv",
                 "--output-bucket", "seminar-qf-batch-data-001",
                 "--output-prefix", "output/results",

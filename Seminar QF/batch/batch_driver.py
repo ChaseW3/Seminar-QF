@@ -4,7 +4,11 @@ import argparse
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from google.cloud import storage
+
+try:
+    from google.cloud import storage
+except ImportError:
+    storage = None
 
 # Add project root to path
 # Assuming this script runs from /app in the container
@@ -14,25 +18,35 @@ if str(project_root) not in sys.path:
 
 try:
     from src.analysis.monte_carlo_garch import monte_carlo_garch_1year_parallel
+    from src.analysis.monte_carlo_regime_switching import monte_carlo_regime_switching_1year_parallel
+    from src.analysis.monte_carlo_ms_garch import monte_carlo_ms_garch_1year_parallel
 except ImportError:
     # Try adding one level up if run from a subdirectory
     sys.path.append(str(project_root.parent))
     from src.analysis.monte_carlo_garch import monte_carlo_garch_1year_parallel
+    from src.analysis.monte_carlo_regime_switching import monte_carlo_regime_switching_1year_parallel
+    from src.analysis.monte_carlo_ms_garch import monte_carlo_ms_garch_1year_parallel
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch Monte Carlo GARCH Simulation")
+    parser = argparse.ArgumentParser(description="Batch Monte Carlo Simulation (GARCH / RS / MS-GARCH)")
     parser.add_argument('--job-index', type=int, default=os.environ.get('BATCH_TASK_INDEX', 0), help='Index of current batch task')
     parser.add_argument('--task-count', type=int, default=os.environ.get('BATCH_TASK_COUNT', 1), help='Total number of batch tasks')
+    parser.add_argument('--model', required=True, choices=['garch', 'regime-switching', 'ms-garch'], help='Model type to run')
     parser.add_argument('--input-bucket', required=True, help='GCS bucket containing input data')
-    parser.add_argument('--input-file', default='data/output/daily_asset_returns_with_garch.csv', help='Path to input CSV in bucket')
+    parser.add_argument('--input-file', required=True, help='Path to model input CSV in bucket')
     parser.add_argument('--merton-file', default='data/output/merged_data_with_merton.csv', help='Path to Merton CSV in bucket')
     parser.add_argument('--output-bucket', required=True, help='GCS bucket for output results')
     parser.add_argument('--output-prefix', default='output/results', help='Prefix for output files')
     parser.add_argument('--num-simulations', type=int, default=1000, help='Number of simulations per firm')
+    parser.add_argument('--n-jobs', type=int, default=1, help='Joblib parallel jobs within task (usually 1 for Batch sharding)')
+    parser.add_argument('--use-antithetic', action='store_true', help='Enable antithetic variates for variance reduction')
+    parser.add_argument('--keep-missing-params', action='store_true', help='Do not exclude rows without estimated model parameters')
     return parser.parse_args()
 
 def download_blob(bucket_name, source_blob_name, destination_file_name):
     """Downloads a blob from the bucket."""
+    if storage is None:
+        raise ImportError("google-cloud-storage is required to download from GCS.")
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(source_blob_name)
@@ -41,6 +55,8 @@ def download_blob(bucket_name, source_blob_name, destination_file_name):
 
 def upload_blob(bucket_name, source_file_name, destination_blob_name):
     """Uploads a file to the bucket."""
+    if storage is None:
+        raise ImportError("google-cloud-storage is required to upload to GCS.")
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(destination_blob_name)
@@ -103,22 +119,56 @@ def main():
         merton_full = pd.read_csv(local_merton)
         # Filter Merton data to relevant dates/firms to save memory
         merton_df_arg = merton_full[merton_full['date'].isin(task_dates)].copy()
+    else:
+        print("Error: Merton file is required but was not available.")
+        sys.exit(1)
     
+    # Save task-specific subset and merton files locally.
+    local_subset = f"subset_{args.model}_{args.job_index}.csv"
+    df_subset.to_csv(local_subset, index=False)
+
+    local_merton_subset = local_merton
+    if merton_df_arg is not None and not merton_df_arg.empty:
+        local_merton_subset = f"merton_subset_{args.job_index}.csv"
+        merton_df_arg.to_csv(local_merton_subset, index=False)
+
     # 3. Run Simulation
-    # n_jobs=1 because we rely on Batch parallelism. 
-    # If the VM has multiple cores, we could increase this, but for 10000 splits, 1 core is best.
-    results = monte_carlo_garch_1year_parallel(
-        garch_file=df_subset,
-        num_simulations=args.num_simulations,
-        n_jobs=1,
-        merton_df=merton_df_arg
-    )
+    exclude_missing = not args.keep_missing_params
+    print(f"Running model={args.model}, simulations={args.num_simulations}, antithetic={args.use_antithetic}, exclude_missing_params={exclude_missing}")
+
+    if args.model == 'garch':
+        results = monte_carlo_garch_1year_parallel(
+            garch_file=local_subset,
+            merton_file=local_merton_subset,
+            num_simulations=args.num_simulations,
+            n_jobs=args.n_jobs,
+            exclude_firms_without_estimated_garch=exclude_missing,
+            use_antithetic=args.use_antithetic,
+        )
+    elif args.model == 'regime-switching':
+        results = monte_carlo_regime_switching_1year_parallel(
+            regime_params_file=local_subset,
+            merton_file=local_merton_subset,
+            num_simulations=args.num_simulations,
+            n_jobs=args.n_jobs,
+            exclude_firms_without_estimated_params=exclude_missing,
+            use_antithetic=args.use_antithetic,
+        )
+    else:
+        results = monte_carlo_ms_garch_1year_parallel(
+            ms_garch_file=local_subset,
+            merton_file=local_merton_subset,
+            num_simulations=args.num_simulations,
+            n_jobs=args.n_jobs,
+            exclude_firms_without_estimated_params=exclude_missing,
+            use_antithetic=args.use_antithetic,
+        )
     
     # 4. Upload Results
-    local_output = f"results_{args.job_index}.csv"
+    local_output = f"results_{args.model}_{args.job_index}.csv"
     results.to_csv(local_output, index=False)
     
-    target_blob = f"{args.output_prefix}/batch_results_{args.job_index}.csv"
+    target_blob = f"{args.output_prefix}/{args.model}/batch_results_{args.job_index}.csv"
     upload_blob(args.output_bucket, local_output, target_blob)
     
     print("Batch Task Complete.")

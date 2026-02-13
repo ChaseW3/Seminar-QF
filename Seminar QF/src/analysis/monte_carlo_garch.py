@@ -5,7 +5,6 @@ import numpy as np
 import os
 from datetime import timedelta
 import numba
-from scipy import stats
 from joblib import Parallel, delayed
 
 
@@ -13,7 +12,8 @@ from joblib import Parallel, delayed
 def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr, 
                                     sigma_arr, nu_arr, mu_arr,
                                     num_simulations, num_firms,
-                                    horizon_days, v0_arr, liability_arr, rf_arr):
+                                    horizon_days, v0_arr, liability_arr, rf_arr,
+                                    use_antithetic=False):
     """
     Optimized Monte Carlo GARCH simulation that computes only PD and spreads.
     Uses log-asset evolution and sigma2 state to minimize exp() calls.
@@ -80,12 +80,30 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         
         for day in range(max_days):
             # 1. Vectorized Random Generation
-            z = np.random.standard_normal(num_simulations)
+            if use_antithetic and num_simulations > 1:
+                half = num_simulations // 2
+                z_half = np.random.standard_normal(half)
+                z = np.empty(num_simulations)
+                z[:half] = z_half
+                z[half:(2 * half)] = -z_half
+                if num_simulations % 2 == 1:
+                    z[num_simulations - 1] = np.random.standard_normal()
+            else:
+                z = np.random.standard_normal(num_simulations)
             
             if check_normal:
                 t_sample = z
             else:
-                v = np.random.chisquare(nu, num_simulations)
+                if use_antithetic and num_simulations > 1:
+                    half = num_simulations // 2
+                    v_half = np.random.chisquare(nu, half)
+                    v = np.empty(num_simulations)
+                    v[:half] = v_half
+                    v[half:(2 * half)] = v_half
+                    if num_simulations % 2 == 1:
+                        v[num_simulations - 1] = np.random.chisquare(nu)
+                else:
+                    v = np.random.chisquare(nu, num_simulations)
                 v = np.maximum(v, 1e-12)
                 t_sample = z / np.sqrt(v / nu) * t_factor
             
@@ -134,7 +152,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
     return pd_out, spread_out, debt_out
 
 
-def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_garch=True):
+def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_garch=True, use_antithetic=False):
     """
     Parameters:
     -----------
@@ -201,7 +219,8 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     pd_out, spread_out, debt_out = simulate_garch_pd_spreads_t_jit(
         omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr, mu_arr,
         num_simulations, num_firms, horizon_days,
-        v0_arr, liability_arr, rf_arr
+        v0_arr, liability_arr, rf_arr,
+        use_antithetic,
     )
 
     if exclude_firms_without_estimated_garch:
@@ -249,7 +268,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     return results_list
 
 
-def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_garch=True):
+def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_garch=True, use_antithetic=False):
     print(f"Loading GARCH data from {garch_file}...")
     df = pd.read_csv(garch_file)
     
@@ -267,6 +286,7 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
     print(f"  Forecast horizon: {num_days} days")
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t")
+    print(f"  Antithetic variates: {use_antithetic}")
     print(f"  Exclude rows without estimated GARCH params: {exclude_firms_without_estimated_garch}")
     
     start_time = pd.Timestamp.now()
@@ -311,6 +331,7 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
             num_simulations,
             num_days,
             exclude_firms_without_estimated_garch,
+            use_antithetic,
         ) 
         for date_data in date_groups
     )

@@ -6,6 +6,7 @@ $REPO_NAME = "batch-images"
 $IMAGE_NAME = "monte-carlo-garch"
 $IMAGE_TAG = "latest"
 $IMAGE_URI = "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$IMAGE_NAME`:$IMAGE_TAG"
+$MODEL = "garch"  # garch | regime-switching | ms-garch
 
 Write-Host "--- Google Cloud Batch Setup ---" -ForegroundColor Cyan
 Write-Host "Project: $PROJECT_ID"
@@ -45,6 +46,8 @@ $ProjectRoot = Split-Path -Parent $ScriptDir
 Set-Location $ProjectRoot
 
 $InputFile = "data/output/daily_asset_returns_with_garch.csv"
+$InputFileRS = "data/output/daily_asset_returns_with_regime.csv"
+$InputFileMSG = "data/output/daily_asset_returns_with_msgarch.csv"
 $MertonFile = "data/output/merged_data_with_merton.csv"
 
 if (Test-Path $InputFile) {
@@ -52,7 +55,20 @@ if (Test-Path $InputFile) {
     Write-Host "Uploaded $InputFile" -ForegroundColor Green
 } else {
     Write-Error "Input file not found: $InputFile"
-    exit 1
+}
+
+if (Test-Path $InputFileRS) {
+    gcloud storage cp $InputFileRS gs://$BUCKET_NAME/data/output/
+    Write-Host "Uploaded $InputFileRS" -ForegroundColor Green
+} else {
+    Write-Warning "Input file not found: $InputFileRS"
+}
+
+if (Test-Path $InputFileMSG) {
+    gcloud storage cp $InputFileMSG gs://$BUCKET_NAME/data/output/
+    Write-Host "Uploaded $InputFileMSG" -ForegroundColor Green
+} else {
+    Write-Warning "Input file not found: $InputFileMSG"
 }
 
 if (Test-Path $MertonFile) {
@@ -78,8 +94,15 @@ if ($LASTEXITCODE -eq 0) {
 
 # 6. Submit Batch Job
 Write-Host "`n[6/6] Submitting Batch Job..."
+$jobConfig = "batch/job_garch_10k.json"
+if ($MODEL -eq "regime-switching") {
+    $jobConfig = "batch/job_regime_switching_10k.json"
+} elseif ($MODEL -eq "ms-garch") {
+    $jobConfig = "batch/job_ms_garch_10k.json"
+}
+
 gcloud batch jobs submit "monte-carlo-run-$(Get-Date -Format 'yyyyMMdd-HHmm')" `
     --location $REGION `
-    --config batch/job.json
+    --config $jobConfig
 
 Write-Host "`n--- Setup Complete! Check the Google Cloud Console for job status. ---" -ForegroundColor Cyan

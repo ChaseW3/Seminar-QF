@@ -5,7 +5,6 @@ import numpy as np
 import os
 from datetime import timedelta
 import numba
-from scipy import stats
 from joblib import Parallel, delayed
 
 
@@ -16,7 +15,8 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                                        p00_arr, p11_arr, nu_0_arr, nu_1_arr,
                                        sigma_arr, regime_prob_arr,
                                        num_simulations, num_firms,
-                                       horizon_days, v0_arr, liability_arr, rf_arr):
+                                       horizon_days, v0_arr, liability_arr, rf_arr,
+                                       use_antithetic=False):
     """
     Optimized Monte Carlo MS-GARCH simulation that computes only PD and spreads.
     Uses log-asset evolution and sigma2 state to minimize exp() calls.
@@ -102,38 +102,57 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
         
         for day in range(max_days):
             # 1. Vectorized Random Generation per regime
-            z = np.random.standard_normal(num_simulations)
+            if use_antithetic and num_simulations > 1:
+                half = num_simulations // 2
+                z_half = np.random.standard_normal(half)
+                z = np.empty(num_simulations)
+                z[:half] = z_half
+                z[half:(2 * half)] = -z_half
+                if num_simulations % 2 == 1:
+                    z[num_simulations - 1] = np.random.standard_normal()
+            else:
+                z = np.random.standard_normal(num_simulations)
             
             # Generate t-distributed samples for both regimes
-            t_sample = np.zeros(num_simulations)
-            
-            for i in range(num_simulations):
-                if regime_1_mask[i]:
-                    # Regime 1
-                    if check_normal_1:
-                        t_sample[i] = z[i]
-                    else:
-                        v = np.random.chisquare(nu_1)
-                        v = max(v, 1e-12)
-                        t_sample[i] = z[i] / np.sqrt(v / nu_1) * t_factor_1
+            if check_normal_0:
+                t_sample_0 = z
+            else:
+                if use_antithetic and num_simulations > 1:
+                    half = num_simulations // 2
+                    v0_half = np.random.chisquare(nu_0, half)
+                    v0 = np.empty(num_simulations)
+                    v0[:half] = v0_half
+                    v0[half:(2 * half)] = v0_half
+                    if num_simulations % 2 == 1:
+                        v0[num_simulations - 1] = np.random.chisquare(nu_0)
                 else:
-                    # Regime 0
-                    if check_normal_0:
-                        t_sample[i] = z[i]
-                    else:
-                        v = np.random.chisquare(nu_0)
-                        v = max(v, 1e-12)
-                        t_sample[i] = z[i] / np.sqrt(v / nu_0) * t_factor_0
+                    v0 = np.random.chisquare(nu_0, num_simulations)
+                v0 = np.maximum(v0, 1e-12)
+                t_sample_0 = z / np.sqrt(v0 / nu_0) * t_factor_0
+
+            if check_normal_1:
+                t_sample_1 = z
+            else:
+                if use_antithetic and num_simulations > 1:
+                    half = num_simulations // 2
+                    v1_half = np.random.chisquare(nu_1, half)
+                    v1 = np.empty(num_simulations)
+                    v1[:half] = v1_half
+                    v1[half:(2 * half)] = v1_half
+                    if num_simulations % 2 == 1:
+                        v1[num_simulations - 1] = np.random.chisquare(nu_1)
+                else:
+                    v1 = np.random.chisquare(nu_1, num_simulations)
+                v1 = np.maximum(v1, 1e-12)
+                t_sample_1 = z / np.sqrt(v1 / nu_1) * t_factor_1
+
+            t_sample = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
             # 2. Vectorized Updates with regime-specific parameters
             eps = sigma * t_sample
             
             # Update log-asset with regime-specific drift
-            for i in range(num_simulations):
-                if regime_1_mask[i]:
-                    log_asset[i] += mu_1 + eps[i]
-                else:
-                    log_asset[i] += mu_0 + eps[i]
+            log_asset += np.where(regime_1_mask, mu_1 + eps, mu_0 + eps)
             
             # 3. Horizon Check
             if is_horizon[day]:
@@ -149,25 +168,19 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                 payoff_sums[h] = np.sum(payoffs)
             
             # 4. GARCH Update using sigma2 state with regime-specific parameters
-            for i in range(num_simulations):
-                if regime_1_mask[i]:
-                    sigma2[i] = omega_1 + alpha_1 * eps[i]**2 + beta_1 * sigma2[i]
-                else:
-                    sigma2[i] = omega_0 + alpha_0 * eps[i]**2 + beta_0 * sigma2[i]
-                sigma2[i] = max(sigma2[i], 1e-12)
-                sigma[i] = np.sqrt(sigma2[i])
+            sigma2 = np.where(
+                regime_1_mask,
+                omega_1 + alpha_1 * eps**2 + beta_1 * sigma2,
+                omega_0 + alpha_0 * eps**2 + beta_0 * sigma2,
+            )
+            sigma2 = np.maximum(sigma2, 1e-12)
+            sigma = np.sqrt(sigma2)
             
             # 5. Regime Transition
             u = np.random.random(num_simulations)
-            for i in range(num_simulations):
-                if regime_1_mask[i]:
-                    # In regime 1, stay with prob p11
-                    if u[i] > p11:
-                        regime_1_mask[i] = False
-                else:
-                    # In regime 0, stay with prob p00
-                    if u[i] > p00:
-                        regime_1_mask[i] = True
+            switch_to_0 = regime_1_mask & (u > p11)
+            switch_to_1 = (~regime_1_mask) & (u > p00)
+            regime_1_mask = (regime_1_mask & (~switch_to_0)) | switch_to_1
         
         # Compute PD and spreads for each horizon
         for h in range(n_horizons):
@@ -190,7 +203,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
     return pd_out, spread_out, debt_out
 
 
-def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days):
+def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False):
     """
     Parameters:
     -----------
@@ -215,6 +228,17 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days):
     firms_list = df_firms['gvkey'].tolist()
     num_firms = len(firms_list)
     
+    required_ms_cols = [
+        'ms_garch_omega_0', 'ms_garch_omega_1', 'ms_garch_alpha_0', 'ms_garch_alpha_1',
+        'ms_garch_beta_0', 'ms_garch_beta_1', 'ms_garch_mu_0', 'ms_garch_mu_1',
+        'ms_garch_p00', 'ms_garch_p11', 'ms_garch_nu_0', 'ms_garch_nu_1',
+        'ms_garch_volatility', 'ms_garch_regime_prob'
+    ]
+    if all(col in df_firms.columns for col in required_ms_cols):
+        has_estimated_model_params = df_firms[required_ms_cols].notna().all(axis=1).values
+    else:
+        has_estimated_model_params = np.zeros(num_firms, dtype=bool)
+
     # Vectorized parameter extraction with defaults and floors
     omega_0_arr = np.maximum(df_firms.get('ms_garch_omega_0', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
     omega_1_arr = np.maximum(df_firms.get('ms_garch_omega_1', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
@@ -228,7 +252,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days):
     p11_arr = df_firms.get('ms_garch_p11', pd.Series([0.95]*num_firms)).fillna(0.95).values
     nu_0_arr = df_firms.get('ms_garch_nu_0', pd.Series([30.0]*num_firms)).fillna(30.0).values
     nu_1_arr = df_firms.get('ms_garch_nu_1', pd.Series([30.0]*num_firms)).fillna(30.0).values
-    sigma_arr = np.maximum(df_firms.get('ms_garch_volatility', pd.Series([0.2]*num_firms)).fillna(0.2).values, 1e-4)
+    sigma_arr = np.maximum(df_firms.get('ms_garch_volatility', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     regime_prob_arr = df_firms.get('ms_garch_regime_prob', pd.Series([0.5]*num_firms)).fillna(0.5).values
     
     # Prepare Merton arrays
@@ -261,8 +285,16 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days):
         p00_arr, p11_arr, nu_0_arr, nu_1_arr,
         sigma_arr, regime_prob_arr,
         num_simulations, num_firms, horizon_days,
-        v0_arr, liability_arr, rf_arr
+        v0_arr, liability_arr, rf_arr,
+        use_antithetic,
     )
+
+    if exclude_firms_without_estimated_params:
+        invalid_mask = ~has_estimated_model_params
+        if np.any(invalid_mask):
+            pd_out[:, invalid_mask] = np.nan
+            spread_out[:, invalid_mask] = np.nan
+            debt_out[:, invalid_mask] = np.nan
     
     # Extract results by horizon
     pd_1y = pd_out[0, :]
@@ -283,6 +315,8 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days):
         results_list.append({
             'gvkey': firm,
             'date': date,
+            'has_estimated_ms_garch_params': bool(has_estimated_model_params[firm_idx]),
+            'used_default_ms_garch_inputs': bool(not has_estimated_model_params[firm_idx]),
             'mc_ms_garch_pd_1y': pd_1y[firm_idx],
             'mc_ms_garch_pd_3y': pd_3y[firm_idx],
             'mc_ms_garch_pd_5y': pd_5y[firm_idx],
@@ -300,7 +334,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days):
     return results_list
 
 
-def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1):
+def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False):
     print(f"Loading MS-GARCH data from {ms_garch_file}...")
     df = pd.read_csv(ms_garch_file)
     
@@ -318,6 +352,8 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     print(f"  Forecast horizon: {num_days} days")
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t per regime")
+    print(f"  Antithetic variates: {use_antithetic}")
+    print(f"  Exclude rows without estimated MS-GARCH params: {exclude_firms_without_estimated_params}")
     
     start_time = pd.Timestamp.now()
     
@@ -356,7 +392,13 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     # Parallel processing across dates
     print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_process_single_date_ms_garch_mc)(date_data, num_simulations, num_days) 
+        delayed(_process_single_date_ms_garch_mc)(
+            date_data,
+            num_simulations,
+            num_days,
+            exclude_firms_without_estimated_params,
+            use_antithetic,
+        ) 
         for date_data in date_groups
     )
     
@@ -372,6 +414,9 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     print(f"\n{'='*80}")
     print(f"PARALLELIZED MONTE CARLO MS-GARCH COMPLETE")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
+    if not results_df.empty and 'used_default_ms_garch_inputs' in results_df.columns:
+        excluded_share = results_df['used_default_ms_garch_inputs'].mean()
+        print(f"Rows without estimated MS-GARCH params (excluded from spreads): {excluded_share:.2%}")
     print(f"{'='*80}\n")
     
     return results_df

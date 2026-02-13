@@ -14,7 +14,8 @@ def simulate_regime_switching_vectorized(
     mu_0, mu_1, ar_0, ar_1, sigma_0, sigma_1, nu_0, nu_1,
     trans_00, trans_01, trans_10, trans_11,
     num_simulations, num_firms, horizon_days, initial_regime_probs,
-    v0_arr, liability_arr, rf_arr
+    v0_arr, liability_arr, rf_arr,
+    use_antithetic=False,
 ):
     """
     Optimized regime-switching Monte Carlo simulation with T-DISTRIBUTION.
@@ -110,20 +111,47 @@ def simulate_regime_switching_vectorized(
             sigma = np.where(regime_1_mask, s1, s0)
             
             # 3. Vectorized Random Generation (T-dist)
-            z = np.random.standard_normal(num_simulations)
+            if use_antithetic and num_simulations > 1:
+                half = num_simulations // 2
+                z_half = np.random.standard_normal(half)
+                z = np.empty(num_simulations)
+                z[:half] = z_half
+                z[half:(2 * half)] = -z_half
+                if num_simulations % 2 == 1:
+                    z[num_simulations - 1] = np.random.standard_normal()
+            else:
+                z = np.random.standard_normal(num_simulations)
             
             # Generate t-samples for both regimes
             if check_normal_0:
                 t_sample_0 = z
             else:
-                v0 = np.random.chisquare(n0, num_simulations)
+                if use_antithetic and num_simulations > 1:
+                    half = num_simulations // 2
+                    v0_half = np.random.chisquare(n0, half)
+                    v0 = np.empty(num_simulations)
+                    v0[:half] = v0_half
+                    v0[half:(2 * half)] = v0_half
+                    if num_simulations % 2 == 1:
+                        v0[num_simulations - 1] = np.random.chisquare(n0)
+                else:
+                    v0 = np.random.chisquare(n0, num_simulations)
                 v0 = np.maximum(v0, 1e-12)
                 t_sample_0 = z / np.sqrt(v0 / n0) * t_factor_0
             
             if check_normal_1:
                 t_sample_1 = z
             else:
-                v1 = np.random.chisquare(n1, num_simulations)
+                if use_antithetic and num_simulations > 1:
+                    half = num_simulations // 2
+                    v1_half = np.random.chisquare(n1, half)
+                    v1 = np.empty(num_simulations)
+                    v1[:half] = v1_half
+                    v1[half:(2 * half)] = v1_half
+                    if num_simulations % 2 == 1:
+                        v1[num_simulations - 1] = np.random.chisquare(n1)
+                else:
+                    v1 = np.random.chisquare(n1, num_simulations)
                 v1 = np.maximum(v1, 1e-12)
                 t_sample_1 = z / np.sqrt(v1 / n1) * t_factor_1
             
@@ -174,7 +202,7 @@ def simulate_regime_switching_vectorized(
     return pd_out, spread_out, debt_out, regime_fractions
 
 
-def _process_single_date_rs_mc(date_data, num_simulations, num_days):
+def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False):
     """
     Parameters:
     -----------
@@ -199,13 +227,23 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     firms_list = df_firms['gvkey'].tolist()
     num_firms = len(firms_list)
     
+    required_rs_cols = [
+        'regime_0_mean', 'regime_1_mean', 'regime_0_ar', 'regime_1_ar',
+        'regime_0_vol', 'regime_1_vol', 'regime_0_nu', 'regime_1_nu',
+        'transition_prob_00', 'transition_prob_01', 'transition_prob_10', 'transition_prob_11'
+    ]
+    if all(col in df_firms.columns for col in required_rs_cols):
+        has_estimated_model_params = df_firms[required_rs_cols].notna().all(axis=1).values
+    else:
+        has_estimated_model_params = np.zeros(num_firms, dtype=bool)
+
     # Vectorized parameter extraction with defaults and floors
     mu_0_arr = df_firms.get('regime_0_mean', pd.Series([0.0]*num_firms)).fillna(0.0).values
     mu_1_arr = df_firms.get('regime_1_mean', pd.Series([0.0]*num_firms)).fillna(0.0).values
     ar_0_arr = df_firms.get('regime_0_ar', pd.Series([0.0]*num_firms)).fillna(0.0).values
     ar_1_arr = df_firms.get('regime_1_ar', pd.Series([0.0]*num_firms)).fillna(0.0).values
-    sigma_0_arr = np.maximum(df_firms.get('regime_0_vol', pd.Series([0.2]*num_firms)).fillna(0.2).values, 1e-4)
-    sigma_1_arr = np.maximum(df_firms.get('regime_1_vol', pd.Series([0.2]*num_firms)).fillna(0.2).values, 1e-4)
+    sigma_0_arr = np.maximum(df_firms.get('regime_0_vol', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
+    sigma_1_arr = np.maximum(df_firms.get('regime_1_vol', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     nu_0_arr = df_firms.get('regime_0_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
     nu_1_arr = df_firms.get('regime_1_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
     trans_00_arr = df_firms.get('transition_prob_00', pd.Series([0.95]*num_firms)).fillna(0.95).values
@@ -244,8 +282,17 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
         mu_0_arr, mu_1_arr, ar_0_arr, ar_1_arr, sigma_0_arr, sigma_1_arr, nu_0_arr, nu_1_arr,
         trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
         num_simulations, num_firms, horizon_days, initial_regime_probs,
-        v0_arr, liability_arr, rf_arr
+        v0_arr, liability_arr, rf_arr,
+        use_antithetic,
     )
+
+    if exclude_firms_without_estimated_params:
+        invalid_mask = ~has_estimated_model_params
+        if np.any(invalid_mask):
+            pd_out[:, invalid_mask] = np.nan
+            spread_out[:, invalid_mask] = np.nan
+            debt_out[:, invalid_mask] = np.nan
+            regime_fractions[:, invalid_mask] = np.nan
     
     # Extract results by horizon
     pd_1y = pd_out[0, :]
@@ -269,6 +316,8 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
         results_list.append({
             'gvkey': firm,
             'date': date,
+            'has_estimated_rs_params': bool(has_estimated_model_params[firm_idx]),
+            'used_default_rs_inputs': bool(not has_estimated_model_params[firm_idx]),
             'rs_fraction_regime_0': regime_0_frac[firm_idx],
             'rs_fraction_regime_1': regime_1_frac[firm_idx],
             'rs_probability_of_default': pd_1y[firm_idx],
@@ -289,7 +338,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days):
     return results_list
 
 
-def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1):
+def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False):
     print(f"Loading Regime-Switching data from {regime_params_file}...")
     df = pd.read_csv(regime_params_file)
     
@@ -307,6 +356,8 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     print(f"  Forecast horizon: {num_days} days")
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t")
+    print(f"  Antithetic variates: {use_antithetic}")
+    print(f"  Exclude rows without estimated RS params: {exclude_firms_without_estimated_params}")
     
     start_time = pd.Timestamp.now()
     
@@ -345,7 +396,13 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     # Parallel processing across dates
     print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_process_single_date_rs_mc)(date_data, num_simulations, num_days) 
+        delayed(_process_single_date_rs_mc)(
+            date_data,
+            num_simulations,
+            num_days,
+            exclude_firms_without_estimated_params,
+            use_antithetic,
+        ) 
         for date_data in date_groups
     )
     
@@ -361,6 +418,9 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     print(f"\n{'='*80}")
     print(f"PARALLELIZED MONTE CARLO REGIME-SWITCHING COMPLETE")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
+    if not results_df.empty and 'used_default_rs_inputs' in results_df.columns:
+        excluded_share = results_df['used_default_rs_inputs'].mean()
+        print(f"Rows without estimated RS params (excluded from spreads): {excluded_share:.2%}")
     print(f"{'='*80}\n")
     
     return results_df
