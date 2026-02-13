@@ -134,7 +134,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
     return pd_out, spread_out, debt_out
 
 
-def _process_single_date_garch_mc(date_data, num_simulations, num_days):
+def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_garch=True):
     """
     Parameters:
     -----------
@@ -159,11 +159,18 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     firms_list = df_firms['gvkey'].tolist()
     num_firms = len(firms_list)
     
-    # Vectorized parameter extraction with defaults and floors
+    required_garch_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_volatility', 'garch_nu', 'garch_mu_daily']
+    if all(col in df_firms.columns for col in required_garch_cols):
+        has_estimated_garch_params = df_firms[required_garch_cols].notna().all(axis=1).values
+    else:
+        has_estimated_garch_params = np.zeros(num_firms, dtype=bool)
+
+    # Vectorized parameter extraction with conservative defaults only for numerical safety.
+    # Missing estimated parameters are excluded from output when exclude_firms_without_estimated_garch=True.
     omega_arr = np.maximum(df_firms.get('garch_omega', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
     alpha_arr = np.maximum(df_firms.get('garch_alpha', pd.Series([0.05]*num_firms)).fillna(0.05).values, 1e-4)
     beta_arr = np.maximum(df_firms.get('garch_beta', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
-    sigma_arr = np.maximum(df_firms.get('garch_volatility', pd.Series([0.2]*num_firms)).fillna(0.2).values, 1e-4)
+    sigma_arr = np.maximum(df_firms.get('garch_volatility', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     nu_arr = df_firms.get('garch_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
     mu_arr = df_firms.get('garch_mu_daily', pd.Series([0.0]*num_firms)).fillna(0.0).values
     
@@ -196,6 +203,13 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
         num_simulations, num_firms, horizon_days,
         v0_arr, liability_arr, rf_arr
     )
+
+    if exclude_firms_without_estimated_garch:
+        invalid_mask = ~has_estimated_garch_params
+        if np.any(invalid_mask):
+            pd_out[:, invalid_mask] = np.nan
+            spread_out[:, invalid_mask] = np.nan
+            debt_out[:, invalid_mask] = np.nan
     
     # Extract results by horizon
     pd_1y = pd_out[0, :]
@@ -216,6 +230,8 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
         results_list.append({
             'gvkey': firm,
             'date': date,
+            'has_estimated_garch_params': bool(has_estimated_garch_params[firm_idx]),
+            'used_default_garch_inputs': bool(not has_estimated_garch_params[firm_idx]),
             'mc_garch_pd_1y': pd_1y[firm_idx],
             'mc_garch_pd_3y': pd_3y[firm_idx],
             'mc_garch_pd_5y': pd_5y[firm_idx],
@@ -233,7 +249,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     return results_list
 
 
-def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1):
+def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_garch=True):
     print(f"Loading GARCH data from {garch_file}...")
     df = pd.read_csv(garch_file)
     
@@ -251,6 +267,7 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
     print(f"  Forecast horizon: {num_days} days")
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t")
+    print(f"  Exclude rows without estimated GARCH params: {exclude_firms_without_estimated_garch}")
     
     start_time = pd.Timestamp.now()
     
@@ -289,7 +306,12 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
     # Parallel processing across dates
     print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_process_single_date_garch_mc)(date_data, num_simulations, num_days) 
+        delayed(_process_single_date_garch_mc)(
+            date_data,
+            num_simulations,
+            num_days,
+            exclude_firms_without_estimated_garch,
+        ) 
         for date_data in date_groups
     )
     
@@ -305,6 +327,9 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
     print(f"\n{'='*80}")
     print(f"PARALLELIZED MONTE CARLO GARCH COMPLETE")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
+    if not results_df.empty and 'used_default_garch_inputs' in results_df.columns:
+        excluded_share = results_df['used_default_garch_inputs'].mean()
+        print(f"Rows without estimated GARCH params (excluded from spreads): {excluded_share:.2%}")
     print(f"{'='*80}\n")
     
     return results_df

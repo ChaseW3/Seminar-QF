@@ -31,3 +31,21 @@ Seminar QF/
 ## Configuration
 
 File paths are managed in `src/utils/config.py`. If you change folder locations, update this file.
+
+## GARCH Diagnostics
+
+Run these from the project root to diagnose parameter behavior and simulated spread dynamics:
+
+1. Parameter diagnostics:
+
+```bash
+python -m src.analysis.garch_parameter_diagnostics
+```
+
+2. Simulated spread diagnostics:
+
+```bash
+python -m src.analysis.garch_spread_diagnostics
+```
+
+Outputs are written to `data/diagnostics/` as CSV summaries and PNG charts.
