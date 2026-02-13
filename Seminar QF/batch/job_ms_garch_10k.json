@@ -30,15 +30,23 @@
         "maxRunDuration": "21600s"
       },
       "taskCount": 256,
-      "parallelism": 128
+      "parallelism": 8
     }
   ],
   "allocationPolicy": {
+    "location": {
+      "allowedLocations": [
+        "zones/us-central1-a",
+        "zones/us-central1-b",
+        "zones/us-central1-c",
+        "zones/us-central1-f"
+      ]
+    },
     "instances": [
       {
         "policy": {
-          "machineType": "c3-standard-4",
-          "provisioningModel": "SPOT"
+          "machineType": "e2-standard-4",
+          "provisioningModel": "STANDARD"
         }
       }
     ]

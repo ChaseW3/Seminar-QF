@@ -8,6 +8,13 @@ $IMAGE_TAG = "latest"
 $IMAGE_URI = "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$IMAGE_NAME`:$IMAGE_TAG"
 $MODEL = "garch"  # garch | regime-switching | ms-garch
 
+# Copy/paste run commands (submit directly without editing this script):
+# gcloud batch jobs submit "garch-10k-$(Get-Date -Format 'yyyyMMdd-HHmm')" --location us-central1 --config batch/job_garch_10k.json
+
+# gcloud batch jobs submit "rs-10k-$(Get-Date -Format 'yyyyMMdd-HHmm')" --location us-central1 --config batch/job_regime_switching_10k.json
+
+# gcloud batch jobs submit "msgarch-10k-$(Get-Date -Format 'yyyyMMdd-HHmm')" --location us-central1 --config batch/job_ms_garch_10k.json
+
 Write-Host "--- Google Cloud Batch Setup ---" -ForegroundColor Cyan
 Write-Host "Project: $PROJECT_ID"
 Write-Host "Region: $REGION"
