@@ -341,58 +341,117 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     results = {}
     
+    # Helper function to transform Monte Carlo results to CDS spread format
+    def prepare_mc_file(mc_file, spread_col_prefix, output_col_prefix):
+        """Read Monte Carlo file and rename spread columns."""
+        try:
+            df = pd.read_csv(mc_file)
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # Rename columns from Monte Carlo format to expected CDS spread format
+            rename_map = {
+                f'{spread_col_prefix}_1y': f'{output_col_prefix}_1y',
+                f'{spread_col_prefix}_3y': f'{output_col_prefix}_3y',
+                f'{spread_col_prefix}_5y': f'{output_col_prefix}_5y',
+            }
+            
+            # Check if all required columns exist
+            missing_cols = [col for col in rename_map.keys() if col not in df.columns]
+            if missing_cols:
+                print(f"⚠ Warning: Missing columns in {mc_file}: {missing_cols}")
+                print(f"   Available columns: {df.columns.tolist()}")
+                return None
+            
+            df = df.rename(columns=rename_map)
+            
+            # Save to temporary file for calculate_cds_correlations
+            temp_file = output_dir / f'temp_{output_col_prefix}.csv'
+            required_cols = ['date', 'gvkey'] + [f'{output_col_prefix}_1y', f'{output_col_prefix}_3y', f'{output_col_prefix}_5y']
+            df[required_cols].to_csv(temp_file, index=False)
+            return temp_file
+        except Exception as e:
+            print(f"⚠ Error preparing {mc_file}: {e}")
+            return None
+    
     # Merton Monte Carlo (Constant Volatility Baseline)
-    merton_mc_cds_file = output_dir / 'cds_spreads_merton_mc_all_firms.csv'
-    if merton_mc_cds_file.exists():
-        results['Merton_MC'] = calculate_cds_correlations(
-            model_cds_file=merton_mc_cds_file,
-            merton_file=merton_file,
-            cds_market_df=cds_market,
-            model_name='Merton MC',
-            col_prefix='cds_spread_merton_mc'
-        )
+    merton_mc_file = output_dir / 'daily_monte_carlo_merton_results.csv'
+    if merton_mc_file.exists():
+        temp_file = prepare_mc_file(merton_mc_file, 'merton_mc_implied_spread', 'cds_spread_merton_mc')
+        if temp_file is not None:
+            results['Merton_MC'] = calculate_cds_correlations(
+                model_cds_file=temp_file,
+                merton_file=merton_file,
+                cds_market_df=cds_market,
+                model_name='Merton MC',
+                col_prefix='cds_spread_merton_mc'
+            )
     else:
-        print(f"⚠ Warning: {merton_mc_cds_file} not found. Run Merton MC CDS calculation first.")
+        print(f"⚠ Warning: {merton_mc_file} not found. Run Merton MC simulation first.")
     
     # GARCH
-    results['GARCH'] = calculate_cds_correlations(
-        model_cds_file=output_dir / 'cds_spreads_garch_mc_all_firms.csv',
-        merton_file=merton_file,
-        cds_market_df=cds_market,
-        model_name='GARCH',
-        col_prefix='cds_spread_garch_mc'
-    )
+    garch_mc_file = output_dir / 'daily_monte_carlo_garch_results.csv'
+    if garch_mc_file.exists():
+        temp_file = prepare_mc_file(garch_mc_file, 'mc_garch_implied_spread', 'cds_spread_garch_mc')
+        if temp_file is not None:
+            results['GARCH'] = calculate_cds_correlations(
+                model_cds_file=temp_file,
+                merton_file=merton_file,
+                cds_market_df=cds_market,
+                model_name='GARCH',
+                col_prefix='cds_spread_garch_mc'
+            )
+    else:
+        print(f"⚠ Warning: {garch_mc_file} not found.")
     
     # Regime Switching
-    results['RS'] = calculate_cds_correlations(
-        model_cds_file=output_dir / 'cds_spreads_regime_switching_mc_all_firms.csv',
-        merton_file=merton_file,
-        cds_market_df=cds_market,
-        model_name='Regime-Switching',
-        col_prefix='cds_spread_regime_switching_mc'
-    )
+    rs_mc_file = output_dir / 'daily_monte_carlo_regime_switching_results.csv'
+    if rs_mc_file.exists():
+        temp_file = prepare_mc_file(rs_mc_file, 'rs_implied_spread', 'cds_spread_regime_switching_mc')
+        if temp_file is not None:
+            results['RS'] = calculate_cds_correlations(
+                model_cds_file=temp_file,
+                merton_file=merton_file,
+                cds_market_df=cds_market,
+                model_name='Regime-Switching',
+                col_prefix='cds_spread_regime_switching_mc'
+            )
+    else:
+        print(f"⚠ Warning: {rs_mc_file} not found.")
     
     # MS-GARCH
-    results['MSGARCH'] = calculate_cds_correlations(
-        model_cds_file=output_dir / 'cds_spreads_ms_garch_mc_all_firms.csv',
-        merton_file=merton_file,
-        cds_market_df=cds_market,
-        model_name='MS-GARCH',
-        col_prefix='cds_spread_msgarch_mc'
-    )
+    msgarch_mc_file = output_dir / 'daily_monte_carlo_ms_garch_results.csv'
+    if msgarch_mc_file.exists():
+        temp_file = prepare_mc_file(msgarch_mc_file, 'mc_ms_garch_implied_spread', 'cds_spread_msgarch_mc')
+        if temp_file is not None:
+            results['MSGARCH'] = calculate_cds_correlations(
+                model_cds_file=temp_file,
+                merton_file=merton_file,
+                cds_market_df=cds_market,
+                model_name='MS-GARCH',
+                col_prefix='cds_spread_msgarch_mc'
+            )
+    else:
+        print(f"⚠ Warning: {msgarch_mc_file} not found.")
     
     # Create summary table
     print("\n" + "="*80)
     print("MODEL COMPARISON SUMMARY (5-Year Maturity)")
     print("="*80)
     
-    # Build summary DataFrame with all metrics
-    summary_df = results['GARCH'][2][['company', 'gvkey', 'n_obs']].copy()
+    # Check if we have any results
+    if not results:
+        print("⚠ Error: No models were successfully loaded!")
+        return None
     
-    # Include Merton_MC if available
-    model_list = [('GARCH', 'GARCH'), ('RS', 'RS'), ('MSGARCH', 'MSGARCH')]
-    if 'Merton_MC' in results:
-        model_list = [('Merton_MC', 'Merton_MC')] + model_list
+    # Build summary DataFrame with all metrics from first available model
+    first_model = list(results.keys())[0]
+    summary_df = results[first_model][2][['company', 'gvkey', 'n_obs']].copy()
+    
+    # Include all available models
+    model_list = []
+    for model_key in ['Merton_MC', 'GARCH', 'RS', 'MSGARCH']:
+        if model_key in results:
+            model_list.append((model_key, model_key))
     
     for model_key, model_short in model_list:
         if model_key not in results:

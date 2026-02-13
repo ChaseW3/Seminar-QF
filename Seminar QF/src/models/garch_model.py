@@ -219,7 +219,11 @@ def run_garch_estimation(daily_returns_df):
                 res = am.fit(starting_values=start_vals, disp='off', show_warning=False)
                 
                 # 1. Convergence Check
-                if not res.converged:
+                # Check convergence using optimization_result.success or convergence_flag
+                converged = (hasattr(res, 'optimization_result') and res.optimization_result.success) or \
+                           (hasattr(res, 'convergence_flag') and res.convergence_flag == 0)
+                
+                if not converged:
                     diag_rejected_convergence += 1
                     # Skip non-converged windows to avoid garbage
                     continue

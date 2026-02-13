@@ -523,8 +523,6 @@ def run_regime_switching_estimation(daily_returns_df):
     # Save Parameters and Merge
     if all_params:
         params_df = pd.DataFrame(all_params)
-        params_df.to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
-        print("Saved regime_switching_parameters.csv")
         
         # Merge rolling parameters back into daily dataframe
         # Ensure date type
@@ -544,5 +542,11 @@ def run_regime_switching_estimation(daily_returns_df):
         df_out[merge_cols] = df_out.groupby('gvkey')[merge_cols].ffill()
         
         print(f"  Merged rolling RS parameters into daily returns data (Forward Filled)")
+        
+        # Save parameters CSV with ALL daily dates (forward-filled), matching GARCH approach
+        # This ensures Monte Carlo simulations have parameters for every date
+        params_daily_df = df_out[['gvkey', 'date'] + merge_cols].copy()
+        params_daily_df.to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
+        print(f"Saved regime_switching_parameters.csv with {len(params_daily_df)} rows (daily, forward-filled)")
     
     return df_out

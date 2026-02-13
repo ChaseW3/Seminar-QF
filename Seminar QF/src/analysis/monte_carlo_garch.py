@@ -10,29 +10,24 @@ from joblib import Parallel, delayed
 
 
 @numba.jit(nopython=True, fastmath=True, cache=True)
-def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr, 
-                                          sigma_arr, nu_arr, mu_arr,
-                                          num_simulations, num_firms,
-                                          horizon_days, v0_arr, liability_arr):
+def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr, 
+                                    sigma_arr, nu_arr, mu_arr,
+                                    num_simulations, num_firms,
+                                    horizon_days, v0_arr, liability_arr, rf_arr):
     """
-    Vectorized Monte Carlo GARCH simulation.
-    Processes all simulations for a firm simultaneously to leverage SIMD/AVX.
+    Optimized Monte Carlo GARCH simulation that computes only PD and spreads.
+    Uses log-asset evolution and sigma2 state to minimize exp() calls.
+    Returns only per-firm, per-horizon aggregates (no per-simulation arrays).
     """
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
-    # Output arrays: (Horizons, Firms, Sims) allows contiguous writes for sims
-    terminal_vols = np.zeros((n_horizons, num_firms, num_simulations))
-    terminal_assets = np.zeros((n_horizons, num_firms, num_simulations))
-    default_indicators = np.zeros((n_horizons, num_firms, num_simulations))
+    # Output arrays: (n_horizons, num_firms)
+    pd_out = np.full((n_horizons, num_firms), np.nan)
+    spread_out = np.full((n_horizons, num_firms), np.nan)
+    debt_out = np.full((n_horizons, num_firms), np.nan)
     
-    # Stats: (Firms, Sims)
-    vol_means = np.zeros((num_firms, num_simulations))
-    vol_stds = np.zeros((num_firms, num_simulations))
-    vol_maxs = np.zeros((num_firms, num_simulations))
-    vol_mins = np.zeros((num_firms, num_simulations))
-    
-    # Pre-compute horizon mask for fast checking
+    # Pre-compute horizon mask
     is_horizon = np.zeros(max_days, dtype=np.int32)
     horizon_map = np.full(max_days, -1, dtype=np.int32)
     for h in range(n_horizons):
@@ -40,7 +35,7 @@ def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr,
         if day_idx < max_days:
             is_horizon[day_idx] = 1
             horizon_map[day_idx] = h
-
+    
     # Process firms sequentially (Joblib handles parallel dates)
     for f in range(num_firms):
         # Constants
@@ -51,16 +46,28 @@ def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr,
         mu = mu_arr[f]
         v0 = v0_arr[f]
         liability = liability_arr[f]
+        rf_rate = rf_arr[f]
+        
+        # Check validity of Merton inputs
+        valid_merton = (not np.isnan(v0)) and (not np.isnan(liability)) and (v0 > 0) and (liability > 0)
+        valid_rf = (not np.isnan(rf_rate))
+        
+        if not valid_merton:
+            # Skip this firm - outputs remain NaN
+            continue
+        
+        # Initialize log-space
+        log_v0 = np.log(v0)
+        log_liability = np.log(liability)
         
         # State Vectors (Size: num_simulations)
-        sigma = np.full(num_simulations, sigma_arr[f])
-        asset = np.full(num_simulations, v0)
+        sigma2 = np.full(num_simulations, sigma_arr[f] ** 2)
+        sigma = np.sqrt(np.maximum(sigma2, 1e-12))
+        log_asset = np.full(num_simulations, log_v0)
         
-        # Stats State
-        m_old = sigma.copy()
-        s_old = np.zeros(num_simulations)
-        curr_max = sigma.copy()
-        curr_min = sigma.copy()
+        # Accumulators for each horizon
+        default_counts = np.zeros(n_horizons)
+        payoff_sums = np.zeros(n_horizons)
         
         # T-dist parameters
         check_normal = (nu >= 100)
@@ -68,12 +75,8 @@ def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr,
         if nu > 2.05:
             t_factor = np.sqrt((nu - 2) / nu)
         else:
-             # If nu <= 2, variance is undefined/infinite. 
-             # For simulation purposes, we can clamp it or treat it as normal if invalid.
-             # However, standard GARCH-t assumes nu > 2 for existence of variance.
-             # We will clamp nu to be slightly above 2 widely used in finance packages.
-             safe_nu = max(nu, 2.0001)
-             t_factor = np.sqrt((safe_nu - 2) / safe_nu)
+            safe_nu = max(nu, 2.0001)
+            t_factor = np.sqrt((safe_nu - 2) / safe_nu)
         
         for day in range(max_days):
             # 1. Vectorized Random Generation
@@ -82,63 +85,57 @@ def simulate_garch_paths_t_jit_vectorized(omega_arr, alpha_arr, beta_arr,
             if check_normal:
                 t_sample = z
             else:
-                # Generate Chi2 via Gamma(nu/2, 2) which is standard method
-                # Ensure nu > 0
-                if nu < 1e-4: 
-                    # Fallback to normal if nu is extremely small/invalid
-                    t_sample = z
-                else:
-                    v = np.random.chisquare(nu, num_simulations)
-                    # Protect against v=0 (very rare but possible with small nu)
-                    v = np.maximum(v, 1e-12)
-                    t_sample = z / np.sqrt(v / nu) * t_factor
+                v = np.random.chisquare(nu, num_simulations)
+                v = np.maximum(v, 1e-12)
+                t_sample = z / np.sqrt(v / nu) * t_factor
             
             # 2. Vectorized Updates
             eps = sigma * t_sample
             
-            # Update Stats (Inline Welford)
-            curr_max = np.maximum(curr_max, sigma)
-            curr_min = np.minimum(curr_min, sigma)
-            
-            n = day + 1
-            delta = sigma - m_old
-            m_new = m_old + delta / n
-            s_old += delta * (sigma - m_new)
-            m_old = m_new
-
-            # Asset Return
-            log_ret = mu + eps
-            asset *= np.exp(log_ret)
+            # Update log-asset (no exp needed daily)
+            log_asset += mu + eps
             
             # 3. Horizon Check
             if is_horizon[day]:
                 h = horizon_map[day]
-                terminal_vols[h, f, :] = sigma
-                terminal_assets[h, f, :] = asset
-                # Vectorized default check
-                if liability > 0:
-                    default_indicators[h, f, :] = (asset < liability).astype(np.float64)
+                
+                # Default detection in log-space
+                defaults = (log_asset < log_liability).astype(np.float64)
+                default_counts[h] = np.sum(defaults)
+                
+                # Compute asset values at horizon (exp only here)
+                asset_T = np.exp(log_asset)
+                payoffs = np.minimum(asset_T, liability)
+                payoff_sums[h] = np.sum(payoffs)
             
-            # 4. GARCH Update (Next Step)
-            sigma2 = omega + alpha * eps**2 + beta * sigma**2
-            sigma = np.sqrt(np.maximum(sigma2, 1e-12))
+            # 4. GARCH Update using sigma2 state
+            sigma2 = omega + alpha * eps**2 + beta * sigma2
+            sigma2 = np.maximum(sigma2, 1e-12)
+            sigma = np.sqrt(sigma2)
         
-        # Finalize Stats
-        vol_means[f, :] = m_old
-        vol_stds[f, :] = np.sqrt(s_old / max_days)
-        vol_maxs[f, :] = curr_max
-        vol_mins[f, :] = curr_min
+        # Compute PD and spreads for each horizon
+        for h in range(n_horizons):
+            # PD
+            pd_out[h, f] = default_counts[h] / num_simulations
+            
+            # Expected payoff and debt value
+            expected_payoff = payoff_sums[h] / num_simulations
+            
+            # Compute spreads only if rf_rate is valid
+            if valid_rf:
+                T_years = horizon_days[h] / 252.0
+                debt_val = expected_payoff * np.exp(-rf_rate * T_years)
+                debt_out[h, f] = debt_val
+                
+                if debt_val > 0:
+                    ytm = -np.log(debt_val / liability) / T_years
+                    spread_out[h, f] = max(ytm - rf_rate, 0.0)
     
-    return terminal_vols, terminal_assets, default_indicators, vol_means, vol_stds, vol_maxs, vol_mins
+    return pd_out, spread_out, debt_out
 
 
 def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     """
-    OPTIMIZED Process Monte Carlo GARCH simulation for a single date.
-    
-    Now only stores terminal values at 1y/3y/5y horizons instead of all daily values!
-    Memory usage reduced by ~400x.
-    
     Parameters:
     -----------
     date_data : tuple
@@ -152,204 +149,93 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days):
     --------
     list : Results for all firms on this date
     """
-    # Unpack with optional merton_data_dict
-    if len(date_data) == 3:
-        date, df_date, merton_data_dict = date_data
-    else:
-        date, df_date = date_data
-        merton_data_dict = {}
-
-    results_list = []
+    date, df_date, merton_data_dict = date_data
     
     if df_date.empty:
-        return results_list
+        return []
     
-    firms_on_date = df_date['gvkey'].unique()
+    # Vectorized preparation: drop duplicates and sort
+    df_firms = df_date.drop_duplicates('gvkey', keep='first').sort_values('gvkey').reset_index(drop=True)
+    firms_list = df_firms['gvkey'].tolist()
+    num_firms = len(firms_list)
     
-    # Prepare arrays for vectorized simulation
-    garch_params = {}
-    for firm in firms_on_date:
-        firm_data = df_date[df_date['gvkey'] == firm].iloc[0]
-        garch_params[firm] = {
-            'omega': max(firm_data.get('garch_omega', 1e-6), 1e-8),
-            'alpha': max(firm_data.get('garch_alpha', 0.05), 1e-4),
-            'beta': max(firm_data.get('garch_beta', 0.93), 0.0),
-            'sigma': max(firm_data.get('garch_volatility', 0.2), 1e-4),
-            'return': firm_data.get('return', 0.0),
-            'nu': firm_data.get('garch_nu', 30.0),  # Degrees of freedom for t-dist
-            'mu': firm_data.get('garch_mu_daily', 0.0)  # Drift/Mean (decimal units)
-        }
+    # Vectorized parameter extraction with defaults and floors
+    omega_arr = np.maximum(df_firms.get('garch_omega', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
+    alpha_arr = np.maximum(df_firms.get('garch_alpha', pd.Series([0.05]*num_firms)).fillna(0.05).values, 1e-4)
+    beta_arr = np.maximum(df_firms.get('garch_beta', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
+    sigma_arr = np.maximum(df_firms.get('garch_volatility', pd.Series([0.2]*num_firms)).fillna(0.2).values, 1e-4)
+    nu_arr = df_firms.get('garch_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
+    mu_arr = df_firms.get('garch_mu_daily', pd.Series([0.0]*num_firms)).fillna(0.0).values
     
-    # Reorder firms consistently
-    firms_on_date = sorted(list(firms_on_date))
+    # Prepare Merton arrays
+    v0_arr = np.full(num_firms, np.nan)
+    liability_arr = np.full(num_firms, np.nan)
+    rf_arr = np.full(num_firms, np.nan)
     
-    # Prepare arrays
-    omega_arr = np.array([garch_params[f]['omega'] for f in firms_on_date])
-    alpha_arr = np.array([garch_params[f]['alpha'] for f in firms_on_date])
-    beta_arr = np.array([garch_params[f]['beta'] for f in firms_on_date])
-    sigma_arr = np.array([garch_params[f]['sigma'] for f in firms_on_date])
-    nu_arr = np.array([garch_params[f]['nu'] for f in firms_on_date])
-    mu_arr = np.array([garch_params[f]['mu'] for f in firms_on_date])
-    
-    # Prepare Merton model parameters for optimized simulation
-    v0_arr = np.zeros(len(firms_on_date))
-    liability_arr = np.zeros(len(firms_on_date))
-    has_merton = {}
-    
-    for firm_idx, firm in enumerate(firms_on_date):
+    for firm_idx, firm in enumerate(firms_list):
         if firm in merton_data_dict:
             m_data = merton_data_dict[firm]
-            v0 = m_data.get('asset_value', 0.0)
-            liability = m_data.get('liabilities_total', 0.0)
-            if not np.isnan(v0) and not np.isnan(liability) and v0 > 0:
-                v0_arr[firm_idx] = v0
-                liability_arr[firm_idx] = liability
-                has_merton[firm] = m_data
+            v0 = m_data.get('asset_value', np.nan)
+            liability = m_data.get('liabilities_total', np.nan)
+            rf_rate = m_data.get('risk_free_rate', np.nan)
+            
+            v0_arr[firm_idx] = v0
+            liability_arr[firm_idx] = liability
+            
+            # Scale rf_rate if needed
+            if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
+                rf_rate = rf_rate / 100.0
+            rf_arr[firm_idx] = rf_rate
     
     # Define horizons: 1y, 3y, 5y (trading days)
     horizon_days = np.array([252, 756, 1260], dtype=np.int32)
     
-    # Run FULLY OPTIMIZED simulation - calculates EVERYTHING in one pass!
-    # Output shapes:
-    # terminal_vols: (n_horizons, num_firms, num_simulations)
-    # vol_means: (num_firms, num_simulations)
-    terminal_vols, terminal_assets, default_indicators, vol_means, vol_stds, vol_maxs, vol_mins = \
-        simulate_garch_paths_t_jit_vectorized(
-            omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr, mu_arr,
-            num_simulations, len(firms_on_date), horizon_days,
-            v0_arr, liability_arr
-        )
+    # Run simulation
+    pd_out, spread_out, debt_out = simulate_garch_pd_spreads_t_jit(
+        omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr, mu_arr,
+        num_simulations, num_firms, horizon_days,
+        v0_arr, liability_arr, rf_arr
+    )
     
-    # For each firm, calculate statistics
-    for firm_idx, firm in enumerate(firms_on_date):
-        # Extract terminal values at each horizon for this firm (updated for vectorized shape)
-        firm_vols_1y = terminal_vols[0, firm_idx, :]
-        firm_vols_3y = terminal_vols[1, firm_idx, :]
-        firm_vols_5y = terminal_vols[2, firm_idx, :]
-        
-        firm_assets_1y = terminal_assets[0, firm_idx, :]
-        firm_assets_3y = terminal_assets[1, firm_idx, :]
-        firm_assets_5y = terminal_assets[2, firm_idx, :]
-        
-        firm_defaulted_1y = default_indicators[0, firm_idx, :]
-        firm_defaulted_3y = default_indicators[1, firm_idx, :]
-        firm_defaulted_5y = default_indicators[2, firm_idx, :]
-        
-        # Get summary statistics for this firm
-        firm_vol_mean = np.mean(vol_means[firm_idx, :])
-        firm_vol_std = np.mean(vol_stds[firm_idx, :])
-        firm_vol_max = np.max(vol_maxs[firm_idx, :])
-        firm_vol_min = np.min(vol_mins[firm_idx, :])
-        
-        # Calculate PD and CDS spreads from pre-computed values
-        pd_value_1y = np.mean(firm_defaulted_1y)
-        pd_value_3y = np.mean(firm_defaulted_3y)
-        pd_value_5y = np.mean(firm_defaulted_5y)
-        pd_value = pd_value_1y  # For backward compatibility
-        
-        mc_spread_1y, mc_spread_3y, mc_spread_5y = np.nan, np.nan, np.nan
-        mc_debt_1y, mc_debt_3y, mc_debt_5y = np.nan, np.nan, np.nan
-        
-        if firm in has_merton:
-            m_data = has_merton[firm]
-            liability = m_data.get('liabilities_total', np.nan)
-            rf_rate = m_data.get('risk_free_rate', np.nan)
-            
-            # Adjust units if needed (ensure decimal)
-            if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
-                rf_rate = rf_rate / 100.0
-            
-            if not np.isnan(liability) and not np.isnan(rf_rate) and liability > 0:
-                # 1-Year CDS Spread
-                expected_payoff_1y = np.mean(np.minimum(firm_assets_1y, liability))
-                T_years = 1.0
-                discount_factor = np.exp(-rf_rate * T_years)
-                debt_val_1y = expected_payoff_1y * discount_factor
-                if debt_val_1y > 0 and liability > 0:
-                    ytm = -np.log(debt_val_1y / liability) / T_years
-                    mc_spread_1y = max(ytm - rf_rate, 0.0)
-                    mc_debt_1y = debt_val_1y
-                
-                # 3-Year CDS Spread
-                expected_payoff_3y = np.mean(np.minimum(firm_assets_3y, liability))
-                T_years = 3.0
-                discount_factor = np.exp(-rf_rate * T_years)
-                debt_val_3y = expected_payoff_3y * discount_factor
-                if debt_val_3y > 0 and liability > 0:
-                    ytm = -np.log(debt_val_3y / liability) / T_years
-                    mc_spread_3y = max(ytm - rf_rate, 0.0)
-                    mc_debt_3y = debt_val_3y
-                
-                # 5-Year CDS Spread
-                expected_payoff_5y = np.mean(np.minimum(firm_assets_5y, liability))
-                T_years = 5.0
-                discount_factor = np.exp(-rf_rate * T_years)
-                debt_val_5y = expected_payoff_5y * discount_factor
-                if debt_val_5y > 0 and liability > 0:
-                    ytm = -np.log(debt_val_5y / liability) / T_years
-                    mc_spread_5y = max(ytm - rf_rate, 0.0)
-                    mc_debt_5y = debt_val_5y
-        
-        # Calculate percentiles from terminal values
-        firm_p95 = np.percentile(firm_vols_5y, 95)
-        firm_p05 = np.percentile(firm_vols_5y, 5)
-        
+    # Extract results by horizon
+    pd_1y = pd_out[0, :]
+    pd_3y = pd_out[1, :]
+    pd_5y = pd_out[2, :]
+    
+    mc_spread_1y = spread_out[0, :]
+    mc_spread_3y = spread_out[1, :]
+    mc_spread_5y = spread_out[2, :]
+    
+    mc_debt_1y = debt_out[0, :]
+    mc_debt_3y = debt_out[1, :]
+    mc_debt_5y = debt_out[2, :]
+    
+    # Assemble results
+    results_list = []
+    for firm_idx, firm in enumerate(firms_list):
         results_list.append({
             'gvkey': firm,
             'date': date,
-            'mc_garch_mean_daily_volatility': firm_vol_mean,
-            'mc_garch_std_daily_volatility': firm_vol_std,
-            'mc_garch_max_daily_volatility': firm_vol_max,
-            'mc_garch_min_daily_volatility': firm_vol_min,
-            'mc_garch_p95_daily_volatility': firm_p95,
-            'mc_garch_p05_daily_volatility': firm_p05,
-            'mc_garch_pd_1y': pd_value_1y, # Now Terminal PD
-            'mc_garch_pd_3y': pd_value_3y,
-            'mc_garch_pd_5y': pd_value_5y,
-            'mc_garch_pd_terminal_1y': pd_value_1y, # Explicitly named
-            'mc_garch_pd_terminal_3y': pd_value_3y,
-            'mc_garch_pd_terminal_5y': pd_value_5y,
-            'mc_garch_implied_spread_1y': mc_spread_1y,
-            'mc_garch_implied_spread_3y': mc_spread_3y,
-            'mc_garch_implied_spread_5y': mc_spread_5y,
-            'mc_garch_debt_value_1y': mc_debt_1y,
-            'mc_garch_debt_value_3y': mc_debt_3y,
-            'mc_garch_debt_value_5y': mc_debt_5y,
+            'mc_garch_pd_1y': pd_1y[firm_idx],
+            'mc_garch_pd_3y': pd_3y[firm_idx],
+            'mc_garch_pd_5y': pd_5y[firm_idx],
+            'mc_garch_pd_terminal_1y': pd_1y[firm_idx],
+            'mc_garch_pd_terminal_3y': pd_3y[firm_idx],
+            'mc_garch_pd_terminal_5y': pd_5y[firm_idx],
+            'mc_garch_implied_spread_1y': mc_spread_1y[firm_idx],
+            'mc_garch_implied_spread_3y': mc_spread_3y[firm_idx],
+            'mc_garch_implied_spread_5y': mc_spread_5y[firm_idx],
+            'mc_garch_debt_value_1y': mc_debt_1y[firm_idx],
+            'mc_garch_debt_value_3y': mc_debt_3y[firm_idx],
+            'mc_garch_debt_value_5y': mc_debt_5y[firm_idx],
         })
     
     return results_list
 
 
-def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, merton_df=None):
-    """
-    Parallelized Monte Carlo GARCH forecast for 1-5 years (default 5 years/1260 days).
-        
-    Parameters:
-    -----------
-    garch_file : str or pd.DataFrame
-        CSV file path OR DataFrame with GARCH parameters and volatilities
-    gvkey_selected : list or None
-        List of gvkeys to process, or None for all firms
-    num_simulations : int
-        Number of Monte Carlo paths per firm per date
-    num_days : int
-        Forecast horizon in trading days (default 1260 = 5 years)
-    n_jobs : int
-        Number of parallel jobs (-1 = use all cores)
-    merton_df : pd.DataFrame, optional
-        Pre-loaded Merton model data (asset values, liabilities) to avoid reloading
-        
-    Returns:
-    --------
-    pd.DataFrame
-        Results with Monte Carlo volatility statistics per firm per date
-    """
-    if isinstance(garch_file, str):
-        print(f"Loading GARCH data from {garch_file}...")
-        df = pd.read_csv(garch_file)
-    else:
-        print(f"Using provided GARCH DataFrame...")
-        df = garch_file.copy()
+def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1):
+    print(f"Loading GARCH data from {garch_file}...")
+    df = pd.read_csv(garch_file)
     
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'])
@@ -372,50 +258,10 @@ def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simula
     
     # Load Merton Data for PD calculation
     merton_by_date = {}
-    
-    if merton_df is not None:
-        print(f"✓ Using provided Merton data for PD calculation ({len(merton_df):,} rows)")
-        if 'date' in merton_df.columns:
-            # Ensure datetime
-            if not pd.api.types.is_datetime64_any_dtype(merton_df['date']):
-                 merton_df = merton_df.copy()
-                 merton_df['date'] = pd.to_datetime(merton_df['date'])
-            
-            # Pre-group by date for faster access
-            merton_by_date = {k: v for k, v in merton_df.groupby('date')}
-    else:
-        merton_file = None
-        # Try to find the file in several locations
-        potential_paths = []
-        
-        if isinstance(garch_file, str):
-            # Same directory as input file
-            potential_paths.append(os.path.join(os.path.dirname(garch_file), 'merged_data_with_merton.csv'))
-            # Common project structure paths
-            potential_paths.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(garch_file))), 'data', 'output', 'merged_data_with_merton.csv'))
-        
-        # Add standard relative paths
-        potential_paths.append('./data/output/merged_data_with_merton.csv')
-        potential_paths.append('./Seminar QF/data/output/merged_data_with_merton.csv')
-        potential_paths.append('../data/output/merged_data_with_merton.csv')
-        
-        for path in potential_paths:
-            if os.path.exists(path):
-                merton_file = path
-                break
-            
-        if merton_file and os.path.exists(merton_file):
-            try:
-                df_merton = pd.read_csv(merton_file)
-                df_merton['date'] = pd.to_datetime(df_merton['date'])
-                merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-                print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows) from {merton_file}")
-            except Exception as e:
-                print(f"⚠ Error loading Merton data: {e}")
-                merton_by_date = {}
-        else:
-             print(f"⚠ Warning: Merton data file not found (checked {len(potential_paths)} locations). PD will be NaN.")
-             merton_by_date = {}
+    df_merton = pd.read_csv(merton_file)
+    df_merton['date'] = pd.to_datetime(df_merton['date'])
+    merton_by_date = {k: v for k, v in df_merton.groupby('date')}
+    print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows) from {merton_file}")
 
     date_groups = []
     if 'date' in df.columns:
@@ -426,12 +272,10 @@ def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simula
                 df_m = merton_by_date[date]
                 firms_on_date = group['gvkey'].unique()
                 df_m_relevant = df_m[df_m['gvkey'].isin(firms_on_date)]
-                for _, row in df_m_relevant.iterrows():
-                    merton_date_dict[row['gvkey']] = {
-                        'asset_value': row['asset_value'],
-                        'liabilities_total': row['liabilities_total'],
-                        'risk_free_rate': row['risk_free_rate']
-                    }
+                # Vectorized construction: subset columns, drop duplicates (keep='last'), convert to dict
+                df_m_subset = df_m_relevant[['gvkey', 'asset_value', 'liabilities_total', 'risk_free_rate']]
+                df_m_subset = df_m_subset.drop_duplicates(subset='gvkey', keep='last')
+                merton_date_dict = df_m_subset.set_index('gvkey').to_dict('index')
             date_groups.append((date, group, merton_date_dict))
     else:
         # Single date case
@@ -441,26 +285,13 @@ def monte_carlo_garch_1year_parallel(garch_file, gvkey_selected=None, num_simula
     
     # OPTIMIZATION: Avoid Joblib overhead for single date / Numba interaction
     use_joblib = True
-    if len(date_groups) == 1:
-        use_joblib = False
-    elif len(date_groups) < n_jobs and n_jobs > 1:
-        # If we have fewer dates than cores, allow Numba to parallelize inside
-        pass
 
-    if use_joblib:
-        # Parallel processing across dates
-        print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
-        results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(_process_single_date_garch_mc)(date_data, num_simulations, num_days) 
-            for date_data in date_groups
-        )
-    else:
-        # Run directly in main process - allows Numba to use all cores effectively
-        print("Optimization: Running simulation directly (avoiding Joblib overhead for single/few batches)")
-        results_nested = [
-            _process_single_date_garch_mc(date_data, num_simulations, num_days)
-            for date_data in date_groups
-        ]
+    # Parallel processing across dates
+    print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
+    results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
+        delayed(_process_single_date_garch_mc)(date_data, num_simulations, num_days) 
+        for date_data in date_groups
+    )
     
     # Flatten results
     results_list = []
