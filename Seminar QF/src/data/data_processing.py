@@ -277,11 +277,9 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
     results = []
     
     for date_idx, date_t in enumerate(all_dates):
-        # 252-day rolling window
-        start_date = date_t - pd.DateOffset(days=252)
-        
-        window_mask = (firm_data["date"] > start_date) & (firm_data["date"] <= date_t)
-        window_df = firm_data.loc[window_mask]
+        # 252-observation rolling window (trading days, not calendar days)
+        window_start_idx = max(0, date_idx - MIN_OBSERVATIONS + 1)
+        window_df = firm_data.iloc[window_start_idx:date_idx + 1]
         
         if len(window_df) < MIN_OBSERVATIONS:
             continue
