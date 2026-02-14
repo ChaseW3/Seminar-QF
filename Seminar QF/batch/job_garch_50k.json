@@ -1,0 +1,57 @@
+{
+  "taskGroups": [
+    {
+      "taskSpec": {
+        "runnables": [
+          {
+            "container": {
+              "imageUri": "us-central1-docker.pkg.dev/seminar-qf/batch-images/monte-carlo-garch:latest",
+              "entrypoint": "python",
+              "commands": [
+                "/app/batch_driver.py",
+                "--model", "garch",
+                "--input-bucket", "seminar-qf-batch-data-001",
+                "--input-file", "data/output/daily_asset_returns_with_garch.csv",
+                "--merton-file", "data/output/merged_data_with_merton.csv",
+                "--output-bucket", "seminar-qf-batch-data-001",
+                "--output-prefix", "output/results",
+                "--num-simulations", "50000",
+                "--use-antithetic",
+                "--n-jobs", "1"
+              ]
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 4000,
+          "memoryMib": 8192
+        },
+        "maxRetryCount": 1,
+        "maxRunDuration": "21600s"
+      },
+      "taskCount": 256,
+      "parallelism": 8
+    }
+  ],
+  "allocationPolicy": {
+    "location": {
+      "allowedLocations": [
+        "zones/us-central1-a",
+        "zones/us-central1-b",
+        "zones/us-central1-c",
+        "zones/us-central1-f"
+      ]
+    },
+    "instances": [
+      {
+        "policy": {
+          "machineType": "e2-standard-4",
+          "provisioningModel": "STANDARD"
+        }
+      }
+    ]
+  },
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  }
+}
