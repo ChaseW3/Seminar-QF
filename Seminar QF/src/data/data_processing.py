@@ -304,16 +304,21 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         equity_value_series = window_df["mkt_cap"].values.astype(np.float64)
 
         # Debt: SINGLE value at estimation date (not a rolling time series)
+        # CRITICAL: Skip if liabilities are NaN at the estimation date (e.g., pre-Feb 2011)
         debt_values_today = window_df.loc[window_df["date"] == date_t, "liabilities_total"].values
         if len(debt_values_today) == 0:
             continue
+        
         debt_value_on_estimation_day = float(debt_values_today[-1])
+        
+        # Skip if debt is NaN or invalid
+        if np.isnan(debt_value_on_estimation_day) or debt_value_on_estimation_day <= 0:
+            continue
         
         # Check validity
         if (
             len(equity_value_series) < 10
             or np.any(equity_value_series <= 0)
-            or debt_value_on_estimation_day <= 0
         ):
             continue
         
@@ -395,9 +400,18 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     print("MERTON MODEL ESTIMATION (Vectorized + Parallelized - EXACT ndtr)")
     print(f"{'='*80}\n")
     
-    # Filter valid data
-    solver_df = df.dropna(subset=["mkt_cap", "liabilities_total"]).copy()
+    # CRITICAL FIX: Only filter mkt_cap (equity) for rolling window computation.
+    # Do NOT filter liabilities_total here - that would drop 2010-early 2011 data.
+    # The Merton rolling window only needs EQUITY history for returns.
+    # Liabilities are only needed AT THE ESTIMATION DATE (checked inside process_firm_merton).
+    print("DEBUG: Date range BEFORE filtering:")
+    print(f"  Full df: {df['date'].min()} to {df['date'].max()} ({len(df)} rows, {df['gvkey'].nunique()} firms)")
+    
+    solver_df = df.dropna(subset=["mkt_cap"]).copy()  # Only require equity data
     solver_df = solver_df.sort_values(["gvkey", "date"])
+    
+    print("DEBUG: Date range AFTER filtering (equity only):")
+    print(f"  solver_df: {solver_df['date'].min()} to {solver_df['date'].max()} ({len(solver_df)} rows, {solver_df['gvkey'].nunique()} firms)")
     
     if solver_df.empty:
         raise ValueError("No valid data found for Merton model estimation.")
@@ -435,8 +449,23 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     parallel_time = time.time() - start_parallel
     print(f"\n✓ Parallel Merton complete in {timedelta(seconds=int(parallel_time))}\n")
     
-    # Merge back to main DF
+    # DEBUG: Check Merton results date range
+    print("DEBUG: Merton results date range:")
+    print(f"  merton_results: {merton_results['date'].min()} to {merton_results['date'].max()} ({len(merton_results)} rows)")
+    
+    # Merge back to main DF (LEFT join to preserve all original dates)
     df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
+    
+    print("DEBUG: After merging Merton back to original df:")
+    print(f"  df_merged: {df_merged['date'].min()} to {df_merged['date'].max()} ({len(df_merged)} rows)")
+    
+    # Check when Merton columns start to populate
+    first_merton_date = df_merged.dropna(subset=['asset_value'])['date'].min()
+    print(f"  First non-null Merton result: {first_merton_date}")
+    
+    # Check when liabilities start
+    first_liab_date = df_merged.dropna(subset=['liabilities_total'])['date'].min()
+    print(f"  First non-null liabilities: {first_liab_date}")
     
     # Compute Daily Log Returns DataFrame
     daily_returns_df = merton_results.copy().sort_values(["gvkey", "date"])
@@ -481,6 +510,41 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     ]].dropna()
     
     overall_time = time.time() - overall_start
+    
+    # ========== SANITY CHECKS FOR DATE RANGES ==========
+    print(f"\n{'='*80}")
+    print("DATE RANGE SANITY CHECKS")
+    print(f"{'='*80}")
+    
+    # 1. df_merged should start at the earliest equity date (2010)
+    equity_min = df['date'].min()
+    merged_min = df_merged['date'].min()
+    print(f"✓ Original equity data starts: {equity_min}")
+    print(f"✓ Merged data (equity + Merton) starts: {merged_min}")
+    assert equity_min == merged_min, f"ERROR: Lost early dates! Equity starts {equity_min}, merged starts {merged_min}"
+    
+    # 2. First non-null Merton result should be ~Jan 2011 (after 252-day window from 2010 data)
+    first_merton = df_merged.dropna(subset=['asset_value'])['date'].min()
+    expected_merton_start = equity_min + pd.DateOffset(days=252)
+    print(f"✓ First non-null Merton result: {first_merton}")
+    print(f"  (Expected around {expected_merton_start.strftime('%Y-%m-%d')} after 252-day window)")
+    
+    # 3. Liabilities should start around Feb 2011 (this is expected and correct)
+    first_liab = df_merged.dropna(subset=['liabilities_total'])['date'].min()
+    print(f"✓ First non-null liabilities: {first_liab}")
+    print(f"  (This is expected - liabilities data starts later than equity)")
+    
+    # 4. Final dataset with BOTH Merton AND liabilities should start ~Feb 2011
+    complete_data = df_merged.dropna(subset=['asset_value', 'liabilities_total'])
+    if not complete_data.empty:
+        complete_min = complete_data['date'].min()
+        print(f"✓ Complete data (Merton + liabilities): {complete_min}")
+        print(f"  ({len(complete_data)} rows with both Merton and liability data)")
+    else:
+        print(f"⚠ No rows with both Merton and liability data!")
+    
+    print(f"{'='*80}\n")
+    # ====================================================
     
     print(f"{'='*80}")
     print(f"Merton Estimation Complete")
