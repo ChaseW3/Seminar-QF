@@ -166,7 +166,15 @@ def load_and_preprocess_data():
     return df
 
 
-def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=1000, tol=1e-6):
+def merton_newton_raphson_vectorized(
+    equity_value_series,
+    debt_value_on_estimation_day,
+    sigma_A_daily_initial,
+    risk_free_rate_annual,
+    time_to_maturity_years,
+    max_iter=1000,
+    tol=1e-4,
+):
     """
     Vectorized Newton-Raphson solver for Merton model (EXACT - NO APPROXIMATION).
     
@@ -175,38 +183,45 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=1
     
     Parameters:
     -----------
-    E_vec : array, Equity values
-    B_vec : array, Liability values
-    sigma_A : float, Initial asset volatility (daily)
-    r : float, Risk-free rate
-    T_val : float, Time horizon (252 for 1 year daily)
+    equity_value_series : array, Equity values over rolling window
+    debt_value_on_estimation_day : float, Debt value at valuation date (scalar)
+    sigma_A_daily_initial : float, Initial DAILY asset volatility
+    risk_free_rate_annual : float, Annual risk-free rate
+    time_to_maturity_years : float, Time to maturity in years (typically 1.0)
     max_iter : int, Max iterations for Newton-Raphson
     tol : float, Convergence tolerance
     
     Returns:
     --------
     V_A_vec : array, Final asset values
-    sigma_A_current : float, Final asset volatility (daily)
+    sigma_A_daily_current : float, Final DAILY asset volatility
     """
     
     # Better initial guess for V_A: Equity + Present Value of Debt (Risk-free proxy)
     # This is closer to the true asset value than E + B (which overestimates)
     # V_A ~ E + B * exp(-rT)
-    V_A_vec = E_vec.astype(np.float64) + B_vec.astype(np.float64) * np.exp(-r * T_val)
+    debt_value_on_estimation_day = np.float64(debt_value_on_estimation_day)
+    asset_value_series = (
+        equity_value_series.astype(np.float64)
+        + debt_value_on_estimation_day * np.exp(-risk_free_rate_annual * time_to_maturity_years)
+    )
     
-    sigma_A_current = np.float64(sigma_A)
+    sigma_A_daily_current = np.float64(sigma_A_daily_initial)
     
     for k in range(max_iter):
-        sigma_A_old = sigma_A_current
+        sigma_A_daily_old = sigma_A_daily_current
         
         # Inner Loop: Newton-Raphson for V_A (vectorized)
         # Increased iterations for stability
         for _ in range(20):
-            V_A_vec = np.maximum(V_A_vec, 1e-4)
-            sig_sqrt_T = sigma_A_current * np.sqrt(T_val)
-            sig2_half = 0.5 * sigma_A_current ** 2
+            asset_value_series = np.maximum(asset_value_series, 1e-4)
+            sig_sqrt_T = sigma_A_daily_current * np.sqrt(time_to_maturity_years)
+            sig2_half = 0.5 * sigma_A_daily_current ** 2
             
-            d1 = (np.log(V_A_vec / B_vec) + (r + sig2_half) * T_val) / sig_sqrt_T
+            d1 = (
+                np.log(asset_value_series / debt_value_on_estimation_day)
+                + (risk_free_rate_annual + sig2_half) * time_to_maturity_years
+            ) / sig_sqrt_T
             d2 = d1 - sig_sqrt_T
             
             # EXACT: Use ndtr (scipy's C-optimized normal CDF)
@@ -214,36 +229,39 @@ def merton_newton_raphson_vectorized(E_vec, B_vec, sigma_A, r, T_val, max_iter=1
             Nd2_arr = ndtr(d2)
             
             # Black-Scholes formula for equity value
-            f_val = V_A_vec * Nd1_arr - B_vec * np.exp(-r * T_val) * Nd2_arr - E_vec
+            f_val = (
+                asset_value_series * Nd1_arr
+                - debt_value_on_estimation_day * np.exp(-risk_free_rate_annual * time_to_maturity_years) * Nd2_arr
+                - equity_value_series
+            )
             f_prime = Nd1_arr  # N(d1)
             
             # Newton-Raphson step (vectorized, safe division)
-            step = np.zeros_like(V_A_vec)
+            step = np.zeros_like(asset_value_series)
             safe_mask = f_prime > 1e-5
             step[safe_mask] = f_val[safe_mask] / f_prime[safe_mask]
             
-            V_A_vec = V_A_vec - step
+            asset_value_series = asset_value_series - step
         
-        V_A_vec = np.maximum(V_A_vec, 1e-4)
+        asset_value_series = np.maximum(asset_value_series, 1e-4)
         
         # Outer Update: sigma_A from asset returns (daily)
-        log_V_A = np.log(V_A_vec)
-        ret_A = np.diff(log_V_A)
+        log_asset_values = np.log(asset_value_series)
+        asset_returns_daily = np.diff(log_asset_values)
         
         # Filter valid returns
-        valid_mask = np.isfinite(ret_A)
+        valid_mask = np.isfinite(asset_returns_daily)
         if np.sum(valid_mask) >= 10:
-            # Calculate annualized volatility from daily returns (assuming 252 trading days)
-            sigma_A_new = np.std(ret_A[valid_mask]) * np.sqrt(252)
+            sigma_A_daily_new = np.std(asset_returns_daily[valid_mask])
             
             # Check convergence
-            if abs(sigma_A_new - sigma_A_old) < tol:
-                sigma_A_current = sigma_A_new
+            if abs(sigma_A_daily_new - sigma_A_daily_old) < tol:
+                sigma_A_daily_current = sigma_A_daily_new
                 break
             
-            sigma_A_current = sigma_A_new
+            sigma_A_daily_current = sigma_A_daily_new
     
-    return V_A_vec, sigma_A_current
+    return asset_value_series, sigma_A_daily_current
 
 
 def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
@@ -281,48 +299,61 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
             month_str = pd.Timestamp(date_t).strftime('%Y-%m')
             r_annual = interest_rates_dict.get(month_str, 0.05)
         
-        # Inputs - liabilities already scaled in load_data()
-        E_vec = window_df["mkt_cap"].values.astype(np.float64)
-        B_vec = window_df["liabilities_total"].values.astype(np.float64)
+        # Inputs
+        # Equity: daily time series over rolling window
+        equity_value_series = window_df["mkt_cap"].values.astype(np.float64)
+
+        # Debt: SINGLE value at estimation date (not a rolling time series)
+        debt_values_today = window_df.loc[window_df["date"] == date_t, "liabilities_total"].values
+        if len(debt_values_today) == 0:
+            continue
+        debt_value_on_estimation_day = float(debt_values_today[-1])
         
         # Check validity
-        if len(E_vec) < 10 or np.any(E_vec <= 0) or np.any(B_vec <= 0):
+        if (
+            len(equity_value_series) < 10
+            or np.any(equity_value_series <= 0)
+            or debt_value_on_estimation_day <= 0
+        ):
             continue
         
         # Initial sigma_E (daily)
-        E_safe = np.maximum(E_vec, 1e-4)
-        ret_E = np.diff(np.log(E_safe))
-        ret_E = ret_E[np.isfinite(ret_E)]
+        equity_values_safe = np.maximum(equity_value_series, 1e-4)
+        equity_returns_daily = np.diff(np.log(equity_values_safe))
+        equity_returns_daily = equity_returns_daily[np.isfinite(equity_returns_daily)]
         
-        if len(ret_E) < 10:
+        if len(equity_returns_daily) < 10:
             continue
         
-        sigma_E_daily = np.std(ret_E)
+        sigma_E_daily = np.std(equity_returns_daily)
         if sigma_E_daily < 1e-6:
             sigma_E_daily = 0.4 / np.sqrt(252)  # Daily equivalent fallback
-            
-        sigma_E_annual = sigma_E_daily * np.sqrt(252)
         
         # CALL VECTORIZED FUNCTION 
-        # Use T = 365/360 consistent with ACT/360 money market convention for rates
-        T_val = 1
+        # Use T = 1.0 year
+        time_to_maturity_years = 1.0
         try:
-            V_A_vec, sigma_A = merton_newton_raphson_vectorized(
-                E_vec, B_vec, sigma_E_annual, r_annual, T_val, max_iter=1000, tol=1e-6
+            asset_value_series, sigma_A_daily = merton_newton_raphson_vectorized(
+                equity_value_series,
+                debt_value_on_estimation_day,
+                sigma_E_daily,
+                r_annual,
+                time_to_maturity_years,
+                max_iter=1000,
+                tol=1e-4,
             )
         except Exception as e:
             print(f"    ⚠ Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
             continue
         
         # Save result
-        V_A_final = V_A_vec[-1]
-        sigma_A_annualized = sigma_A  # Already annualized
+        asset_value_final = asset_value_series[-1]
         
         results.append({
             "gvkey": gvkey,
             "date": date_t,
-            "asset_value": V_A_final,
-            "asset_volatility": sigma_A_annualized,
+            "asset_value": asset_value_final,
+            "asset_volatility": sigma_A_daily,
         })
         
         # Progress
@@ -407,7 +438,7 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     # Merge back to main DF
     df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
     
-    # Compute Daily Returns DataFrame
+    # Compute Daily Log Returns DataFrame
     daily_returns_df = merton_results.copy().sort_values(["gvkey", "date"])
     daily_returns_df["asset_return_daily"] = daily_returns_df.groupby("gvkey")["asset_value"].transform(
         lambda x: np.log(x / x.shift(1))
@@ -444,9 +475,6 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     # ADD SCALE RETURNS (Multiply by 100) for numerical stability in optimization
     # This centralized scaling ensures all models work on the same scaled data
     daily_returns_df["asset_return_daily_scaled"] = daily_returns_df["asset_return_daily"] * 100.0
-    
-    # CRITICAL: Convert annualized volatility to DAILY for scale matching
-    daily_returns_df["asset_volatility"] = daily_returns_df["asset_volatility"] / np.sqrt(252)
     
     daily_returns_df = daily_returns_df[[
         "gvkey", "date", "asset_return_daily", "asset_return_daily_scaled", "asset_value", "asset_volatility"
