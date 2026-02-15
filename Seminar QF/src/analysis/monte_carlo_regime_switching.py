@@ -228,7 +228,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     num_firms = len(firms_list)
     
     required_rs_cols = [
-        'regime_0_mean', 'regime_1_mean', 'regime_0_ar', 'regime_1_ar',
+        'regime_0_mean', 'regime_1_mean',
         'regime_0_vol', 'regime_1_vol', 'regime_0_nu', 'regime_1_nu',
         'transition_prob_00', 'transition_prob_01', 'transition_prob_10', 'transition_prob_11'
     ]
