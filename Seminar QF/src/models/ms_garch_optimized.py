@@ -1037,18 +1037,12 @@ def run_ms_garch_estimation_optimized(data_df,
                 # Initialize and fit OPTIMIZED MS-GARCH
                 model = MSGARCHOptimized()
                 
-                # Re-scale params if passing from previous window (params are stored unscaled in last_params_firm)
+                # Use warm start from previous window
+                # last_params_firm contains SCALED parameters from the previous iteration
                 init_p = None
                 if last_params_firm is not None:
-                     init_p = last_params_firm.copy()
-                     # Params in last_params_firm are UNSCALED (raw return scale).
-                     # The model estimation happens on SCALED returns (returns * scale_factor).
-                     # So we must RESCALE the parameters before passing them to fit()
-                     if scale_factor != 1.0:
-                        init_p['omega_0'] *= (scale_factor ** 2)
-                        init_p['omega_1'] *= (scale_factor ** 2)
-                        init_p['mu_0'] *= scale_factor
-                        init_p['mu_1'] *= scale_factor
+                     init_p = last_params_firm.copy()  # Already scaled, ready to use directly
+                     # No rescaling needed - last_params_firm already contains scaled params!
 
                 # Run silently for rolling windows to avoid spam
                 params = model.fit(returns, verbose=False, init_params=init_p)
@@ -1056,17 +1050,17 @@ def run_ms_garch_estimation_optimized(data_df,
                 if params is None:
                     continue
                 
-                last_params_firm = params.copy() # Store the RAW optimizer output (scaled) for next iter
-                # Note: We unscale below for saving, but for warm start next loop we need the SCALED version?
-                # Actually, the logic below unscales `params` IN PLACE for saving. 
-                # So `last_params_firm` will be unscaled version.
-                # That explains why I re-scale above.
+                # CRITICAL FIX: Deep copy the scaled parameters BEFORE unscaling
+                # This prevents the bug where unscaling affects the warm start parameters
+                import copy
+                last_params_firm = copy.deepcopy(params)  # Store SCALED params for next iteration
                 
                 # Get model results
                 vol_series = model.get_volatility_series()
                 regime_probs = model.get_regime_probabilities()
                 
                 # Unscale parameters for saving (so they match RAW return scale)
+                # This modifies params in place, but last_params_firm is protected by deepcopy
                 if scale_factor != 1.0:
                     params['omega_0'] /= (scale_factor ** 2)
                     params['omega_1'] /= (scale_factor ** 2)
