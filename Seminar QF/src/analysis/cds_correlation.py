@@ -343,30 +343,30 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     # Helper function to transform Monte Carlo results to CDS spread format
     def prepare_mc_file(mc_file, spread_col_prefix, output_col_prefix):
-        """Read Monte Carlo file and rename spread columns."""
+        """Read Monte Carlo file and rename spread columns, converting to basis points."""
         try:
             df = pd.read_csv(mc_file)
             df['date'] = pd.to_datetime(df['date'])
             
-            # Rename columns from Monte Carlo format to expected CDS spread format
-            rename_map = {
-                f'{spread_col_prefix}_1y': f'{output_col_prefix}_1y',
-                f'{spread_col_prefix}_3y': f'{output_col_prefix}_3y',
-                f'{spread_col_prefix}_5y': f'{output_col_prefix}_5y',
-            }
-            
             # Check if all required columns exist
-            missing_cols = [col for col in rename_map.keys() if col not in df.columns]
+            required_cols = [f'{spread_col_prefix}_1y', f'{spread_col_prefix}_3y', f'{spread_col_prefix}_5y']
+            missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 print(f"⚠ Warning: Missing columns in {mc_file}: {missing_cols}")
                 print(f"   Available columns: {df.columns.tolist()}")
                 return None
             
-            df = df.rename(columns=rename_map)
+            # Convert spreads from decimal to basis points (multiply by 10000)
+            # and rename columns to expected format with _bps suffix
+            for mat in ['1y', '3y', '5y']:
+                source_col = f'{spread_col_prefix}_{mat}'
+                target_col = f'{output_col_prefix}_{mat}_bps'
+                # Spreads in MC results are in decimal format, convert to bps
+                df[target_col] = df[source_col] * 10000
             
             # Save to temporary file for calculate_cds_correlations
             temp_file = output_dir / f'temp_{output_col_prefix}.csv'
-            required_cols = ['date', 'gvkey'] + [f'{output_col_prefix}_1y', f'{output_col_prefix}_3y', f'{output_col_prefix}_5y']
+            required_cols = ['date', 'gvkey'] + [f'{output_col_prefix}_1y_bps', f'{output_col_prefix}_3y_bps', f'{output_col_prefix}_5y_bps']
             df[required_cols].to_csv(temp_file, index=False)
             return temp_file
         except Exception as e:

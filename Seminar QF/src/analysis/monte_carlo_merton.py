@@ -135,8 +135,9 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
     num_firms = len(firms_list)
     
     # Vectorized parameter extraction with defaults and floors
-    sigma_annual_arr = np.maximum(df_firms.get('asset_volatility', pd.Series([0.2]*num_firms)).fillna(0.2).values, 1e-4)
-    sigma_daily_arr = sigma_annual_arr / np.sqrt(252)  # Convert annual to daily
+    # NOTE: asset_volatility from Merton estimation is ALREADY DAILY (not annual)
+    # Default to 0.2/sqrt(252) ≈ 0.0126 daily = 20% annual if missing
+    sigma_daily_arr = np.maximum(df_firms.get('asset_volatility', pd.Series([0.2/np.sqrt(252)]*num_firms)).fillna(0.2/np.sqrt(252)).values, 1e-4)
     
     # Drift term (typically 0 for Merton, but can be set if needed)
     mu_arr = df_firms.get('merton_mu_daily', pd.Series([0.0]*num_firms)).fillna(0.0).values

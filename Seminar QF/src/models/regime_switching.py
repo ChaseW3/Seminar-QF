@@ -520,33 +520,34 @@ def run_regime_switching_estimation(daily_returns_df):
     else:
         print("Warning: No firms processed successfully.")
 
-    # Save Parameters and Merge
+    # Save Parameters and Merge (matching GARCH approach)
     if all_params:
         params_df = pd.DataFrame(all_params)
+        output_path = OUTPUT_DIR / 'regime_switching_parameters.csv'
+        params_df.to_csv(output_path, index=False)
+        print(f"\n✓ Saved Regime Switching parameters (month-ends) to '{output_path}'")
         
         # Merge rolling parameters back into daily dataframe
         # Ensure date type
         df_out['date'] = pd.to_datetime(df_out['date'])
         
-        merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'regime_0_ar', 'regime_1_ar']]
+        # Define columns to merge (include AR terms even though they're 0 - needed for Monte Carlo)
+        merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date']]
         
-        # Drop existing if any
+        # Prepare merge dataframe
+        merge_df = params_df[['gvkey', 'date'] + merge_cols].copy()
+        
+        # Drop existing columns to avoid conflicts
         df_out = df_out.drop(columns=[c for c in merge_cols if c in df_out.columns])
         
-        # Merge on date (month-ends)
-        merge_df = params_df[['gvkey', 'date'] + merge_cols]
+        # Merge on date (month-ends only match initially)
         df_out = pd.merge(df_out, merge_df, on=['gvkey', 'date'], how='left')
         
-        # Forward fill per firm
+        # Forward fill parameters per firm to create daily values
         df_out = df_out.sort_values(['gvkey', 'date'])
         df_out[merge_cols] = df_out.groupby('gvkey')[merge_cols].ffill()
         
-        print(f"  Merged rolling RS parameters into daily returns data (Forward Filled)")
-        
-        # Save parameters CSV with ALL daily dates (forward-filled), matching GARCH approach
-        # This ensures Monte Carlo simulations have parameters for every date
-        params_daily_df = df_out[['gvkey', 'date'] + merge_cols].copy()
-        params_daily_df.to_csv(OUTPUT_DIR / "regime_switching_parameters.csv", index=False)
-        print(f"Saved regime_switching_parameters.csv with {len(params_daily_df)} rows (daily, forward-filled)")
+        print(f"✓ Merged rolling RS parameters into daily returns data (Forward Filled)")
+        print(f"✓ Output contains {len(df_out)} rows with forward-filled parameters")
     
     return df_out
