@@ -16,6 +16,7 @@ def simulate_regime_switching_vectorized(
     num_simulations, num_firms, horizon_days, initial_regime_probs,
     v0_arr, liability_arr, rf_arr,
     use_antithetic=False,
+    use_risk_neutral_drift=True,
 ):
     """
     Optimized regime-switching Monte Carlo simulation with T-DISTRIBUTION.
@@ -158,7 +159,10 @@ def simulate_regime_switching_vectorized(
             z_t = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
             # 4. Vectorized Updates
-            r_curr = mu_curr + ar_curr * r_prev + sigma * z_t
+            if use_risk_neutral_drift and valid_rf:
+                r_curr = (rf_rate / 252.0) - 0.5 * sigma**2 + sigma * z_t
+            else:
+                r_curr = mu_curr + ar_curr * r_prev + sigma * z_t
             r_prev = r_curr
             
             # Update log-asset (no exp needed daily)
@@ -202,7 +206,7 @@ def simulate_regime_switching_vectorized(
     return pd_out, spread_out, debt_out, regime_fractions
 
 
-def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False):
+def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False, use_risk_neutral_drift=True):
     """
     Parameters:
     -----------
@@ -284,6 +288,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
         num_simulations, num_firms, horizon_days, initial_regime_probs,
         v0_arr, liability_arr, rf_arr,
         use_antithetic,
+        use_risk_neutral_drift,
     )
 
     if exclude_firms_without_estimated_params:
@@ -338,7 +343,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     return results_list
 
 
-def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False):
+def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False, use_risk_neutral_drift=True):
     print(f"Loading Regime-Switching data from {regime_params_file}...")
     df = pd.read_csv(regime_params_file)
     
@@ -357,6 +362,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t")
     print(f"  Antithetic variates: {use_antithetic}")
+    print(f"  Risk-neutral drift: {use_risk_neutral_drift}")
     print(f"  Exclude rows without estimated RS params: {exclude_firms_without_estimated_params}")
     
     start_time = pd.Timestamp.now()
@@ -402,6 +408,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
             num_days,
             exclude_firms_without_estimated_params,
             use_antithetic,
+            use_risk_neutral_drift,
         ) 
         for date_data in date_groups
     )

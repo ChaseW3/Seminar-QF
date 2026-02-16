@@ -16,7 +16,8 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                                        sigma_arr, regime_prob_arr,
                                        num_simulations, num_firms,
                                        horizon_days, v0_arr, liability_arr, rf_arr,
-                                       use_antithetic=False):
+                                       use_antithetic=False,
+                                       use_risk_neutral_drift=True):
     """
     Optimized Monte Carlo MS-GARCH simulation that computes only PD and spreads.
     Uses log-asset evolution and sigma2 state to minimize exp() calls.
@@ -150,9 +151,16 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
             
             # 2. Vectorized Updates with regime-specific parameters
             eps = sigma * t_sample
+
+            # Drift choice for log-asset dynamics
+            # For pricing (implied spreads), risk-neutral drift is generally appropriate.
+            if use_risk_neutral_drift and valid_rf:
+                drift = (rf_rate / 252.0) - 0.5 * sigma2
+            else:
+                drift = np.where(regime_1_mask, mu_1, mu_0)
             
             # Update log-asset with regime-specific drift
-            log_asset += np.where(regime_1_mask, mu_1 + eps, mu_0 + eps)
+            log_asset += drift + eps
             
             # 3. Horizon Check
             if is_horizon[day]:
@@ -203,7 +211,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
     return pd_out, spread_out, debt_out
 
 
-def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False):
+def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False, use_risk_neutral_drift=True):
     """
     Parameters:
     -----------
@@ -310,6 +318,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
         num_simulations, num_firms, horizon_days,
         v0_arr, liability_arr, rf_arr,
         use_antithetic,
+        use_risk_neutral_drift,
     )
 
     if exclude_firms_without_estimated_params:
@@ -357,7 +366,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     return results_list
 
 
-def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False):
+def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False, use_risk_neutral_drift=True):
     print(f"Loading MS-GARCH data from {ms_garch_file}...")
     df = pd.read_csv(ms_garch_file)
     
@@ -376,6 +385,7 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t per regime")
     print(f"  Antithetic variates: {use_antithetic}")
+    print(f"  Risk-neutral drift: {use_risk_neutral_drift}")
     print(f"  Exclude rows without estimated MS-GARCH params: {exclude_firms_without_estimated_params}")
     
     start_time = pd.Timestamp.now()
@@ -421,6 +431,7 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
             num_days,
             exclude_firms_without_estimated_params,
             use_antithetic,
+            use_risk_neutral_drift,
         ) 
         for date_data in date_groups
     )
