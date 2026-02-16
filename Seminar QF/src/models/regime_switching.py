@@ -308,10 +308,12 @@ class MarkovSwitchingTDist:
                     np.log(max(current_nu - 2.0, 1e-4))
                 ])
                 
-                # Bounds
+                # Bounds with reasonable limits on volatility
+                # Max sigma2 = exp(6) ≈ 403, so max sigma ≈ 20 (reasonable for scaled returns)
+                # Min sigma2 = exp(-15) ≈ 3e-7 (very small but positive)
                 b_regime = [
                     (None, None), # mu
-                    (-15, 10),    # log_sigma2
+                    (-15, 6),     # log_sigma2 (tightened upper bound from 10 to 6)
                     (-10, 6)      # log(nu-2)
                 ]
                 
@@ -435,6 +437,16 @@ def _process_single_firm(gvkey, firm_df):
                  params['p00'], params['p11'] = params['p11'], params['p00']
                  # Swap probabilities
                  probs[:, [0, 1]] = probs[:, [1, 0]]
+            
+            # Sanity check on volatilities (before unscaling)
+            # For scaled returns (×100), daily vol should typically be < 20 (equivalent to 20% daily on the scaled data)
+            max_reasonable_sigma = 20.0
+            if np.sqrt(params['sigma2_0']) > max_reasonable_sigma or np.sqrt(params['sigma2_1']) > max_reasonable_sigma:
+                print(f"    ⚠ Warning: Extreme volatility detected for firm {gvkey} at {date_point.date()}")
+                print(f"      Regime 0 vol: {np.sqrt(params['sigma2_0']):.4f}, Regime 1 vol: {np.sqrt(params['sigma2_1']):.4f}")
+                print(f"      Capping at {max_reasonable_sigma}")
+                params['sigma2_0'] = min(params['sigma2_0'], max_reasonable_sigma**2)
+                params['sigma2_1'] = min(params['sigma2_1'], max_reasonable_sigma**2)
             
             last_params = params
 
