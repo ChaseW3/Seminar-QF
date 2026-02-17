@@ -20,6 +20,7 @@ SHEET_EQUITY = 0
 SHEET_LIABILITY = 1
 MIN_OBSERVATIONS = 252
 T_HORIZON = 1.0
+TRADING_DAYS_PER_YEAR = 252.0
 
 
 def load_interest_rates():
@@ -215,8 +216,12 @@ def merton_newton_raphson_vectorized(
         # Increased iterations for stability
         for _ in range(20):
             asset_value_series = np.maximum(asset_value_series, 1e-4)
-            sig_sqrt_T = sigma_A_daily_current * np.sqrt(time_to_maturity_years)
-            sig2_half = 0.5 * sigma_A_daily_current ** 2
+            sigma_A_annual_current = sigma_A_daily_current * np.sqrt(TRADING_DAYS_PER_YEAR)
+            sig_sqrt_T = sigma_A_annual_current * np.sqrt(time_to_maturity_years)
+            sig2_half = 0.5 * sigma_A_annual_current ** 2
+
+            if sig_sqrt_T < 1e-10:
+                sig_sqrt_T = 1e-10
             
             d1 = (
                 np.log(asset_value_series / debt_value_on_estimation_day)

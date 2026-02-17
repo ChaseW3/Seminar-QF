@@ -323,14 +323,15 @@ def calculate_merton_pd_normal(daily_returns_file):
     )
     df['risk_free_rate'] = df['risk_free_rate'].fillna(0.05)
     
-    # Use asset_volatility (normal returns volatility, annualized)
+    # Use asset_volatility from Merton estimation (stored as DAILY volatility)
     df_clean = df.dropna(subset=['asset_value', 'liabilities_total', 'asset_volatility', 'risk_free_rate'])
     df_clean = df_clean[(df_clean['asset_value'] > 0) & (df_clean['liabilities_total'] > 0)]
     
     # Merton PD calculation
     V_A = df_clean['asset_value'].values
     B = df_clean['liabilities_total'].values  # Already scaled in data_processing.py
-    sigma_A = df_clean['asset_volatility'].values
+    sigma_A_daily = df_clean['asset_volatility'].values
+    sigma_A = sigma_A_daily * np.sqrt(252)
     r = df_clean['risk_free_rate'].values
     T = 1.0
     
