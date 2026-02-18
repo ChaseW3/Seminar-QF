@@ -356,13 +356,13 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 print(f"   Available columns: {df.columns.tolist()}")
                 return None
             
-            # Convert spreads from decimal to basis points (multiply by 10000)
-            # and rename columns to expected format with _bps suffix
+            # Spreads in MC results are already in basis points - just rename columns
+            # and add _bps suffix for clarity
             for mat in ['1y', '3y', '5y']:
                 source_col = f'{spread_col_prefix}_{mat}'
                 target_col = f'{output_col_prefix}_{mat}_bps'
-                # Spreads in MC results are in decimal format, convert to bps
-                df[target_col] = df[source_col] * 10000
+                # NO conversion needed - spreads are already in bps
+                df[target_col] = df[source_col]
             
             # Save to temporary file for calculate_cds_correlations
             temp_file = output_dir / f'temp_{output_col_prefix}.csv'
