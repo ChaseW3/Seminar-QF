@@ -17,3 +17,15 @@ env/
 # Mac
 .DS_Store
 __MACOSX/
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
