@@ -8,9 +8,10 @@ from joblib import Parallel, delayed
 
 
 @numba.jit(nopython=True, fastmath=True, cache=True)
-def simulate_merton_pd_spreads_jit(sigma_daily_arr, mu_arr,
+def simulate_merton_pd_spreads_jit(sigma_daily_arr,
                                     num_simulations, num_firms,
-                                    horizon_days, v0_arr, liability_arr, rf_arr):
+                                    horizon_days, v0_arr, liability_arr, rf_arr,
+                                    spread_cap=0.5):
     """
     Optimized Monte Carlo Merton simulation with constant volatility.
     Uses log-asset evolution to minimize exp() calls.
@@ -37,7 +38,6 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr, mu_arr,
     for f in range(num_firms):
         # Constants
         sigma = sigma_daily_arr[f]
-        mu = mu_arr[f]
         v0 = v0_arr[f]
         liability = liability_arr[f]
         rf_rate = rf_arr[f]
@@ -52,7 +52,14 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr, mu_arr,
         
         # Initialize log-space
         log_v0 = np.log(v0)
-        log_liability = np.log(liability)
+        liability_horizon = np.full(n_horizons, liability)
+        log_liability_horizon = np.full(n_horizons, np.log(liability))
+        if valid_rf:
+            for h in range(n_horizons):
+                T_years = horizon_days[h] / 252.0
+                liability_T = liability * np.exp(rf_rate * T_years)
+                liability_horizon[h] = liability_T
+                log_liability_horizon[h] = np.log(liability_T)
         
         # State Vectors (Size: num_simulations)
         log_asset = np.full(num_simulations, log_v0)
@@ -72,19 +79,21 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr, mu_arr,
             eps = sigma * z
             
             # Update log-asset (no exp needed daily)
-            log_asset += mu + eps
+            log_asset += eps
             
             # 3. Horizon Check
             if is_horizon[day]:
                 h = horizon_map[day]
+                log_liability_T = log_liability_horizon[h]
+                liability_T = liability_horizon[h]
                 
                 # Default detection in log-space (Terminal PD only for Merton)
-                defaults = (log_asset < log_liability).astype(np.float64)
+                defaults = (log_asset < log_liability_T).astype(np.float64)
                 default_counts[h] = np.sum(defaults)
                 
                 # Compute asset values at horizon (exp only here)
                 asset_T = np.exp(log_asset)
-                payoffs = np.minimum(asset_T, liability)
+                payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)
         
         # Compute PD and spreads for each horizon
@@ -98,19 +107,21 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr, mu_arr,
             # Compute spreads only if rf_rate is valid
             if valid_rf:
                 T_years = horizon_days[h] / 252.0
+                liability_T = liability_horizon[h]
                 debt_val = expected_payoff * np.exp(-rf_rate * T_years)
                 debt_out[h, f] = debt_val
                 
                 if debt_val > 0:
-                    ytm = -np.log(debt_val / liability) / T_years
-                    spread_out[h, f] = max(ytm - rf_rate, 0.0)
+                    ytm = -np.log(debt_val / liability_T) / T_years
+                    spread = max(ytm - rf_rate, 0.0)
+                    spread_out[h, f] = min(spread, spread_cap)
     
     return pd_out, spread_out, debt_out
 
 
 
 
-def _process_single_date_merton_mc(date_data, num_simulations, num_days):
+def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_cap=0.5):
     """
     Process Monte Carlo Merton simulation for a single date (for parallelization).
     
@@ -142,9 +153,6 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
     # Default to 0.2/sqrt(252) ≈ 0.0126 daily = 20% annual if missing
     sigma_daily_arr = np.maximum(df_firms.get('asset_volatility', pd.Series([0.2/np.sqrt(252)]*num_firms)).fillna(0.2/np.sqrt(252)).values, 1e-4)
     
-    # Drift term (typically 0 for Merton, but can be set if needed)
-    mu_arr = df_firms.get('merton_mu_daily', pd.Series([0.0]*num_firms)).fillna(0.0).values
-    
     # Prepare Merton arrays
     v0_arr = df_firms.get('asset_value', pd.Series([np.nan]*num_firms)).fillna(np.nan).values
     liability_arr = df_firms.get('liabilities_total', pd.Series([np.nan]*num_firms)).fillna(np.nan).values
@@ -160,9 +168,10 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
     
     # Run simulation
     pd_out, spread_out, debt_out = simulate_merton_pd_spreads_jit(
-        sigma_daily_arr, mu_arr,
+        sigma_daily_arr,
         num_simulations, num_firms, horizon_days,
-        v0_arr, liability_arr, rf_arr
+        v0_arr, liability_arr, rf_arr,
+        spread_cap,
     )
     
     # Extract results by horizon
@@ -202,7 +211,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days):
 
 
 
-def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1):
+def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, spread_cap=0.5):
     print(f"Loading Merton data from {merton_file}...")
     df = pd.read_csv(merton_file)
     
@@ -220,6 +229,7 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simu
     print(f"  Forecast horizon: {num_days} days")
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Normal (constant volatility)")
+    print(f"  CDS spread cap: {spread_cap:.4f} ({spread_cap*10000:.0f} bps)")
     
     start_time = pd.Timestamp.now()
     
@@ -236,7 +246,7 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simu
     
     # Parallel processing across dates
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_process_single_date_merton_mc)(date_data, num_simulations, num_days) 
+        delayed(_process_single_date_merton_mc)(date_data, num_simulations, num_days, spread_cap) 
         for date_data in date_groups
     )
     

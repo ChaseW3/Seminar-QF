@@ -10,11 +10,11 @@ from joblib import Parallel, delayed
 
 @numba.jit(nopython=True, fastmath=True, cache=True)
 def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr, 
-                                    sigma_arr, nu_arr, mu_arr,
+                                    sigma_arr, nu_arr,
                                     num_simulations, num_firms,
                                     horizon_days, v0_arr, liability_arr, rf_arr,
                                     use_antithetic=False,
-                                    use_risk_neutral_drift=True):
+                                    spread_cap=0.5):
     """
     Optimized Monte Carlo GARCH simulation that computes only PD and spreads.
     Uses log-asset evolution and sigma2 state to minimize exp() calls.
@@ -44,7 +44,6 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         alpha = alpha_arr[f]
         beta = beta_arr[f]
         nu = nu_arr[f]
-        mu = mu_arr[f]
         v0 = v0_arr[f]
         liability = liability_arr[f]
         rf_rate = rf_arr[f]
@@ -59,7 +58,14 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         
         # Initialize log-space
         log_v0 = np.log(v0)
-        log_liability = np.log(liability)
+        liability_horizon = np.full(n_horizons, liability)
+        log_liability_horizon = np.full(n_horizons, np.log(liability))
+        if valid_rf:
+            for h in range(n_horizons):
+                T_years = horizon_days[h] / 252.0
+                liability_T = liability * np.exp(rf_rate * T_years)
+                liability_horizon[h] = liability_T
+                log_liability_horizon[h] = np.log(liability_T)
         
         # State Vectors (Size: num_simulations)
         sigma2 = np.full(num_simulations, sigma_arr[f] ** 2)
@@ -115,28 +121,22 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             t_sample = np.clip(t_sample, -5.0, 5.0)
             eps = sigma * t_sample
 
-            # Drift choice for log-asset dynamics
-            # For pricing (implied spreads), risk-neutral drift is generally appropriate.
-            # Keep historical-mu mode as an option for backward compatibility.
-            if use_risk_neutral_drift and valid_rf:
-                drift = (rf_rate / 252.0) - 0.5 * sigma2
-            else:
-                drift = np.full(num_simulations, mu)
-            
-            # Update log-asset (no exp needed daily)
-            log_asset += drift + eps
+            # Update log-asset using shocks only (no drift)
+            log_asset += eps
             
             # 3. Horizon Check
             if is_horizon[day]:
                 h = horizon_map[day]
+                log_liability_T = log_liability_horizon[h]
+                liability_T = liability_horizon[h]
                 
                 # Default detection in log-space
-                defaults = (log_asset < log_liability).astype(np.float64)
+                defaults = (log_asset < log_liability_T).astype(np.float64)
                 default_counts[h] = np.sum(defaults)
                 
                 # Compute asset values at horizon (exp only here)
                 asset_T = np.exp(log_asset)
-                payoffs = np.minimum(asset_T, liability)
+                payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)
             
             # 4. GARCH Update using sigma2 state
@@ -155,17 +155,19 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             # Compute spreads only if rf_rate is valid
             if valid_rf:
                 T_years = horizon_days[h] / 252.0
+                liability_T = liability_horizon[h]
                 debt_val = expected_payoff * np.exp(-rf_rate * T_years)
                 debt_out[h, f] = debt_val
                 
                 if debt_val > 0:
-                    ytm = -np.log(debt_val / liability) / T_years
-                    spread_out[h, f] = max(ytm - rf_rate, 0.0)
+                    ytm = -np.log(debt_val / liability_T) / T_years
+                    spread = max(ytm - rf_rate, 0.0)
+                    spread_out[h, f] = min(spread, spread_cap)
     
     return pd_out, spread_out, debt_out
 
 
-def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_garch=True, use_antithetic=False, use_risk_neutral_drift=True):
+def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_garch=True, use_antithetic=False, spread_cap=0.5):
     """
     Parameters:
     -----------
@@ -190,7 +192,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     firms_list = df_firms['gvkey'].tolist()
     num_firms = len(firms_list)
     
-    required_garch_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_volatility', 'garch_nu', 'garch_mu_daily']
+    required_garch_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_volatility', 'garch_nu']
     if all(col in df_firms.columns for col in required_garch_cols):
         has_estimated_garch_params = df_firms[required_garch_cols].notna().all(axis=1).values
     else:
@@ -203,7 +205,6 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     beta_arr = np.maximum(df_firms.get('garch_beta', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
     sigma_arr = np.maximum(df_firms.get('garch_volatility', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     nu_arr = df_firms.get('garch_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
-    mu_arr = df_firms.get('garch_mu_daily', pd.Series([0.0]*num_firms)).fillna(0.0).values
     
     # Prepare Merton arrays
     v0_arr = np.full(num_firms, np.nan)
@@ -230,11 +231,11 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     
     # Run simulation
     pd_out, spread_out, debt_out = simulate_garch_pd_spreads_t_jit(
-        omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr, mu_arr,
+        omega_arr, alpha_arr, beta_arr, sigma_arr, nu_arr,
         num_simulations, num_firms, horizon_days,
         v0_arr, liability_arr, rf_arr,
         use_antithetic,
-        use_risk_neutral_drift,
+        spread_cap,
     )
 
     if exclude_firms_without_estimated_garch:
@@ -282,7 +283,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     return results_list
 
 
-def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_garch=True, use_antithetic=False, use_risk_neutral_drift=True):
+def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_garch=True, use_antithetic=False, spread_cap=0.5):
     print(f"Loading GARCH data from {garch_file}...")
     df = pd.read_csv(garch_file)
     
@@ -301,7 +302,7 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
     print(f"  Parallel jobs: {n_jobs}")
     print(f"  Innovation distribution: Student's t")
     print(f"  Antithetic variates: {use_antithetic}")
-    print(f"  Risk-neutral drift: {use_risk_neutral_drift}")
+    print(f"  CDS spread cap: {spread_cap:.4f} ({spread_cap*10000:.0f} bps)")
     print(f"  Exclude rows without estimated GARCH params: {exclude_firms_without_estimated_garch}")
     
     start_time = pd.Timestamp.now()
@@ -347,7 +348,7 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
             num_days,
             exclude_firms_without_estimated_garch,
             use_antithetic,
-            use_risk_neutral_drift,
+            spread_cap,
         ) 
         for date_data in date_groups
     )
