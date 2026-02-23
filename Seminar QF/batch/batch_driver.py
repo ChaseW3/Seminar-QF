@@ -20,18 +20,20 @@ try:
     from src.analysis.monte_carlo_garch import monte_carlo_garch_1year_parallel
     from src.analysis.monte_carlo_regime_switching import monte_carlo_regime_switching_1year_parallel
     from src.analysis.monte_carlo_ms_garch import monte_carlo_ms_garch_1year_parallel
+    from src.analysis.monte_carlo_merton import monte_carlo_merton_1year_parallel
 except ImportError:
     # Try adding one level up if run from a subdirectory
     sys.path.append(str(project_root.parent))
     from src.analysis.monte_carlo_garch import monte_carlo_garch_1year_parallel
     from src.analysis.monte_carlo_regime_switching import monte_carlo_regime_switching_1year_parallel
     from src.analysis.monte_carlo_ms_garch import monte_carlo_ms_garch_1year_parallel
+    from src.analysis.monte_carlo_merton import monte_carlo_merton_1year_parallel
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch Monte Carlo Simulation (GARCH / RS / MS-GARCH)")
+    parser = argparse.ArgumentParser(description="Batch Monte Carlo Simulation (GARCH / RS / MS-GARCH / Merton)")
     parser.add_argument('--job-index', type=int, default=os.environ.get('BATCH_TASK_INDEX', 0), help='Index of current batch task')
     parser.add_argument('--task-count', type=int, default=os.environ.get('BATCH_TASK_COUNT', 1), help='Total number of batch tasks')
-    parser.add_argument('--model', required=True, choices=['garch', 'regime-switching', 'ms-garch'], help='Model type to run')
+    parser.add_argument('--model', required=True, choices=['garch', 'regime-switching', 'ms-garch', 'merton'], help='Model type to run')
     parser.add_argument('--input-bucket', required=True, help='GCS bucket containing input data')
     parser.add_argument('--input-file', required=True, help='Path to model input CSV in bucket')
     parser.add_argument('--merton-file', default='data/output/merged_data_with_merton.csv', help='Path to Merton CSV in bucket')
@@ -154,13 +156,20 @@ def main():
             exclude_firms_without_estimated_params=exclude_missing,
             use_antithetic=args.use_antithetic,
         )
-    else:
+    elif args.model == 'ms-garch':
         results = monte_carlo_ms_garch_1year_parallel(
             ms_garch_file=local_subset,
             merton_file=local_merton_subset,
             num_simulations=args.num_simulations,
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_params=exclude_missing,
+            use_antithetic=args.use_antithetic,
+        )
+    else:
+        results = monte_carlo_merton_1year_parallel(
+            merton_file=local_merton_subset,
+            num_simulations=args.num_simulations,
+            n_jobs=args.n_jobs,
             use_antithetic=args.use_antithetic,
         )
     
