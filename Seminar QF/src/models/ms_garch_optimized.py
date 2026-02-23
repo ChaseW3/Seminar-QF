@@ -152,9 +152,9 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
     sigma2_0_uncond = omega_0 / max(1 - alpha_0 - beta_0, 0.01)
     sigma2_1_uncond = omega_1 / max(1 - alpha_1 - beta_1, 0.01)
     
-    # Bound initial variances
-    sigma2_0_uncond = min(max(sigma2_0_uncond, 1e-8), 1.0)
-    sigma2_1_uncond = min(max(sigma2_1_uncond, 1e-8), 1.0)
+    # Bound initial variances (only lower bound for numerical stability)
+    sigma2_0_uncond = max(sigma2_0_uncond, 1e-8)
+    sigma2_1_uncond = max(sigma2_1_uncond, 1e-8)
     
     # Initialize
     prev_sigma2_0 = sigma2_0_uncond
@@ -174,9 +174,10 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
             curr_sigma2_0 = omega_0 + alpha_0 * prev_eps2 + beta_0 * prev_sigma2_0
             curr_sigma2_1 = omega_1 + alpha_1 * prev_eps2 + beta_1 * prev_sigma2_1
         
-        # Bound variances for numerical stability
-        curr_sigma2_0 = min(max(curr_sigma2_0, 1e-10), 10.0)
-        curr_sigma2_1 = min(max(curr_sigma2_1, 1e-10), 10.0)
+        # REMOVED: Upper bound on variance (now only using 5-sigma truncation in Monte Carlo)
+        # Only keep lower bound for numerical stability
+        curr_sigma2_0 = max(curr_sigma2_0, 1e-10)
+        curr_sigma2_1 = max(curr_sigma2_1, 1e-10)
         
         sigma2[t, 0] = curr_sigma2_0
         sigma2[t, 1] = curr_sigma2_1
@@ -384,6 +385,11 @@ class MSGARCHOptimized:
             try:
                 p = self.init_params
                 # Transform constrained parameters back to unconstrained space for optimizer
+                
+                # Properly bound transition probabilities before logit transformation
+                p00_bounded = max(min(p['p00'], 0.99), 0.01)
+                p11_bounded = max(min(p['p11'], 0.99), 0.01)
+                
                 x0 = np.array([
                     np.log(max(p['omega_0'], 1e-10)),
                     self._alpha_to_unconstrained(p['alpha_0']),
@@ -393,9 +399,9 @@ class MSGARCHOptimized:
                     self._beta_to_unconstrained(p['beta_1']),
                     p['mu_0'],
                     p['mu_1'],
-                    # Handle boundaries for probabilities safely
-                    np.log(max(p['p00'], 0.01) / (1 - min(p['p00'], 0.99))), # logit(p00)
-                    np.log(max(p['p11'], 0.01) / (1 - min(p['p11'], 0.99))), # logit(p11)
+                    # Correct logit transformation: logit(p) = log(p / (1-p))
+                    np.log(p00_bounded / (1 - p00_bounded)), # logit(p00)
+                    np.log(p11_bounded / (1 - p11_bounded)), # logit(p11)
                     self._nu_to_unconstrained(p['nu_0']),
                     self._nu_to_unconstrained(p['nu_1'])
                 ])
@@ -990,7 +996,7 @@ def run_ms_garch_estimation_optimized(data_df,
         start_date = firm_data['date'].min()
         end_date = firm_data['date'].max()
         try:
-            estimation_start = start_date + pd.DateOffset(months=12)
+            estimation_start = start_date + pd.DateOffset(months=60)  # Start 5 years in
             if estimation_start >= end_date:
                 continue
             month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -1005,17 +1011,17 @@ def run_ms_garch_estimation_optimized(data_df,
                 # Select all data up to this point
                 data_up_to_point = firm_data[firm_data['date'] <= date_point]
 
-                # Require at least 252 trading days of history
-                if len(data_up_to_point) < 252:
+                # Require at least 1260 trading days of history (5 years)
+                if len(data_up_to_point) < 1260:
                     continue
 
-                # Take the exact last 252 trading days for the window
-                window_df = data_up_to_point.iloc[-252:].copy()
+                # Take the exact last 1260 trading days for the window (5 years)
+                window_df = data_up_to_point.iloc[-1260:].copy()
                 
-                # Additional data quality checks
+                # Additional data quality checks (relaxed for 5-year window)
                 valid_count = window_df['asset_return_daily_scaled'].notna().sum() if 'asset_return_daily_scaled' in window_df.columns else window_df['asset_return_daily'].notna().sum()
                 
-                if valid_count < 200: 
+                if valid_count < 1000:  # Require at least 1000 valid observations for 5-year window
                     continue
                 
                 # Use centrally scaled returns if available
@@ -1069,6 +1075,15 @@ def run_ms_garch_estimation_optimized(data_df,
                     
                     # Unscale volatility series
                     vol_series /= scale_factor
+                
+                # Validation: Check that unscaled unconditional volatilities are reasonable
+                uncond_vol_0_unscaled = np.sqrt(params['omega_0'] / max(1 - params['alpha_0'] - params['beta_0'], 0.01))
+                uncond_vol_1_unscaled = np.sqrt(params['omega_1'] / max(1 - params['alpha_1'] - params['beta_1'], 0.01))
+                
+                if not (0.0001 < uncond_vol_0_unscaled < 0.15):
+                    print(f"    ! Warning: Regime 0 uncond vol {uncond_vol_0_unscaled:.6f} outside reasonable range")
+                if not (0.0001 < uncond_vol_1_unscaled < 0.15):
+                    print(f"    ! Warning: Regime 1 uncond vol {uncond_vol_1_unscaled:.6f} outside reasonable range")
                 
                 # Use Last Trading Date for the "Date" field to ensure merge/saving works
                 last_trading_date = window_df['date'].max()

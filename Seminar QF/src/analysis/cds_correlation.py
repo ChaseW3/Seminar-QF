@@ -170,8 +170,8 @@ def calculate_cds_correlations(
     
     Parameters
     ----------
-    model_cds_file : str or Path
-        Path to model CDS spreads CSV
+    model_cds_file : str, Path, or pd.DataFrame
+        Path to model CDS spreads CSV or DataFrame with model CDS data
     merton_file : str or Path
         Path to Merton results CSV (for company name mapping)
     cds_market_df : pd.DataFrame
@@ -193,8 +193,11 @@ def calculate_cds_correlations(
     gvkey_to_company = merton_df[['gvkey', 'company']].drop_duplicates()
     gvkey_to_company = gvkey_to_company.set_index('gvkey')['company'].to_dict()
     
-    # Load model CDS
-    model_df = pd.read_csv(model_cds_file)
+    # Load model CDS (accept either file path or DataFrame)
+    if isinstance(model_cds_file, pd.DataFrame):
+        model_df = model_cds_file.copy()
+    else:
+        model_df = pd.read_csv(model_cds_file)
     model_df['company'] = model_df['gvkey'].map(gvkey_to_company)
     model_df['company_cds'] = model_df['company'].map(COMPANY_MAPPING)
     model_df['date'] = pd.to_datetime(model_df['date'])
@@ -364,11 +367,9 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 # NO conversion needed - spreads are already in bps
                 df[target_col] = df[source_col]
             
-            # Save to temporary file for calculate_cds_correlations
-            temp_file = output_dir / f'temp_{output_col_prefix}.csv'
+            # Return DataFrame with required columns (no temporary file needed)
             required_cols = ['date', 'gvkey'] + [f'{output_col_prefix}_1y_bps', f'{output_col_prefix}_3y_bps', f'{output_col_prefix}_5y_bps']
-            df[required_cols].to_csv(temp_file, index=False)
-            return temp_file
+            return df[required_cols]
         except Exception as e:
             print(f"⚠ Error preparing {mc_file}: {e}")
             return None
@@ -376,10 +377,10 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Merton Monte Carlo (Constant Volatility Baseline)
     merton_mc_file = output_dir / 'daily_monte_carlo_merton_results.csv'
     if merton_mc_file.exists():
-        temp_file = prepare_mc_file(merton_mc_file, 'merton_mc_implied_spread', 'cds_spread_merton_mc')
-        if temp_file is not None:
+        model_df = prepare_mc_file(merton_mc_file, 'merton_mc_implied_spread', 'cds_spread_merton_mc')
+        if model_df is not None:
             results['Merton_MC'] = calculate_cds_correlations(
-                model_cds_file=temp_file,
+                model_cds_file=model_df,
                 merton_file=merton_file,
                 cds_market_df=cds_market,
                 model_name='Merton MC',
@@ -391,10 +392,10 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # GARCH
     garch_mc_file = output_dir / 'daily_monte_carlo_garch_results.csv'
     if garch_mc_file.exists():
-        temp_file = prepare_mc_file(garch_mc_file, 'mc_garch_implied_spread', 'cds_spread_garch_mc')
-        if temp_file is not None:
+        model_df = prepare_mc_file(garch_mc_file, 'mc_garch_implied_spread', 'cds_spread_garch_mc')
+        if model_df is not None:
             results['GARCH'] = calculate_cds_correlations(
-                model_cds_file=temp_file,
+                model_cds_file=model_df,
                 merton_file=merton_file,
                 cds_market_df=cds_market,
                 model_name='GARCH',
@@ -406,10 +407,10 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Regime Switching
     rs_mc_file = output_dir / 'daily_monte_carlo_regime_switching_results.csv'
     if rs_mc_file.exists():
-        temp_file = prepare_mc_file(rs_mc_file, 'rs_implied_spread', 'cds_spread_regime_switching_mc')
-        if temp_file is not None:
+        model_df = prepare_mc_file(rs_mc_file, 'rs_implied_spread', 'cds_spread_regime_switching_mc')
+        if model_df is not None:
             results['RS'] = calculate_cds_correlations(
-                model_cds_file=temp_file,
+                model_cds_file=model_df,
                 merton_file=merton_file,
                 cds_market_df=cds_market,
                 model_name='Regime-Switching',
@@ -421,10 +422,10 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # MS-GARCH
     msgarch_mc_file = output_dir / 'daily_monte_carlo_ms_garch_results.csv'
     if msgarch_mc_file.exists():
-        temp_file = prepare_mc_file(msgarch_mc_file, 'mc_ms_garch_implied_spread', 'cds_spread_msgarch_mc')
-        if temp_file is not None:
+        model_df = prepare_mc_file(msgarch_mc_file, 'mc_ms_garch_implied_spread', 'cds_spread_msgarch_mc')
+        if model_df is not None:
             results['MSGARCH'] = calculate_cds_correlations(
-                model_cds_file=temp_file,
+                model_cds_file=model_df,
                 merton_file=merton_file,
                 cds_market_df=cds_market,
                 model_name='MS-GARCH',
