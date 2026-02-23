@@ -65,6 +65,9 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr, mu_arr,
             # 1. Vectorized Random Generation (standard normal for Merton)
             z = np.random.standard_normal(num_simulations)
             
+            # TRUNCATION: Cap errors at 5 standard deviations (as per paper page 12)
+            z = np.clip(z, -5.0, 5.0)
+            
             # 2. Vectorized Updates with constant volatility
             eps = sigma * z
             

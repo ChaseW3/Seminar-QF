@@ -309,11 +309,12 @@ class MarkovSwitchingTDist:
                 ])
                 
                 # Bounds with reasonable limits on volatility
-                # Max sigma2 = exp(6) ≈ 403, so max sigma ≈ 20 (reasonable for scaled returns)
+                # For scaled returns (×100):
+                # Max sigma2 = exp(3) ≈ 20.1, so max sigma ≈ 4.5 (4.5% daily unscaled, very high but possible)
                 # Min sigma2 = exp(-15) ≈ 3e-7 (very small but positive)
                 b_regime = [
                     (None, None), # mu
-                    (-15, 6),     # log_sigma2 (tightened upper bound from 10 to 6)
+                    (-15, 3),     # log_sigma2 (max daily vol of ~5% in scaled terms = 5% daily unscaled)
                     (-10, 6)      # log(nu-2)
                 ]
                 
@@ -381,7 +382,7 @@ def _process_single_firm(gvkey, firm_df):
     params_list = []
     
     try:
-        estimation_start = start_date + pd.DateOffset(months=12)
+        estimation_start = start_date + pd.DateOffset(months=60)  # Start 5 years in
         if estimation_start >= end_date:
             return firm_df, params_list
         month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -394,22 +395,22 @@ def _process_single_firm(gvkey, firm_df):
         # Select all data up to this point
         data_up_to_point = firm_df[firm_df['date'] <= date_point]
 
-        # Require at least 252 trading days of history
-        if len(data_up_to_point) < 252:
+        # Require at least 1260 trading days of history (5 years)
+        if len(data_up_to_point) < 1260:
             continue
 
         if len(params_list) % 12 == 0:
             print(f"    > Date: {date_point.date()} (Window {len(params_list)})")
 
-        # Take the exact last 252 trading days for the window
-        window_df = data_up_to_point.iloc[-252:].copy()
+        # Take the exact last 1260 trading days for the window (5 years)
+        window_df = data_up_to_point.iloc[-1260:].copy()
         
-        # Check for missing values
-        if window_df[target_col].isna().sum() > 20: 
+        # Check for missing values (relaxed for 5-year window)
+        if window_df[target_col].isna().sum() > 50: 
              continue
         
         valid_mask = window_df[target_col].notna()
-        if valid_mask.sum() < 200:
+        if valid_mask.sum() < 1000:  # Require at least 1000 valid observations for 5-year window
             continue
             
         returns = window_df.loc[valid_mask, target_col].values
@@ -417,10 +418,17 @@ def _process_single_firm(gvkey, firm_df):
         # Use the last actual trading date
         last_trading_date = window_df['date'].max()
         
-        # Scale for calculation if needed
-        calc_scale_factor = 100.0
-        if not scaled_available:
-             returns = returns * calc_scale_factor
+        # Scale for calculation - always scale returns by 100 for numerical stability
+        # CRITICAL: Regardless of input scale, always unscale by 100 when saving parameters
+        # This ensures all saved parameters are in RAW return scale (matching Monte Carlo expectations)
+        if scaled_available:
+            # Data is already scaled by 100, no need to scale again
+            # But we STILL need to unscale by 100 when saving (params are estimated on scaled data)
+            calc_scale_factor = 100.0  # Will unscale later to match raw return scale
+        else:
+            # Data is in raw scale, scale it by 100 for numerical stability
+            returns = returns * 100.0
+            calc_scale_factor = 100.0  # Will unscale later to match raw return scale
         
         try:
             model = MarkovSwitchingTDist()
@@ -438,15 +446,9 @@ def _process_single_firm(gvkey, firm_df):
                  # Swap probabilities
                  probs[:, [0, 1]] = probs[:, [1, 0]]
             
-            # Sanity check on volatilities (before unscaling)
-            # For scaled returns (×100), daily vol should typically be < 20 (equivalent to 20% daily on the scaled data)
-            max_reasonable_sigma = 20.0
-            if np.sqrt(params['sigma2_0']) > max_reasonable_sigma or np.sqrt(params['sigma2_1']) > max_reasonable_sigma:
-                print(f"    ⚠ Warning: Extreme volatility detected for firm {gvkey} at {date_point.date()}")
-                print(f"      Regime 0 vol: {np.sqrt(params['sigma2_0']):.4f}, Regime 1 vol: {np.sqrt(params['sigma2_1']):.4f}")
-                print(f"      Capping at {max_reasonable_sigma}")
-                params['sigma2_0'] = min(params['sigma2_0'], max_reasonable_sigma**2)
-                params['sigma2_1'] = min(params['sigma2_1'], max_reasonable_sigma**2)
+            # REMOVED: Volatility capping (now only using 5-sigma truncation in Monte Carlo)
+            # No longer cap estimated volatilities here - let the model estimate them freely
+            # The 5-sigma truncation in Monte Carlo simulations handles extreme values
             
             last_params = params
 
@@ -467,14 +469,24 @@ def _process_single_firm(gvkey, firm_df):
                 firm_df.loc[update_indices, "regime_probability_1"] = update_probs[:, 1]
                 firm_df.loc[update_indices, "regime_state"] = np.where(update_probs[:, 0] > 0.5, 0, 1)
 
-            # Store params
+            # Store params (unscale to raw return scale)
+            regime_0_vol_unscaled = np.sqrt(params['sigma2_0']) / calc_scale_factor
+            regime_1_vol_unscaled = np.sqrt(params['sigma2_1']) / calc_scale_factor
+            
+            # Validation: Check that unscaled volatilities are reasonable (daily returns)
+            # Typical daily vol: 0.5% to 5% (0.005 to 0.05)
+            if not (0.0001 < regime_0_vol_unscaled < 0.15):
+                print(f"    ! Warning: Regime 0 vol {regime_0_vol_unscaled:.6f} outside reasonable range [0.0001, 0.15]")
+            if not (0.0001 < regime_1_vol_unscaled < 0.15):
+                print(f"    ! Warning: Regime 1 vol {regime_1_vol_unscaled:.6f} outside reasonable range [0.0001, 0.15]")
+            
             params_list.append({
                 'gvkey': gvkey,
                 'date': last_trading_date, 
                 'regime_0_mean': params['mu_0'] / calc_scale_factor,
                 'regime_1_mean': params['mu_1'] / calc_scale_factor,
-                'regime_0_vol': np.sqrt(params['sigma2_0']) / calc_scale_factor,
-                'regime_1_vol': np.sqrt(params['sigma2_1']) / calc_scale_factor,
+                'regime_0_vol': regime_0_vol_unscaled,
+                'regime_1_vol': regime_1_vol_unscaled,
                 'regime_0_nu': params['nu_0'],
                 'regime_1_nu': params['nu_1'], 
                 'transition_prob_00': params['p00'],

@@ -158,6 +158,9 @@ def simulate_regime_switching_vectorized(
             
             z_t = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
+            # TRUNCATION: Cap errors at 5 standard deviations (as per paper page 12)
+            z_t = np.clip(z_t, -5.0, 5.0)
+            
             # 4. Vectorized Updates
             if use_risk_neutral_drift and valid_rf:
                 r_curr = (rf_rate / 252.0) - 0.5 * sigma**2 + sigma * z_t
@@ -248,6 +251,26 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     ar_1_arr = df_firms.get('regime_1_ar', pd.Series([0.0]*num_firms)).fillna(0.0).values
     sigma_0_arr = np.maximum(df_firms.get('regime_0_vol', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     sigma_1_arr = np.maximum(df_firms.get('regime_1_vol', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
+    
+    # Validation: Check if volatilities are in reasonable range for DAILY returns
+    # Expected range: 0.5% to 5% (0.005 to 0.05) for typical stocks
+    # If outside this range, likely an estimation or scaling error
+    median_vol_0 = np.median(sigma_0_arr[sigma_0_arr > 0])
+    median_vol_1 = np.median(sigma_1_arr[sigma_1_arr > 0])
+    
+    if median_vol_0 < 0.001 or median_vol_1 < 0.001:
+        print(f"ERROR: Regime switching volatilities too small (Regime 0: {median_vol_0:.6f}, Regime 1: {median_vol_1:.6f})")
+        print(f"       Expected range: [0.001, 0.15] for daily returns")
+        print(f"       This indicates a parameter estimation error in regime_switching.py")
+        print(f"       Please re-run regime switching estimation with corrected scaling.")
+        raise ValueError("Invalid volatility parameters detected")
+    
+    if median_vol_0 > 0.15 or median_vol_1 > 0.15:
+        print(f"WARNING: Regime switching volatilities very high (Regime 0: {median_vol_0:.6f}, Regime 1: {median_vol_1:.6f})")
+        print(f"         Expected range: [0.001, 0.15] for daily returns")
+        print(f"         This may indicate a parameter estimation error (100x too large)")
+        print(f"         Proceeding with caution - results may be unrealistic")
+    
     nu_0_arr = df_firms.get('regime_0_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
     nu_1_arr = df_firms.get('regime_1_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
     trans_00_arr = df_firms.get('transition_prob_00', pd.Series([0.95]*num_firms)).fillna(0.95).values

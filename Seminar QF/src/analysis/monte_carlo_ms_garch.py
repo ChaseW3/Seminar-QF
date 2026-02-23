@@ -149,6 +149,9 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
 
             t_sample = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
+            # TRUNCATION: Cap errors at 5 standard deviations (as per paper page 12)
+            t_sample = np.clip(t_sample, -5.0, 5.0)
+            
             # 2. Vectorized Updates with regime-specific parameters
             eps = sigma * t_sample
 
@@ -277,6 +280,21 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     alpha_1_arr = np.maximum(series_map['alpha_1'].fillna(0.05).values, 1e-4)
     beta_0_arr = np.maximum(series_map['beta_0'].fillna(0.93).values, 0.0)
     beta_1_arr = np.maximum(series_map['beta_1'].fillna(0.93).values, 0.0)
+    
+    # CRITICAL FIX: Ensure omega values have a reasonable floor to prevent variance collapse
+    # Omega should be at least (1-alpha-beta) * (min_reasonable_variance)
+    # where min_reasonable_variance ≈ (0.001)^2 = 1e-6 (0.1% daily vol)
+    min_variance = 1e-6
+    for idx in range(len(omega_0_arr)):
+        persistence_0 = alpha_0_arr[idx] + beta_0_arr[idx]
+        persistence_1 = alpha_1_arr[idx] + beta_1_arr[idx]
+        if persistence_0 < 0.9999:  # Only apply if stationary
+            min_omega_0 = (1 - persistence_0) * min_variance
+            omega_0_arr[idx] = max(omega_0_arr[idx], min_omega_0)
+        if persistence_1 < 0.9999:  # Only apply if stationary
+            min_omega_1 = (1 - persistence_1) * min_variance
+            omega_1_arr[idx] = max(omega_1_arr[idx], min_omega_1)
+    
     mu_0_arr = series_map['mu_0'].fillna(0.0).values
     mu_1_arr = series_map['mu_1'].fillna(0.0).values
     p00_arr = series_map['p00'].fillna(0.95).values

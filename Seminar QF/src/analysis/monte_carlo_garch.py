@@ -110,6 +110,10 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             
             # 2. Vectorized Updates
             eps = sigma * t_sample
+            
+            # TRUNCATION: Cap t_sample at 5 standard deviations (as per paper page 12)
+            t_sample = np.clip(t_sample, -5.0, 5.0)
+            eps = sigma * t_sample
 
             # Drift choice for log-asset dynamics
             # For pricing (implied spreads), risk-neutral drift is generally appropriate.

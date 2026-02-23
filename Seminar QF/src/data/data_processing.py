@@ -18,7 +18,7 @@ FILENAME_EQUITY_DATA = config.EQUITY_DATA_FILE
 FILENAME_INTEREST_RATES = config.INTEREST_RATES_FILE
 SHEET_EQUITY = 0
 SHEET_LIABILITY = 1
-MIN_OBSERVATIONS = 252
+MIN_OBSERVATIONS = 756  # 3 years of trading days (252 * 3)
 T_HORIZON = 1.0
 TRADING_DAYS_PER_YEAR = 252.0
 
@@ -282,7 +282,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
     results = []
     
     for date_idx, date_t in enumerate(all_dates):
-        # 252-observation rolling window (trading days, not calendar days)
+        # 756-observation rolling window (3 years of trading days)
         window_start_idx = max(0, date_idx - MIN_OBSERVATIONS + 1)
         window_df = firm_data.iloc[window_start_idx:date_idx + 1]
         
@@ -526,11 +526,11 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     print(f"✓ Merged data (equity + Merton) starts: {merged_min}")
     assert equity_min == merged_min, f"ERROR: Lost early dates! Equity starts {equity_min}, merged starts {merged_min}"
     
-    # 2. First non-null Merton result should be ~Jan 2011 (after 252-day window from 2010 data)
+    # 2. First non-null Merton result should be ~3 years after start (after 756-day window from 2010 data)
     first_merton = df_merged.dropna(subset=['asset_value'])['date'].min()
-    expected_merton_start = equity_min + pd.DateOffset(days=252)
+    expected_merton_start = equity_min + pd.DateOffset(days=756)
     print(f"✓ First non-null Merton result: {first_merton}")
-    print(f"  (Expected around {expected_merton_start.strftime('%Y-%m-%d')} after 252-day window)")
+    print(f"  (Expected around {expected_merton_start.strftime('%Y-%m-%d')} after 756-day (3-year) window)")
     
     # 3. Liabilities should start around Feb 2011 (this is expected and correct)
     first_liab = df_merged.dropna(subset=['liabilities_total'])['date'].min()
