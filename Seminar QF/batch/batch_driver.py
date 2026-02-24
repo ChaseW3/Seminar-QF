@@ -170,7 +170,6 @@ def main():
             merton_file=local_merton_subset,
             num_simulations=args.num_simulations,
             n_jobs=args.n_jobs,
-            use_antithetic=args.use_antithetic,
         )
     
     # 4. Upload Results

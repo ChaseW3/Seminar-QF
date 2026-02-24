@@ -14,6 +14,7 @@ MODEL_TO_OUTPUT_FILE = {
     "garch": "daily_monte_carlo_garch_results.csv",
     "regime-switching": "daily_monte_carlo_regime_switching_results.csv",
     "ms-garch": "daily_monte_carlo_ms_garch_results.csv",
+    "merton": "daily_monte_carlo_merton_results.csv",
 }
 
 
@@ -39,7 +40,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         required=True,
-        help="Model to download: garch, regime-switching, ms-garch (aliases: msgarch, msgrach)",
+        help="Model to download: garch, regime-switching, ms-garch, merton (aliases: msgarch, msgrach)",
     )
     parser.add_argument("--bucket", default=DEFAULT_BUCKET, help="GCS bucket name")
     parser.add_argument("--prefix", default=DEFAULT_PREFIX, help="Base GCS prefix for batch outputs")
@@ -48,10 +49,15 @@ def parse_args():
         default="./batch_results",
         help="Local temp root where shard CSVs are downloaded",
     )
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="Optional ISO timestamp filter (UTC). Only download blobs updated at/after this time.",
+    )
     return parser.parse_args()
 
 
-def download_results(bucket_name: str, model: str, model_prefix: str, model_local_dir: Path) -> int:
+def download_results(bucket_name: str, model: str, model_prefix: str, model_local_dir: Path, since: str | None = None) -> int:
     """Downloads model-specific CSV shards from GCS to local temp folder."""
     print(f"Connecting to bucket: {bucket_name}...")
     storage_client = storage.Client()
@@ -61,10 +67,19 @@ def download_results(bucket_name: str, model: str, model_prefix: str, model_loca
 
     blobs = bucket.list_blobs(prefix=model_prefix)
     count = 0
+    since_ts = pd.to_datetime(since, utc=True) if since else None
 
     print(f"Downloading model='{model}' files from gs://{bucket_name}/{model_prefix} ...")
+    if since_ts is not None:
+        print(f"Applying updated>= filter: {since_ts.isoformat()}")
     for blob in blobs:
         if blob.name.endswith(".csv"):
+            if since_ts is not None and blob.updated is not None:
+                blob_updated = pd.Timestamp(blob.updated)
+                if blob_updated.tzinfo is None:
+                    blob_updated = blob_updated.tz_localize("UTC")
+                if blob_updated < since_ts:
+                    continue
             filename = os.path.basename(blob.name)
             local_path = model_local_dir / filename
             blob.download_to_filename(str(local_path))
@@ -138,7 +153,7 @@ if __name__ == "__main__":
     model_local_dir = local_root / model
     model_prefix = f"{args.prefix.rstrip('/')}/{model}/"
 
-    downloaded = download_results(args.bucket, model, model_prefix, model_local_dir)
+    downloaded = download_results(args.bucket, model, model_prefix, model_local_dir, args.since)
     if downloaded > 0:
         merged_ok = merge_results(model_local_dir, final_output_file)
         if merged_ok:

@@ -392,6 +392,51 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     # Filter firms if specified
     if gvkey_selected is not None:
         df = df[df['gvkey'].isin(gvkey_selected)]
+
+    ms_garch_required_candidates = {
+        'omega_0': ['ms_garch_omega_0', 'omega_0'],
+        'omega_1': ['ms_garch_omega_1', 'omega_1'],
+        'alpha_0': ['ms_garch_alpha_0', 'alpha_0'],
+        'alpha_1': ['ms_garch_alpha_1', 'alpha_1'],
+        'beta_0': ['ms_garch_beta_0', 'beta_0'],
+        'beta_1': ['ms_garch_beta_1', 'beta_1'],
+        'p00': ['ms_garch_p00', 'p00'],
+        'p11': ['ms_garch_p11', 'p11'],
+        'nu_0': ['ms_garch_nu_0', 'nu_0'],
+        'nu_1': ['ms_garch_nu_1', 'nu_1'],
+        'volatility': ['ms_garch_volatility'],
+        'regime_prob': ['ms_garch_regime_prob'],
+    }
+
+    # Start each firm at its first date where all MS-GARCH parameters are estimated
+    if exclude_firms_without_estimated_params:
+        has_complete_ms_garch_params = pd.Series(True, index=df.index)
+        for _, candidates in ms_garch_required_candidates.items():
+            existing = [col for col in candidates if col in df.columns]
+            if not existing:
+                has_complete_ms_garch_params &= False
+                continue
+
+            key_valid = pd.Series(False, index=df.index)
+            for col in existing:
+                key_valid |= df[col].notna()
+            has_complete_ms_garch_params &= key_valid
+
+        if 'date' in df.columns:
+            first_valid_date = (
+                df.loc[has_complete_ms_garch_params]
+                .groupby('gvkey', as_index=True)['date']
+                .min()
+                .rename('_msgarch_first_valid_date')
+            )
+            df = df.merge(first_valid_date, left_on='gvkey', right_index=True, how='left')
+            df = df[
+                df['_msgarch_first_valid_date'].notna()
+                & (df['date'] >= df['_msgarch_first_valid_date'])
+                & has_complete_ms_garch_params.values
+            ].drop(columns=['_msgarch_first_valid_date'])
+        else:
+            df = df.loc[has_complete_ms_garch_params].copy()
     
     print(f"Running PARALLELIZED Monte Carlo MS-GARCH simulation:")
     print(f"  Firms: {df['gvkey'].nunique()}")

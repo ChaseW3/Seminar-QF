@@ -152,9 +152,9 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
     sigma2_0_uncond = omega_0 / max(1 - alpha_0 - beta_0, 0.01)
     sigma2_1_uncond = omega_1 / max(1 - alpha_1 - beta_1, 0.01)
     
-    # Bound initial variances (only lower bound for numerical stability)
-    sigma2_0_uncond = max(sigma2_0_uncond, 1e-8)
-    sigma2_1_uncond = max(sigma2_1_uncond, 1e-8)
+    # Bound initial variances
+    sigma2_0_uncond = min(max(sigma2_0_uncond, 1e-8), 1.0)
+    sigma2_1_uncond = min(max(sigma2_1_uncond, 1e-8), 1.0)
     
     # Initialize
     prev_sigma2_0 = sigma2_0_uncond

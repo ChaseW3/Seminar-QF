@@ -371,6 +371,34 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     # Filter firms if specified
     if gvkey_selected is not None:
         df = df[df['gvkey'].isin(gvkey_selected)]
+
+    required_rs_cols = [
+        'regime_0_vol', 'regime_1_vol', 'regime_0_nu', 'regime_1_nu',
+        'transition_prob_00', 'transition_prob_01', 'transition_prob_10', 'transition_prob_11'
+    ]
+
+    # Start each firm at its first date where all RS parameters are estimated
+    if exclude_firms_without_estimated_params:
+        if all(col in df.columns for col in required_rs_cols):
+            has_complete_rs_params = df[required_rs_cols].notna().all(axis=1)
+        else:
+            has_complete_rs_params = pd.Series(False, index=df.index)
+
+        if 'date' in df.columns:
+            first_valid_date = (
+                df.loc[has_complete_rs_params]
+                .groupby('gvkey', as_index=True)['date']
+                .min()
+                .rename('_rs_first_valid_date')
+            )
+            df = df.merge(first_valid_date, left_on='gvkey', right_index=True, how='left')
+            df = df[
+                df['_rs_first_valid_date'].notna()
+                & (df['date'] >= df['_rs_first_valid_date'])
+                & has_complete_rs_params.values
+            ].drop(columns=['_rs_first_valid_date'])
+        else:
+            df = df.loc[has_complete_rs_params].copy()
     
     print(f"Running PARALLELIZED Monte Carlo Regime-Switching simulation:")
     print(f"  Firms: {df['gvkey'].nunique()}")
