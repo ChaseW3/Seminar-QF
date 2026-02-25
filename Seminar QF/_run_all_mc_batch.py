@@ -21,7 +21,7 @@ files = {
     'regime_fallback': root / 'data/output/daily_asset_returns_with_regime.csv',
     'ms_garch': root / 'data/output/daily_asset_returns_with_msgarch.csv',
     'merton': root / 'data/output/merged_data_with_merton.csv',
-    'cds_filter': root / 'data/output/cds_date_level_model_use_flag.csv',
+    'cds_filter': root / 'data/cds_filters/gvkey_maturity_simulation_windows.csv',
 }
 
 regime_file = files['regime'] if files['regime'].exists() else files['regime_fallback']

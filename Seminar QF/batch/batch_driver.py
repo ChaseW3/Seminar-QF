@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('--input-bucket', required=True, help='GCS bucket containing input data')
     parser.add_argument('--input-file', required=True, help='Path to model input CSV in bucket')
     parser.add_argument('--merton-file', default='data/output/merged_data_with_merton.csv', help='Path to Merton CSV in bucket')
-    parser.add_argument('--cds-filter-file', default='data/output/cds_date_level_model_use_flag.csv', help='Path to CDS clean-date filter CSV in bucket')
+    parser.add_argument('--cds-filter-file', default='data/cds_filters/gvkey_maturity_simulation_windows.csv', help='Path to CDS gvkey+maturity simulation windows CSV in bucket')
     parser.add_argument('--output-bucket', required=True, help='GCS bucket for output results')
     parser.add_argument('--output-prefix', default='output/results', help='Prefix for output files')
     parser.add_argument('--num-simulations', type=int, default=1000, help='Number of simulations per firm')
@@ -165,7 +165,7 @@ def main():
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_garch=exclude_missing,
             use_antithetic=args.use_antithetic,
-            cds_filter_file=local_cds_filter,
+            cds_filter_file=None,
         )
     elif args.model == 'regime-switching':
         results = monte_carlo_regime_switching_1year_parallel(
@@ -175,7 +175,7 @@ def main():
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_params=exclude_missing,
             use_antithetic=args.use_antithetic,
-            cds_filter_file=local_cds_filter,
+            cds_filter_file=None,
         )
     elif args.model == 'ms-garch':
         results = monte_carlo_ms_garch_1year_parallel(
@@ -185,14 +185,14 @@ def main():
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_params=exclude_missing,
             use_antithetic=args.use_antithetic,
-            cds_filter_file=local_cds_filter,
+            cds_filter_file=None,
         )
     else:
         results = monte_carlo_merton_1year_parallel(
             merton_file=local_merton_subset,
             num_simulations=args.num_simulations,
             n_jobs=args.n_jobs,
-            cds_filter_file=local_cds_filter,
+            cds_filter_file=None,
         )
     
     # 4. Upload Results

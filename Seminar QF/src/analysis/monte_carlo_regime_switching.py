@@ -10,6 +10,14 @@ import numba
 from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
+
+def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
+    if max_days <= 252:
+        return np.array([252], dtype=np.int32)
+    if max_days <= 756:
+        return np.array([252, 756], dtype=np.int32)
+    return np.array([252, 756, 1260], dtype=np.int32)
+
 @numba.jit(nopython=True, fastmath=True, cache=True)
 def simulate_regime_switching_vectorized(
     sigma_0, sigma_1, nu_0, nu_1,
@@ -297,18 +305,46 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     # Initial regime probabilities
     initial_regime_probs = np.full(num_firms, 0.5)
     
-    # Define horizons: 1y, 3y, 5y (trading days)
-    horizon_days = np.array([252, 756, 1260], dtype=np.int32)
-    
-    # Run simulation
-    pd_out, spread_out, debt_out, regime_fractions = simulate_regime_switching_vectorized(
-        sigma_0_arr, sigma_1_arr, nu_0_arr, nu_1_arr,
-        trans_00_arr, trans_01_arr, trans_10_arr, trans_11_arr,
-        num_simulations, num_firms, horizon_days, initial_regime_probs,
-        v0_arr, liability_arr, rf_arr,
-        use_antithetic,
-        spread_cap,
-    )
+    # Maturity-aware horizons per firm-date; default to 5Y if not provided
+    if 'cds_max_horizon_days' in df_firms.columns:
+        required_horizons = pd.to_numeric(df_firms['cds_max_horizon_days'], errors='coerce').fillna(1260).astype(int).values
+    else:
+        required_horizons = np.full(num_firms, 1260, dtype=np.int32)
+    required_horizons = np.where(required_horizons <= 252, 252, np.where(required_horizons <= 756, 756, 1260)).astype(np.int32)
+
+    pd_out = np.full((3, num_firms), np.nan)
+    spread_out = np.full((3, num_firms), np.nan)
+    debt_out = np.full((3, num_firms), np.nan)
+    regime_fractions = np.full((2, num_firms), np.nan)
+
+    for max_days in np.unique(required_horizons):
+        idx = np.where(required_horizons == max_days)[0]
+        if len(idx) == 0:
+            continue
+
+        horizon_days = _horizon_vector_from_max_days(int(max_days))
+        sub_pd, sub_spread, sub_debt, sub_regime = simulate_regime_switching_vectorized(
+            sigma_0_arr[idx], sigma_1_arr[idx], nu_0_arr[idx], nu_1_arr[idx],
+            trans_00_arr[idx], trans_01_arr[idx], trans_10_arr[idx], trans_11_arr[idx],
+            num_simulations, len(idx), horizon_days, initial_regime_probs[idx],
+            v0_arr[idx], liability_arr[idx], rf_arr[idx],
+            use_antithetic,
+            spread_cap,
+        )
+
+        pd_out[0, idx] = sub_pd[0, :]
+        spread_out[0, idx] = sub_spread[0, :]
+        debt_out[0, idx] = sub_debt[0, :]
+        if horizon_days.shape[0] >= 2:
+            pd_out[1, idx] = sub_pd[1, :]
+            spread_out[1, idx] = sub_spread[1, :]
+            debt_out[1, idx] = sub_debt[1, :]
+        if horizon_days.shape[0] >= 3:
+            pd_out[2, idx] = sub_pd[2, :]
+            spread_out[2, idx] = sub_spread[2, :]
+            debt_out[2, idx] = sub_debt[2, :]
+
+        regime_fractions[:, idx] = sub_regime
 
     if exclude_firms_without_estimated_params:
         invalid_mask = ~has_estimated_model_params
@@ -340,6 +376,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
         results_list.append({
             'gvkey': firm,
             'date': date,
+            'cds_max_horizon_days': int(required_horizons[firm_idx]),
             'has_estimated_rs_params': bool(has_estimated_model_params[firm_idx]),
             'used_default_rs_inputs': bool(not has_estimated_model_params[firm_idx]),
             'rs_fraction_regime_0': regime_0_frac[firm_idx],

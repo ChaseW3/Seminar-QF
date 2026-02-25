@@ -8,6 +8,14 @@ from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 
+def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
+    if max_days <= 252:
+        return np.array([252], dtype=np.int32)
+    if max_days <= 756:
+        return np.array([252, 756], dtype=np.int32)
+    return np.array([252, 756, 1260], dtype=np.int32)
+
+
 @numba.jit(nopython=True, fastmath=True, cache=True)
 def simulate_merton_pd_spreads_jit(sigma_daily_arr,
                                     num_simulations, num_firms,
@@ -164,16 +172,41 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
         if not np.isnan(rf_arr[i]) and abs(rf_arr[i]) > 0.5:
             rf_arr[i] = rf_arr[i] / 100.0
     
-    # Define horizons: 1y, 3y, 5y (trading days)
-    horizon_days = np.array([252, 756, 1260], dtype=np.int32)
-    
-    # Run simulation
-    pd_out, spread_out, debt_out = simulate_merton_pd_spreads_jit(
-        sigma_daily_arr,
-        num_simulations, num_firms, horizon_days,
-        v0_arr, liability_arr, rf_arr,
-        spread_cap,
-    )
+    # Maturity-aware horizons per firm-date; default to 5Y if not provided
+    if 'cds_max_horizon_days' in df_firms.columns:
+        required_horizons = pd.to_numeric(df_firms['cds_max_horizon_days'], errors='coerce').fillna(1260).astype(int).values
+    else:
+        required_horizons = np.full(num_firms, 1260, dtype=np.int32)
+    required_horizons = np.where(required_horizons <= 252, 252, np.where(required_horizons <= 756, 756, 1260)).astype(np.int32)
+
+    pd_out = np.full((3, num_firms), np.nan)
+    spread_out = np.full((3, num_firms), np.nan)
+    debt_out = np.full((3, num_firms), np.nan)
+
+    for max_days in np.unique(required_horizons):
+        idx = np.where(required_horizons == max_days)[0]
+        if len(idx) == 0:
+            continue
+
+        horizon_days = _horizon_vector_from_max_days(int(max_days))
+        sub_pd, sub_spread, sub_debt = simulate_merton_pd_spreads_jit(
+            sigma_daily_arr[idx],
+            num_simulations, len(idx), horizon_days,
+            v0_arr[idx], liability_arr[idx], rf_arr[idx],
+            spread_cap,
+        )
+
+        pd_out[0, idx] = sub_pd[0, :]
+        spread_out[0, idx] = sub_spread[0, :]
+        debt_out[0, idx] = sub_debt[0, :]
+        if horizon_days.shape[0] >= 2:
+            pd_out[1, idx] = sub_pd[1, :]
+            spread_out[1, idx] = sub_spread[1, :]
+            debt_out[1, idx] = sub_debt[1, :]
+        if horizon_days.shape[0] >= 3:
+            pd_out[2, idx] = sub_pd[2, :]
+            spread_out[2, idx] = sub_spread[2, :]
+            debt_out[2, idx] = sub_debt[2, :]
     
     # Extract results by horizon
     pd_1y = pd_out[0, :]
@@ -194,6 +227,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
         results_list.append({
             'gvkey': firm,
             'date': date,
+            'cds_max_horizon_days': int(required_horizons[firm_idx]),
             'merton_mc_pd_1y': pd_1y[firm_idx],
             'merton_mc_pd_3y': pd_3y[firm_idx],
             'merton_mc_pd_5y': pd_5y[firm_idx],
