@@ -21,6 +21,7 @@ try:
     from src.analysis.monte_carlo_regime_switching import monte_carlo_regime_switching_1year_parallel
     from src.analysis.monte_carlo_ms_garch import monte_carlo_ms_garch_1year_parallel
     from src.analysis.monte_carlo_merton import monte_carlo_merton_1year_parallel
+    from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 except ImportError:
     # Try adding one level up if run from a subdirectory
     sys.path.append(str(project_root.parent))
@@ -28,6 +29,7 @@ except ImportError:
     from src.analysis.monte_carlo_regime_switching import monte_carlo_regime_switching_1year_parallel
     from src.analysis.monte_carlo_ms_garch import monte_carlo_ms_garch_1year_parallel
     from src.analysis.monte_carlo_merton import monte_carlo_merton_1year_parallel
+    from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Batch Monte Carlo Simulation (GARCH / RS / MS-GARCH / Merton)")
@@ -37,6 +39,7 @@ def parse_args():
     parser.add_argument('--input-bucket', required=True, help='GCS bucket containing input data')
     parser.add_argument('--input-file', required=True, help='Path to model input CSV in bucket')
     parser.add_argument('--merton-file', default='data/output/merged_data_with_merton.csv', help='Path to Merton CSV in bucket')
+    parser.add_argument('--cds-filter-file', default='data/output/cds_date_level_model_use_flag.csv', help='Path to CDS clean-date filter CSV in bucket')
     parser.add_argument('--output-bucket', required=True, help='GCS bucket for output results')
     parser.add_argument('--output-prefix', default='output/results', help='Prefix for output files')
     parser.add_argument('--num-simulations', type=int, default=1000, help='Number of simulations per firm')
@@ -71,6 +74,7 @@ def main():
     # Define local paths
     local_input = 'input_data.csv'
     local_merton = 'merton_data.csv'
+    local_cds_filter = 'cds_date_filter.csv'
     
     # 1. Download Input Data
     # For large scale, downloading repeatedly is okay if data is small (<100MB).
@@ -78,6 +82,7 @@ def main():
     print(f"Task {args.job_index}/{args.task_count}: Downloading inputs...")
     try:
         download_blob(args.input_bucket, args.input_file, local_input)
+        download_blob(args.input_bucket, args.cds_filter_file, local_cds_filter)
         # Try to download merton file, but it's optional in the logic (though recommended)
         try:
             download_blob(args.input_bucket, args.merton_file, local_merton)
@@ -95,8 +100,19 @@ def main():
         # If no date column, we can't split by date. Fail or run all.
         print("Error: Input data has no 'date' column.")
         sys.exit(1)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df[df['date'].notna()].copy()
+
+    allowed_dates = load_allowed_cds_dates(local_cds_filter)
+    if len(allowed_dates) == 0:
+        print("Error: CDS clean-date filter produced zero allowed dates.")
+        sys.exit(1)
+    before_rows = len(df)
+    before_dates = df['date'].nunique()
+    df = filter_df_to_allowed_dates(df, allowed_dates, date_col='date')
+    print(f"Applied CDS clean-date filter: rows {before_rows:,} -> {len(df):,}, dates {before_dates} -> {df['date'].nunique()}")
         
-    unique_dates = sorted(df['date'].unique())
+    unique_dates = sorted(df['date'].dt.normalize().unique())
     total_dates = len(unique_dates)
     print(f"Total unique dates in dataset: {total_dates}")
     
@@ -113,14 +129,17 @@ def main():
     print(f"Processing {len(task_dates)} dates: from {task_dates[0]} to {task_dates[-1]}")
     
     # Filter DataFrame
-    df_subset = df[df['date'].isin(task_dates)].copy()
+    df_subset = df[df['date'].dt.normalize().isin(task_dates)].copy()
     
     # Load Merton DF if available (needed for efficient PD calc)
     merton_df_arg = None
     if local_merton and os.path.exists(local_merton):
         merton_full = pd.read_csv(local_merton)
+        merton_full['date'] = pd.to_datetime(merton_full['date'], errors='coerce')
+        merton_full = merton_full[merton_full['date'].notna()].copy()
+        merton_full = filter_df_to_allowed_dates(merton_full, allowed_dates, date_col='date')
         # Filter Merton data to relevant dates/firms to save memory
-        merton_df_arg = merton_full[merton_full['date'].isin(task_dates)].copy()
+        merton_df_arg = merton_full[merton_full['date'].dt.normalize().isin(task_dates)].copy()
     else:
         print("Error: Merton file is required but was not available.")
         sys.exit(1)
@@ -146,6 +165,7 @@ def main():
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_garch=exclude_missing,
             use_antithetic=args.use_antithetic,
+            cds_filter_file=local_cds_filter,
         )
     elif args.model == 'regime-switching':
         results = monte_carlo_regime_switching_1year_parallel(
@@ -155,6 +175,7 @@ def main():
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_params=exclude_missing,
             use_antithetic=args.use_antithetic,
+            cds_filter_file=local_cds_filter,
         )
     elif args.model == 'ms-garch':
         results = monte_carlo_ms_garch_1year_parallel(
@@ -164,12 +185,14 @@ def main():
             n_jobs=args.n_jobs,
             exclude_firms_without_estimated_params=exclude_missing,
             use_antithetic=args.use_antithetic,
+            cds_filter_file=local_cds_filter,
         )
     else:
         results = monte_carlo_merton_1year_parallel(
             merton_file=local_merton_subset,
             num_simulations=args.num_simulations,
             n_jobs=args.n_jobs,
+            cds_filter_file=local_cds_filter,
         )
     
     # 4. Upload Results

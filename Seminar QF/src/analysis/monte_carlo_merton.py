@@ -5,6 +5,7 @@ import numpy as np
 import numba
 from datetime import timedelta
 from joblib import Parallel, delayed
+from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 
 @numba.jit(nopython=True, fastmath=True, cache=True)
@@ -211,7 +212,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
 
 
 
-def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, spread_cap=0.5):
+def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, spread_cap=0.5, cds_filter_file=None):
     print(f"Loading Merton data from {merton_file}...")
     df = pd.read_csv(merton_file)
     
@@ -221,6 +222,16 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simu
     # Filter firms if specified
     if gvkey_selected is not None:
         df = df[df['gvkey'].isin(gvkey_selected)]
+
+    if cds_filter_file:
+        allowed_dates = load_allowed_cds_dates(cds_filter_file)
+        before_rows = len(df)
+        before_dates = df['date'].nunique() if 'date' in df.columns else 1
+        df = filter_df_to_allowed_dates(df, allowed_dates, date_col='date')
+        after_rows = len(df)
+        after_dates = df['date'].nunique() if 'date' in df.columns else 1
+        print(f"✓ Applied CDS clean-date filter from {cds_filter_file}")
+        print(f"  Rows: {before_rows:,} -> {after_rows:,}; Dates: {before_dates} -> {after_dates}")
     
     print(f"Running PARALLELIZED Monte Carlo Merton simulation:")
     print(f"  Firms: {df['gvkey'].nunique()}")
