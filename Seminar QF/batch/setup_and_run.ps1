@@ -6,20 +6,22 @@ $REPO_NAME = "batch-images"
 $IMAGE_NAME = "monte-carlo-garch"
 $IMAGE_TAG = "latest"
 $IMAGE_URI = "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$IMAGE_NAME`:$IMAGE_TAG"
-$MODEL = "garch"  # garch | regime-switching | ms-garch
+$MODEL = "all-1k"  # all-1k | merton | regime-switching | ms-garch
+$RUN_ID = (Get-Date -Format "yyyyMMdd-HHmmss")
+$INPUT_PREFIX = "data/releases/$RUN_ID"
+$OUTPUT_PREFIX = "output/runs/$RUN_ID/results_1k"
 
-# Copy/paste run commands (submit directly without editing this script):
-# gcloud batch jobs submit "garch-10k-$(Get-Date -Format 'yyyyMMdd-HHmm')" --location us-central1 --config batch/job_garch_10k.json
-
-# gcloud batch jobs submit "rs-10k-$(Get-Date -Format 'yyyyMMdd-HHmm')" --location us-central1 --config batch/job_regime_switching_10k.json
-
-# gcloud batch jobs submit "msgarch-10k-$(Get-Date -Format 'yyyyMMdd-HHmm')" --location us-central1 --config batch/job_ms_garch_10k.json
+# This script uploads a fresh release snapshot under gs://$BUCKET_NAME/$INPUT_PREFIX/
+# and submits model jobs with output under gs://$BUCKET_NAME/$OUTPUT_PREFIX/<model>/
 
 Write-Host "--- Google Cloud Batch Setup ---" -ForegroundColor Cyan
 Write-Host "Project: $PROJECT_ID"
 Write-Host "Region: $REGION"
 Write-Host "Bucket: $BUCKET_NAME"
 Write-Host "Image: $IMAGE_URI"
+Write-Host "Run ID: $RUN_ID"
+Write-Host "Input Prefix: $INPUT_PREFIX"
+Write-Host "Output Prefix: $OUTPUT_PREFIX"
 Write-Host "--------------------------------"
 
 # 1. Enable Required Services (API calls can take a moment)
@@ -28,7 +30,8 @@ gcloud services enable batch.googleapis.com compute.googleapis.com logging.googl
 
 # 2. Create Storage Bucket
 Write-Host "`n[2/6] Creating/Checking Storage Bucket..."
-if (gsutil ls -b gs://$BUCKET_NAME 2>$null) {
+$null = gsutil ls -b "gs://$BUCKET_NAME" 2>$null
+if ($LASTEXITCODE -eq 0) {
     Write-Host "Bucket gs://$BUCKET_NAME already exists." -ForegroundColor Yellow
 } else {
     gcloud storage buckets create gs://$BUCKET_NAME --location=$REGION
@@ -52,38 +55,48 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 Set-Location $ProjectRoot
 
-$InputFile = "data/output/daily_asset_returns_with_garch.csv"
-$InputFileRS = "data/output/daily_asset_returns_with_regime.csv"
+$InputFileRS = "data/output/daily_asset_returns_with_regime_switching.csv"
 $InputFileMSG = "data/output/daily_asset_returns_with_msgarch.csv"
 $MertonFile = "data/output/merged_data_with_merton.csv"
 
-if (Test-Path $InputFile) {
-    gcloud storage cp $InputFile gs://$BUCKET_NAME/data/output/
-    Write-Host "Uploaded $InputFile" -ForegroundColor Green
-} else {
-    Write-Error "Input file not found: $InputFile"
-}
-
 if (Test-Path $InputFileRS) {
-    gcloud storage cp $InputFileRS gs://$BUCKET_NAME/data/output/
+    gcloud storage cp $InputFileRS gs://$BUCKET_NAME/$INPUT_PREFIX/
     Write-Host "Uploaded $InputFileRS" -ForegroundColor Green
 } else {
-    Write-Warning "Input file not found: $InputFileRS"
+    Write-Error "Required input file not found: $InputFileRS"
+    exit 1
 }
 
 if (Test-Path $InputFileMSG) {
-    gcloud storage cp $InputFileMSG gs://$BUCKET_NAME/data/output/
+    gcloud storage cp $InputFileMSG gs://$BUCKET_NAME/$INPUT_PREFIX/
     Write-Host "Uploaded $InputFileMSG" -ForegroundColor Green
 } else {
-    Write-Warning "Input file not found: $InputFileMSG"
+    Write-Error "Required input file not found: $InputFileMSG"
+    exit 1
 }
 
 if (Test-Path $MertonFile) {
-    gcloud storage cp $MertonFile gs://$BUCKET_NAME/data/output/
+    gcloud storage cp $MertonFile gs://$BUCKET_NAME/$INPUT_PREFIX/
     Write-Host "Uploaded $MertonFile" -ForegroundColor Green
 } else {
-    Write-Warning "Merton file not found: $MertonFile. Proceeding without it (PD calculation might be limited)."
+    Write-Error "Required Merton file not found: $MertonFile"
+    exit 1
 }
+
+# Optional release manifest for traceability (prevents accidental old-input ambiguity)
+$manifestPath = "batch_input_manifest_$RUN_ID.txt"
+@(
+    "run_id=$RUN_ID"
+    "region=$REGION"
+    "bucket=$BUCKET_NAME"
+    "input_prefix=$INPUT_PREFIX"
+    "output_prefix=$OUTPUT_PREFIX"
+    "regime_file=$InputFileRS"
+    "ms_garch_file=$InputFileMSG"
+    "merton_file=$MertonFile"
+) | Set-Content -Path $manifestPath
+gcloud storage cp $manifestPath gs://$BUCKET_NAME/$INPUT_PREFIX/
+Write-Host "Uploaded input manifest: $manifestPath" -ForegroundColor Green
 
 # 5. Build and Push Docker Image (Using Cloud Build)
 Write-Host "`n[5/6] Building and Pushing Docker Image (via Cloud Build)..."
@@ -99,17 +112,75 @@ if ($LASTEXITCODE -eq 0) {
     exit 1
 }
 
-# 6. Submit Batch Job
-Write-Host "`n[6/6] Submitting Batch Job..."
-$jobConfig = "batch/job_garch_10k.json"
-if ($MODEL -eq "regime-switching") {
-    $jobConfig = "batch/job_regime_switching_10k.json"
-} elseif ($MODEL -eq "ms-garch") {
-    $jobConfig = "batch/job_ms_garch_10k.json"
+# 6. Submit Batch Jobs (1k) with run-specific input/output paths
+Write-Host "`n[6/6] Submitting Batch Job(s)..."
+
+New-Item -ItemType Directory -Path "batch/generated" -Force | Out-Null
+
+function New-RunScopedJobConfig {
+    param(
+        [string]$TemplatePath,
+        [string]$OutputPath,
+        [string]$InputFileName,
+        [string]$ModelOutputSuffix
+    )
+
+    $jobObj = Get-Content -Raw -Path $TemplatePath | ConvertFrom-Json
+
+    $commands = @($jobObj.taskGroups[0].taskSpec.runnables[0].container.commands)
+
+    function Set-CommandArgValue {
+        param(
+            [object[]]$Cmd,
+            [string]$Flag,
+            [string]$Value
+        )
+        $idx = [Array]::IndexOf($Cmd, $Flag)
+        if ($idx -lt 0 -or ($idx + 1) -ge $Cmd.Length) {
+            throw "Could not find flag '$Flag' in job template commands"
+        }
+        $Cmd[$idx + 1] = $Value
+        return $Cmd
+    }
+
+    $commands = Set-CommandArgValue -Cmd $commands -Flag "--input-file" -Value "$INPUT_PREFIX/$InputFileName"
+    $commands = Set-CommandArgValue -Cmd $commands -Flag "--merton-file" -Value "$INPUT_PREFIX/merged_data_with_merton.csv"
+    $commands = Set-CommandArgValue -Cmd $commands -Flag "--output-prefix" -Value "$OUTPUT_PREFIX/$ModelOutputSuffix"
+
+    $jobObj.taskGroups[0].taskSpec.runnables[0].container.commands = $commands
+    $jobObj | ConvertTo-Json -Depth 30 | Set-Content -Path $OutputPath
 }
 
-gcloud batch jobs submit "monte-carlo-run-$(Get-Date -Format 'yyyyMMdd-HHmm')" `
-    --location $REGION `
-    --config $jobConfig
+function Submit-ModelJob {
+    param(
+        [string]$Model,
+        [string]$Template,
+        [string]$InputFileName,
+        [string]$Suffix,
+        [string]$JobNamePrefix
+    )
+
+    $generatedConfig = "batch/generated/job_${Model}_1k_$RUN_ID.json"
+    New-RunScopedJobConfig -TemplatePath $Template -OutputPath $generatedConfig -InputFileName $InputFileName -ModelOutputSuffix $Suffix
+
+    $jobName = "$JobNamePrefix-$RUN_ID"
+    gcloud batch jobs submit $jobName --location $REGION --config $generatedConfig
+    Write-Host "Submitted $Model with config: $generatedConfig" -ForegroundColor Green
+}
+
+if ($MODEL -eq "all-1k") {
+    Submit-ModelJob -Model "merton" -Template "batch/job_merton_1k.json" -InputFileName "merged_data_with_merton.csv" -Suffix "merton" -JobNamePrefix "merton-1k"
+    Submit-ModelJob -Model "regime-switching" -Template "batch/job_regime_switching_1k.json" -InputFileName "daily_asset_returns_with_regime_switching.csv" -Suffix "regime-switching" -JobNamePrefix "rs-1k"
+    Submit-ModelJob -Model "ms-garch" -Template "batch/job_ms_garch_1k.json" -InputFileName "daily_asset_returns_with_msgarch.csv" -Suffix "ms-garch" -JobNamePrefix "msgarch-1k"
+} elseif ($MODEL -eq "merton") {
+    Submit-ModelJob -Model "merton" -Template "batch/job_merton_1k.json" -InputFileName "merged_data_with_merton.csv" -Suffix "merton" -JobNamePrefix "merton-1k"
+} elseif ($MODEL -eq "regime-switching") {
+    Submit-ModelJob -Model "regime-switching" -Template "batch/job_regime_switching_1k.json" -InputFileName "daily_asset_returns_with_regime_switching.csv" -Suffix "regime-switching" -JobNamePrefix "rs-1k"
+} elseif ($MODEL -eq "ms-garch") {
+    Submit-ModelJob -Model "ms-garch" -Template "batch/job_ms_garch_1k.json" -InputFileName "daily_asset_returns_with_msgarch.csv" -Suffix "ms-garch" -JobNamePrefix "msgarch-1k"
+} else {
+    Write-Error "Unsupported MODEL: $MODEL"
+    exit 1
+}
 
 Write-Host "`n--- Setup Complete! Check the Google Cloud Console for job status. ---" -ForegroundColor Cyan

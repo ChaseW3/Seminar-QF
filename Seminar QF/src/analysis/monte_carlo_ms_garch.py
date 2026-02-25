@@ -297,9 +297,13 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     
     p00_arr = series_map['p00'].fillna(0.95).values
     p11_arr = series_map['p11'].fillna(0.95).values
-    nu_0_arr = series_map['nu_0'].fillna(30.0).values
-    nu_1_arr = series_map['nu_1'].fillna(30.0).values
-    sigma_arr = np.maximum(series_map['volatility'].fillna(0.02).values, 1e-4)
+
+    # Light stability bounds for Monte Carlo inputs
+    vol_min, vol_max = 1e-4, 0.15
+    nu_min, nu_max = 2.2, 80.0
+    nu_0_arr = np.clip(series_map['nu_0'].fillna(30.0).values, nu_min, nu_max)
+    nu_1_arr = np.clip(series_map['nu_1'].fillna(30.0).values, nu_min, nu_max)
+    sigma_arr = np.clip(series_map['volatility'].fillna(0.02).values, vol_min, vol_max)
     regime_prob_arr = series_map['regime_prob'].fillna(0.5).values
     
     # Prepare Merton arrays
