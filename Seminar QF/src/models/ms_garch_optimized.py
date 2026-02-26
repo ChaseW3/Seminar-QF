@@ -21,6 +21,12 @@ import math
 import warnings
 warnings.filterwarnings('ignore')
 
+# Numerical safety bounds (kept intentionally loose to avoid over-capping tails/volatility)
+NU_LOWER_BOUND = 2.01
+NU_WARM_START_UPPER_BOUND = 200.0
+NU_OPTIMIZER_UPPER_BOUND = 500.0
+INITIAL_VARIANCE_UPPER_BOUND = 1e5
+
 # Try to import arch for GARCH warm start
 try:
     from arch import arch_model
@@ -153,8 +159,8 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
     sigma2_1_uncond = omega_1 / max(1 - alpha_1 - beta_1, 0.01)
     
     # Bound initial variances
-    sigma2_0_uncond = min(max(sigma2_0_uncond, 1e-8), 1.0)
-    sigma2_1_uncond = min(max(sigma2_1_uncond, 1e-8), 1.0)
+    sigma2_0_uncond = min(max(sigma2_0_uncond, 1e-8), INITIAL_VARIANCE_UPPER_BOUND)
+    sigma2_1_uncond = min(max(sigma2_1_uncond, 1e-8), INITIAL_VARIANCE_UPPER_BOUND)
     
     # Initialize
     prev_sigma2_0 = sigma2_0_uncond
@@ -278,9 +284,9 @@ def get_garch_warm_start(returns):
         
         # Bound parameters
         omega = max(omega, 1e-10)
-        alpha = min(max(alpha, 0.01), 0.3)
-        beta = min(max(beta, 0.5), 0.98)
-        nu = min(max(nu, 2.5), 30.0)
+        alpha = min(max(alpha, 0.001), 0.6)
+        beta = min(max(beta, 0.2), 0.995)
+        nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
         
         return {
             'omega': omega,
@@ -443,8 +449,8 @@ class MSGARCHOptimized:
             mu_0_init = mu_base + 0.0002 
             mu_1_init = mu_base - 0.0003 
             
-            nu_0_init = max(min(nu_base * 2.0, 25.0), 12.0) 
-            nu_1_init = max(min(nu_base * 0.4, 8.0), 2.5)   
+            nu_0_init = max(min(nu_base * 2.0, NU_WARM_START_UPPER_BOUND), 3.0)
+            nu_1_init = max(min(nu_base * 0.4, NU_WARM_START_UPPER_BOUND), NU_LOWER_BOUND)
             
             p00_init_logit = 2.5 # p00 ~ 0.92
             p11_init_logit = 2.5 # p11 ~ 0.92
@@ -888,8 +894,8 @@ class MSGARCHOptimized:
     
     def _nu_to_unconstrained(self, nu):
         """Transform nu to unconstrained space."""
-        # Natural bound: (2, ∞) - keep sensible upper limit for numerical stability
-        nu = min(max(nu, 2.1), 100)
+        # Natural bound: (2, ∞); keep only a very loose cap for numerical safety.
+        nu = min(max(nu, NU_LOWER_BOUND), NU_OPTIMIZER_UPPER_BOUND)
         return np.log(nu - 2)
     
     def _unconstrained_to_nu(self, x):
