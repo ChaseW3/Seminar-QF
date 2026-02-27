@@ -70,9 +70,10 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         liability_horizon = np.full(n_horizons, liability)
         log_liability_horizon = np.full(n_horizons, np.log(liability))
         if valid_rf:
+            rf_compound = max(rf_rate, 0.0)
             for h in range(n_horizons):
                 T_years = horizon_days[h] / 252.0
-                liability_T = liability * np.exp(rf_rate * T_years)
+                liability_T = liability * np.exp(rf_compound * T_years)
                 liability_horizon[h] = liability_T
                 log_liability_horizon[h] = np.log(liability_T)
         
