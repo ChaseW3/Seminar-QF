@@ -81,7 +81,6 @@ def merge_batch_results(batch_dir, output_file, model_name):
 def main():
     # Set up paths
     base_dir = Path(__file__).parent
-    batch_downloads = base_dir / "data" / "batch_downloads"
     output_dir = base_dir / "data" / "output"
     
     # Create output directory if it doesn't exist
@@ -91,22 +90,30 @@ def main():
     print("BATCH RESULTS CONSOLIDATION")
     print("="*60)
     
-    # Merge GARCH results
-    garch_batch_dir = batch_downloads / "garch"
+    # Merge GARCH results from the downloaded location
+    garch_batch_dir = output_dir / "garch_batch"
     garch_output = output_dir / "batch_garch_results.csv"
-    merge_batch_results(garch_batch_dir, garch_output, "GARCH")
+    if garch_batch_dir.exists():
+        merge_batch_results(garch_batch_dir, garch_output, "GARCH")
+    else:
+        print(f"⚠ WARNING: GARCH batch directory not found: {garch_batch_dir}")
     
-    # Merge Regime Switching results
-    rs_batch_dir = batch_downloads / "regime_switching"
+    # Merge Regime Switching results (when available)
+    rs_batch_dir = output_dir / "regime_switching_batch"
     rs_output = output_dir / "batch_regime_switching_results.csv"
-    merge_batch_results(rs_batch_dir, rs_output, "Regime Switching")
+    if rs_batch_dir.exists():
+        merge_batch_results(rs_batch_dir, rs_output, "Regime Switching")
+    else:
+        print(f"⚠ INFO: Regime Switching batch directory not found: {rs_batch_dir}")
     
     print("\n" + "="*60)
     print("✓ CONSOLIDATION COMPLETE")
     print("="*60)
     print(f"\nOutput files created in: {output_dir}")
-    print(f"  - {garch_output.name}")
-    print(f"  - {rs_output.name}")
+    if garch_batch_dir.exists():
+        print(f"  - {garch_output.name}")
+    if rs_batch_dir.exists():
+        print(f"  - {rs_output.name}")
     print("\n")
 
 if __name__ == "__main__":
