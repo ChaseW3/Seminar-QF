@@ -8,6 +8,9 @@ from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 
+MIN_RISK_FREE_RATE = 0.02
+
+
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
@@ -54,6 +57,8 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
         # Check validity of Merton inputs
         valid_merton = (not np.isnan(v0)) and (not np.isnan(liability)) and (v0 > 0) and (liability > 0)
         valid_rf = (not np.isnan(rf_rate))
+        if valid_rf:
+            rf_rate = max(rf_rate, MIN_RISK_FREE_RATE)
         
         if not valid_merton:
             # Skip this firm - outputs remain NaN
@@ -172,6 +177,8 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
     for i in range(num_firms):
         if not np.isnan(rf_arr[i]) and abs(rf_arr[i]) > 0.5:
             rf_arr[i] = rf_arr[i] / 100.0
+        if not np.isnan(rf_arr[i]):
+            rf_arr[i] = max(rf_arr[i], MIN_RISK_FREE_RATE)
     
     # Maturity-aware horizons per firm-date; default to 5Y if not provided
     if 'cds_max_horizon_days' in df_firms.columns:

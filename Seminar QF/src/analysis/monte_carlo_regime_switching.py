@@ -11,6 +11,9 @@ from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 
+MIN_RISK_FREE_RATE = 0.02
+
+
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
@@ -66,6 +69,8 @@ def simulate_regime_switching_vectorized(
         # Check validity of Merton inputs
         valid_merton = (not np.isnan(v0)) and (not np.isnan(liability)) and (v0 > 0) and (liability > 0)
         valid_rf = (not np.isnan(rf_rate))
+        if valid_rf:
+            rf_rate = max(rf_rate, MIN_RISK_FREE_RATE)
         
         if not valid_merton:
             # Skip this firm - outputs remain NaN
@@ -301,6 +306,8 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
             # Scale rf_rate if needed
             if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
                 rf_rate = rf_rate / 100.0
+            if not np.isnan(rf_rate):
+                rf_rate = max(rf_rate, MIN_RISK_FREE_RATE)
             rf_arr[firm_idx] = rf_rate
     
     # Initial regime probabilities
