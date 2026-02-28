@@ -38,7 +38,7 @@
                                             "maxRunDuration":  "21600s"
                                         },
                            "taskCount":  256,
-                           "parallelism":  8
+                           "parallelism":  3
                        }
                    ],
     "allocationPolicy":  {
