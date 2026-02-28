@@ -169,7 +169,7 @@ def load_and_preprocess_data():
 
 def merton_newton_raphson_vectorized(
     equity_value_series,
-    debt_value_on_estimation_day,
+    debt_value_series,
     sigma_A_daily_initial,
     risk_free_rate_annual,
     time_to_maturity_years,
@@ -185,7 +185,7 @@ def merton_newton_raphson_vectorized(
     Parameters:
     -----------
     equity_value_series : array, Equity values over rolling window
-    debt_value_on_estimation_day : float, Debt value at valuation date (scalar)
+    debt_value_series : array, Debt values over rolling window (HISTORICAL TIME SERIES)
     sigma_A_daily_initial : float, Initial DAILY asset volatility
     risk_free_rate_annual : float, Annual risk-free rate
     time_to_maturity_years : float, Time to maturity in years (typically 1.0)
@@ -201,10 +201,11 @@ def merton_newton_raphson_vectorized(
     # Better initial guess for V_A: Equity + Present Value of Debt (Risk-free proxy)
     # This is closer to the true asset value than E + B (which overestimates)
     # V_A ~ E + B * exp(-rT)
-    debt_value_on_estimation_day = np.float64(debt_value_on_estimation_day)
+    # FIXED: Now uses historical debt series instead of single value
+    debt_value_series = debt_value_series.astype(np.float64)
     asset_value_series = (
         equity_value_series.astype(np.float64)
-        + debt_value_on_estimation_day * np.exp(-risk_free_rate_annual * time_to_maturity_years)
+        + debt_value_series * np.exp(-risk_free_rate_annual * time_to_maturity_years)
     )
     
     sigma_A_daily_current = np.float64(sigma_A_daily_initial)
@@ -223,8 +224,9 @@ def merton_newton_raphson_vectorized(
             if sig_sqrt_T < 1e-10:
                 sig_sqrt_T = 1e-10
             
+            # FIXED: Use historical debt series (not single value)
             d1 = (
-                np.log(asset_value_series / debt_value_on_estimation_day)
+                np.log(asset_value_series / debt_value_series)
                 + (risk_free_rate_annual + sig2_half) * time_to_maturity_years
             ) / sig_sqrt_T
             d2 = d1 - sig_sqrt_T
@@ -234,9 +236,10 @@ def merton_newton_raphson_vectorized(
             Nd2_arr = ndtr(d2)
             
             # Black-Scholes formula for equity value
+            # FIXED: Use historical debt series (not single value)
             f_val = (
                 asset_value_series * Nd1_arr
-                - debt_value_on_estimation_day * np.exp(-risk_free_rate_annual * time_to_maturity_years) * Nd2_arr
+                - debt_value_series * np.exp(-risk_free_rate_annual * time_to_maturity_years) * Nd2_arr
                 - equity_value_series
             )
             f_prime = Nd1_arr  # N(d1)
@@ -306,16 +309,15 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         # Equity: daily time series over rolling window
         equity_value_series = window_df["mkt_cap"].values.astype(np.float64)
 
-        # Debt: SINGLE value at estimation date (not a rolling time series)
-        # CRITICAL: Skip if liabilities are NaN at the estimation date (e.g., pre-Feb 2011)
-        debt_values_today = window_df.loc[window_df["date"] == date_t, "liabilities_total"].values
-        if len(debt_values_today) == 0:
-            continue
+        # Debt: HISTORICAL TIME SERIES over rolling window (FIXED)
+        # CRITICAL FIX: Use the actual historical debt values for each date in the window
+        # This ensures that when equity drops during COVID, we use the corresponding historical debt,
+        # not just today's debt value. This allows asset values to properly reflect equity changes.
+        debt_value_series = window_df["liabilities_total"].values.astype(np.float64)
         
-        debt_value_on_estimation_day = float(debt_values_today[-1])
-        
-        # Skip if debt is NaN or invalid
-        if np.isnan(debt_value_on_estimation_day) or debt_value_on_estimation_day <= 0:
+        # Skip if ANY debt values in the window are NaN or invalid
+        # (This happens before liabilities data starts, e.g., pre-Feb 2011)
+        if np.any(np.isnan(debt_value_series)) or np.any(debt_value_series <= 0):
             continue
         
         # Check validity
@@ -343,7 +345,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         try:
             asset_value_series, sigma_A_daily = merton_newton_raphson_vectorized(
                 equity_value_series,
-                debt_value_on_estimation_day,
+                debt_value_series,  # FIXED: Now passes time series instead of scalar
                 sigma_E_daily,
                 r_annual,
                 time_to_maturity_years,

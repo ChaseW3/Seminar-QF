@@ -29,3 +29,12 @@ __pycache__/
 # Virtual env
 .venv/
 venv/
+
+# --- local / generated artifacts (do not commit) ---
+*.json
+*.log
+*.txt
+*.sh
+
+# Jupyter noise
+.ipynb_checkpoints/
