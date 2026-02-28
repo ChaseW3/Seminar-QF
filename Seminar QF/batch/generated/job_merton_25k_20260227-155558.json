@@ -5,19 +5,27 @@
         "runnables": [
           {
             "container": {
-              "imageUri": "us-central1-docker.pkg.dev/seminar-qf/batch-images/monte-carlo-garch:latest",
+              "imageUri": "us-central1-docker.pkg.dev/seminar-qf/batch-images/monte-carlo-garch:20260227-155558",
               "entrypoint": "python",
               "commands": [
                 "/app/batch_driver.py",
-                "--model", "regime-switching",
-                "--input-bucket", "seminar-qf-batch-data-001",
-                "--input-file", "data/output/daily_asset_returns_with_regime_switching.csv",
-                "--merton-file", "data/output/merged_data_with_merton.csv",
-                "--output-bucket", "seminar-qf-batch-data-001",
-                "--output-prefix", "output/results_1k",
-                "--num-simulations", "1000",
+                "--model",
+                "merton",
+                "--input-bucket",
+                "seminar-qf-batch-data-001",
+                "--input-file",
+                "data/releases/20260224-222224/merged_data_with_merton.csv",
+                "--merton-file",
+                "data/releases/20260224-222224/merged_data_with_merton.csv",
+                "--output-bucket",
+                "seminar-qf-batch-data-001",
+                "--output-prefix",
+                "output/runs/20260227-155558/results_25k/merton",
+                "--num-simulations",
+                "25000",
                 "--use-antithetic",
-                "--n-jobs", "1"
+                "--n-jobs",
+                "1"
               ]
             }
           }
@@ -30,7 +38,7 @@
         "maxRunDuration": "21600s"
       },
       "taskCount": 256,
-      "parallelism": 3
+      "parallelism": 2
     }
   ],
   "allocationPolicy": {

@@ -74,3 +74,5 @@ gcloud batch jobs submit msgarch-10k --location us-central1 --config batch/job_m
 ```
 
 Batch outputs are sharded to model folders under `output/results/` in your GCS bucket.
+
+If you hit GCP quota errors like `CODE_GCE_QUOTA_EXCEEDED` for `CPUS_ALL_REGIONS`, reduce `taskGroups[0].parallelism` in the selected `batch/job_*.json` file. Current templates are set to `parallelism: 3` with `e2-standard-4` (8 vCPUs total), which is safe under a 12-vCPU global quota.
