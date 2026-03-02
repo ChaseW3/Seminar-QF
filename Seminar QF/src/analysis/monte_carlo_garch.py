@@ -11,6 +11,13 @@ from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_al
 
 MIN_RISK_FREE_RATE = 0.02
 
+# Daily variance cap: prevents impossible variance accumulation over multi-year horizons.
+# Set to (5%)² = 0.0025, corresponding to ~79% annualized volatility.
+# This preserves extreme real-world events (COVID VIX peak ≈ 80% annualized ≈ 5% daily σ)
+# while preventing the -0.5σ² risk-neutral drift from compounding destructively
+# over 1260 days for high-leverage firms.
+SIGMA2_MAX_DAILY = 0.0025  # (0.05)^2 — consistent across all three models
+
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
     if max_days <= 252:
@@ -84,6 +91,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         
         # State Vectors (Size: num_simulations)
         sigma2 = np.full(num_simulations, sigma_arr[f] ** 2)
+        sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)  # Apply daily variance cap
         sigma = np.sqrt(np.maximum(sigma2, 1e-12))
         log_asset = np.full(num_simulations, log_v0)
         
@@ -136,8 +144,6 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
                 t_sample = z / np.sqrt(v / nu) * t_factor
             
             # 2. Vectorized Updates
-            eps = sigma * t_sample
-            
             # TRUNCATION: Cap t_sample at 5 standard deviations (as per paper page 12)
             t_sample = np.clip(t_sample, -5.0, 5.0)
             eps = sigma * t_sample
@@ -163,6 +169,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             
             # 4. GARCH Update using sigma2 state
             sigma2 = omega + alpha * eps**2 + beta * sigma2
+            sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)  # Daily variance cap
             sigma2 = np.maximum(sigma2, 1e-12)
             sigma = np.sqrt(sigma2)
         
@@ -226,7 +233,18 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     alpha_arr = np.maximum(df_firms.get('garch_alpha', pd.Series([0.05]*num_firms)).fillna(0.05).values, 1e-4)
     beta_arr = np.maximum(df_firms.get('garch_beta', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
     sigma_arr = np.maximum(df_firms.get('garch_volatility', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
-    nu_arr = df_firms.get('garch_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
+
+    # Light stability bounds for Monte Carlo inputs (consistent across all models)
+    nu_min, nu_max = 2.1, 200.0
+    nu_arr = np.clip(df_firms.get('garch_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values, nu_min, nu_max)
+
+    # Smart omega floor: prevent variance collapse (consistent with MS-GARCH MC)
+    min_variance = 1e-6
+    for idx in range(num_firms):
+        persistence = alpha_arr[idx] + beta_arr[idx]
+        if persistence < 0.9999:
+            min_omega = (1 - persistence) * min_variance
+            omega_arr[idx] = max(omega_arr[idx], min_omega)
     
     # Prepare Merton arrays
     v0_arr = np.full(num_firms, np.nan)

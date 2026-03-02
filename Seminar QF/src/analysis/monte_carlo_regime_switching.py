@@ -13,6 +13,13 @@ from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_al
 
 MIN_RISK_FREE_RATE = 0.02
 
+# Daily variance cap: prevents impossible variance accumulation over multi-year horizons.
+# Set to (5%)² = 0.0025, corresponding to ~79% annualized volatility.
+# This preserves extreme real-world events (COVID VIX peak ≈ 80% annualized ≈ 5% daily σ)
+# while preventing the -0.5σ² risk-neutral drift from compounding destructively
+# over 1260 days for high-leverage firms.
+SIGMA2_MAX_DAILY = 0.0025  # (0.05)^2 — consistent across all three models
+
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
     if max_days <= 252:
@@ -65,6 +72,12 @@ def simulate_regime_switching_vectorized(
         v0 = v0_arr[f]
         liability = liability_arr[f]
         rf_rate = rf_arr[f]
+        
+        # Daily variance cap: limit regime volatilities to sqrt(SIGMA2_MAX_DAILY)
+        # This prevents the -0.5σ² risk-neutral drift from compounding destructively
+        sigma_cap = np.sqrt(SIGMA2_MAX_DAILY)
+        s0 = min(s0, sigma_cap)
+        s1 = min(s1, sigma_cap)
         
         # Check validity of Merton inputs
         valid_merton = (not np.isnan(v0)) and (not np.isnan(liability)) and (v0 > 0) and (liability > 0)
@@ -288,8 +301,10 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
         print(f"         This may indicate a parameter estimation error (100x too large)")
         print(f"         Proceeding with caution - results may be unrealistic")
     
-    nu_0_arr = df_firms.get('regime_0_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
-    nu_1_arr = df_firms.get('regime_1_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values
+    # Light stability bounds for Monte Carlo inputs (consistent across all models)
+    nu_min, nu_max = 2.1, 200.0
+    nu_0_arr = np.clip(df_firms.get('regime_0_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values, nu_min, nu_max)
+    nu_1_arr = np.clip(df_firms.get('regime_1_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values, nu_min, nu_max)
     trans_00_arr = df_firms.get('transition_prob_00', pd.Series([0.95]*num_firms)).fillna(0.95).values
     trans_01_arr = df_firms.get('transition_prob_01', pd.Series([0.05]*num_firms)).fillna(0.05).values
     trans_10_arr = df_firms.get('transition_prob_10', pd.Series([0.05]*num_firms)).fillna(0.05).values

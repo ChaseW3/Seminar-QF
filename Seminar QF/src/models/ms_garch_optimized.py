@@ -21,10 +21,10 @@ import math
 import warnings
 warnings.filterwarnings('ignore')
 
-# Numerical safety bounds (kept intentionally loose to avoid over-capping tails/volatility)
-NU_LOWER_BOUND = 2.01
+# Numerical safety bounds (consistent with GARCH and Regime Switching models)
+NU_LOWER_BOUND = 2.1
 NU_WARM_START_UPPER_BOUND = 200.0
-NU_OPTIMIZER_UPPER_BOUND = 500.0
+NU_OPTIMIZER_UPPER_BOUND = 200.0
 INITIAL_VARIANCE_UPPER_BOUND = 1e5
 
 # Try to import arch for GARCH warm start
@@ -95,7 +95,7 @@ def _t_log_likelihood(x, nu, sigma2):
     --------
     float : Log-likelihood value
     """
-    if sigma2 <= 0 or nu <= 2:
+    if sigma2 <= 0 or nu <= 2.1:
         return -1e10
     
     # Log-likelihood of standardized t-distribution
@@ -181,9 +181,9 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
             curr_sigma2_1 = omega_1 + alpha_1 * prev_eps2 + beta_1 * prev_sigma2_1
         
         # REMOVED: Upper bound on variance (now only using 5-sigma truncation in Monte Carlo)
-        # Only keep lower bound for numerical stability
-        curr_sigma2_0 = max(curr_sigma2_0, 1e-10)
-        curr_sigma2_1 = max(curr_sigma2_1, 1e-10)
+        # Only keep lower bound for numerical stability (consistent with MC variance floor)
+        curr_sigma2_0 = max(curr_sigma2_0, 1e-12)
+        curr_sigma2_1 = max(curr_sigma2_1, 1e-12)
         
         sigma2[t, 0] = curr_sigma2_0
         sigma2[t, 1] = curr_sigma2_1
@@ -899,8 +899,8 @@ class MSGARCHOptimized:
         return np.log(nu - 2)
     
     def _unconstrained_to_nu(self, x):
-        """Transform back to nu (bounded 2+, no artificial upper cap)."""
-        return 2 + np.exp(x)  # Range: (2, ∞) in practice capped by exp limit
+        """Transform back to nu (bounded [2.1, 200], consistent with GARCH model)."""
+        return min(2 + np.exp(x), NU_OPTIMIZER_UPPER_BOUND)  # Cap at 200 for consistency
     
     # =========================================================================
     # Accessor methods

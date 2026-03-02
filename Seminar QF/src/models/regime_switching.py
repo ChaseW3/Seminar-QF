@@ -41,7 +41,7 @@ def _numba_gammaln(x):
 @njit(cache=True)
 def _t_log_likelihood(x, nu, sigma2):
     """Compute log-likelihood of t-distribution (Numba JIT compiled)."""
-    if sigma2 <= 0 or nu <= 2.001: return -1e10 # Strict check
+    if sigma2 <= 0 or nu <= 2.1: return -1e10 # Strict check (consistent across all models)
     const = _numba_gammaln((nu + 1) / 2) - _numba_gammaln(nu / 2) - 0.5 * np.log((nu - 2) * np.pi * sigma2)
     kernel = -((nu + 1) / 2) * np.log(1 + x**2 / ((nu - 2) * sigma2))
     return const + kernel
@@ -315,7 +315,7 @@ class MarkovSwitchingTDist:
                 b_regime = [
                     (None, None), # mu
                     (-15, 3),     # log_sigma2 (max daily vol of ~5% in scaled terms = 5% daily unscaled)
-                    (-10, 6)      # log(nu-2)
+                    (-10, np.log(198.0))  # log(nu-2): nu in [~2.1, 200], consistent with GARCH & MS-GARCH
                 ]
                 
                 # Wrapper for JIT objective
@@ -334,13 +334,13 @@ class MarkovSwitchingTDist:
             p0 = optimize_regime(smoothed_prob[:, 0], current_params['mu_0'], current_params['sigma2_0'], current_params['nu_0'])
             current_params['mu_0'] = p0[0]
             current_params['sigma2_0'] = np.exp(p0[1])
-            current_params['nu_0'] = 2.0 + np.exp(p0[2])
+            current_params['nu_0'] = min(max(2.0 + np.exp(p0[2]), 2.1), 200.0)  # Clamp nu to [2.1, 200] (consistent across models)
             
             # Update Regime 1
             p1 = optimize_regime(smoothed_prob[:, 1], current_params['mu_1'], current_params['sigma2_1'], current_params['nu_1'])
             current_params['mu_1'] = p1[0]
             current_params['sigma2_1'] = np.exp(p1[1])
-            current_params['nu_1'] = 2.0 + np.exp(p1[2])
+            current_params['nu_1'] = min(max(2.0 + np.exp(p1[2]), 2.1), 200.0)  # Clamp nu to [2.1, 200] (consistent across models)
             
         # Final pass to get probabilities with final params
         final_ll, final_filt, final_pred = hamilton_filter_t_details_jit(

@@ -11,6 +11,13 @@ from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_al
 
 MIN_RISK_FREE_RATE = 0.02
 
+# Daily variance cap: prevents impossible variance accumulation over multi-year horizons.
+# Set to (5%)² = 0.0025, corresponding to ~79% annualized volatility.
+# This preserves extreme real-world events (COVID VIX peak ≈ 80% annualized ≈ 5% daily σ)
+# while preventing the -0.5σ² risk-neutral drift from compounding destructively
+# over 1260 days for high-leverage firms.
+SIGMA2_MAX_DAILY = 0.0025  # (0.05)^2 — consistent across all three models
+
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
     if max_days <= 252:
@@ -95,6 +102,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
         
         # State Vectors (Size: num_simulations)
         sigma2 = np.full(num_simulations, initial_sigma ** 2)
+        sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)  # Apply daily variance cap
         sigma = np.sqrt(np.maximum(sigma2, 1e-12))
         log_asset = np.full(num_simulations, log_v0)
         
@@ -206,6 +214,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                 omega_1 + alpha_1 * eps**2 + beta_1 * sigma2,
                 omega_0 + alpha_0 * eps**2 + beta_0 * sigma2,
             )
+            sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)  # Daily variance cap
             sigma2 = np.maximum(sigma2, 1e-12)
             sigma = np.sqrt(sigma2)
             
@@ -320,12 +329,11 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     p00_arr = series_map['p00'].fillna(0.95).values
     p11_arr = series_map['p11'].fillna(0.95).values
 
-    # Light stability bounds for Monte Carlo inputs
-    vol_min, vol_max = 1e-4, 0.15
-    nu_min, nu_max = 2.2, 80.0
+    # Light stability bounds for Monte Carlo inputs (consistent across all models)
+    nu_min, nu_max = 2.1, 200.0
     nu_0_arr = np.clip(series_map['nu_0'].fillna(30.0).values, nu_min, nu_max)
     nu_1_arr = np.clip(series_map['nu_1'].fillna(30.0).values, nu_min, nu_max)
-    sigma_arr = np.clip(series_map['volatility'].fillna(0.02).values, vol_min, vol_max)
+    sigma_arr = np.maximum(series_map['volatility'].fillna(0.02).values, 1e-4)  # Floor only, no upper cap (consistent with GARCH MC)
     regime_prob_arr = series_map['regime_prob'].fillna(0.5).values
     
     # Prepare Merton arrays
