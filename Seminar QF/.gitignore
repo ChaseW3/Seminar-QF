@@ -6,3 +6,6 @@ data/input/*.xlsx
 *.png
 *.jpg
 *.jpeg
+
+# generated job outputs
+**/job_*.json
