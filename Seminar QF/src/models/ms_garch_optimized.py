@@ -1002,7 +1002,7 @@ def run_ms_garch_estimation_optimized(data_df,
         start_date = firm_data['date'].min()
         end_date = firm_data['date'].max()
         try:
-            estimation_start = start_date + pd.DateOffset(months=60)  # Start 5 years in
+            estimation_start = start_date + pd.DateOffset(months=12)  # Start 1 year in
             if estimation_start >= end_date:
                 continue
             month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -1017,17 +1017,17 @@ def run_ms_garch_estimation_optimized(data_df,
                 # Select all data up to this point
                 data_up_to_point = firm_data[firm_data['date'] <= date_point]
 
-                # Require at least 1260 trading days of history (5 years)
-                if len(data_up_to_point) < 1260:
+                # Require at least 252 trading days of history (1 year)
+                if len(data_up_to_point) < 252:
                     continue
 
-                # Take the exact last 1260 trading days for the window (5 years)
-                window_df = data_up_to_point.iloc[-1260:].copy()
+                # Take the exact last 252 trading days for the window (1 year)
+                window_df = data_up_to_point.iloc[-252:].copy()
                 
-                # Additional data quality checks (relaxed for 5-year window)
+                # Additional data quality checks
                 valid_count = window_df['asset_return_daily_scaled'].notna().sum() if 'asset_return_daily_scaled' in window_df.columns else window_df['asset_return_daily'].notna().sum()
                 
-                if valid_count < 1000:  # Require at least 1000 valid observations for 5-year window
+                if valid_count < 200:  # Require at least 200 valid observations for 1-year window
                     continue
                 
                 # Use centrally scaled returns if available

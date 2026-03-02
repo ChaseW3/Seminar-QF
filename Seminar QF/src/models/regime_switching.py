@@ -382,7 +382,7 @@ def _process_single_firm(gvkey, firm_df):
     params_list = []
     
     try:
-        estimation_start = start_date + pd.DateOffset(months=60)  # Start 5 years in
+        estimation_start = start_date + pd.DateOffset(months=12)  # Start 1 year in
         if estimation_start >= end_date:
             return firm_df, params_list
         month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -395,22 +395,22 @@ def _process_single_firm(gvkey, firm_df):
         # Select all data up to this point
         data_up_to_point = firm_df[firm_df['date'] <= date_point]
 
-        # Require at least 1260 trading days of history (5 years)
-        if len(data_up_to_point) < 1260:
+        # Require at least 252 trading days of history (1 year)
+        if len(data_up_to_point) < 252:
             continue
 
         if len(params_list) % 12 == 0:
             print(f"    > Date: {date_point.date()} (Window {len(params_list)})")
 
-        # Take the exact last 1260 trading days for the window (5 years)
-        window_df = data_up_to_point.iloc[-1260:].copy()
+        # Take the exact last 252 trading days for the window (1 year)
+        window_df = data_up_to_point.iloc[-252:].copy()
         
-        # Check for missing values (relaxed for 5-year window)
-        if window_df[target_col].isna().sum() > 50: 
+        # Check for missing values
+        if window_df[target_col].isna().sum() > 10: 
              continue
         
         valid_mask = window_df[target_col].notna()
-        if valid_mask.sum() < 1000:  # Require at least 1000 valid observations for 5-year window
+        if valid_mask.sum() < 200:  # Require at least 200 valid observations for 1-year window
             continue
             
         returns = window_df.loc[valid_mask, target_col].values

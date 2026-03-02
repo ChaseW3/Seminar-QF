@@ -163,9 +163,9 @@ def run_garch_estimation(daily_returns_df):
         start_date = firm_ts['date'].min()
         end_date = firm_ts['date'].max()
         
-        # Start 60 months (5 years) in
+        # Start 12 months (1 year) in
         try:
-            estimation_start = start_date + pd.DateOffset(months=60)
+            estimation_start = start_date + pd.DateOffset(months=12)
             if estimation_start >= end_date:
                 continue
             month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -182,16 +182,16 @@ def run_garch_estimation(daily_returns_df):
             # Select all data up to this point
             data_up_to_point = firm_ts[firm_ts['date'] <= date_point]
 
-            # Require at least 1260 trading days of history (5 years)
-            if len(data_up_to_point) < 1260:
+            # Require at least 252 trading days of history (1 year)
+            if len(data_up_to_point) < 252:
                 continue
 
-            # Take the exact last 1260 trading days for the window (5 years)
-            window_df = data_up_to_point.iloc[-1260:].copy()
+            # Take the exact last 252 trading days for the window (1 year)
+            window_df = data_up_to_point.iloc[-252:].copy()
             
             # Additional check for missing values inside the window
-            if window_df['asset_return_daily'].isna().sum() > 50: 
-                 # Skip if too many missing returns in the window (relaxed for 5-year window)
+            if window_df['asset_return_daily'].isna().sum() > 10: 
+                 # Skip if too many missing returns in the window
                  continue
                  
             last_trading_date = window_df['date'].max()
@@ -200,7 +200,7 @@ def run_garch_estimation(daily_returns_df):
                 returns = window_df["asset_return_daily_scaled"].dropna().values
             else:
                 window_df = window_df.dropna(subset=["asset_return_daily"])
-                if len(window_df) < 1000: continue  # Require at least 1000 valid observations for 5-year window
+                if len(window_df) < 200: continue  # Require at least 200 valid observations for 1-year window
                 returns = window_df["asset_return_daily"].values * SCALE_FACTOR
             
             try:
