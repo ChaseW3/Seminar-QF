@@ -79,6 +79,13 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
         # State Vectors (Size: num_simulations)
         log_asset = np.full(num_simulations, log_v0)
         
+        # Risk-neutral drift: daily risk-free rate and variance drag (constant vol for Merton)
+        if valid_rf:
+            rf_daily = rf_rate / 252.0
+        else:
+            rf_daily = 0.0
+        drift_daily = rf_daily - 0.5 * sigma * sigma
+        
         # Accumulators for each horizon
         default_counts = np.zeros(n_horizons)
         payoff_sums = np.zeros(n_horizons)
@@ -93,8 +100,8 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
             # 2. Vectorized Updates with constant volatility
             eps = sigma * z
             
-            # Update log-asset (no exp needed daily)
-            log_asset += eps
+            # Update log-asset with risk-neutral drift: (r/252 - 0.5*sigma²) + sigma*Z
+            log_asset += drift_daily + eps
             
             # 3. Horizon Check
             if is_horizon[day]:

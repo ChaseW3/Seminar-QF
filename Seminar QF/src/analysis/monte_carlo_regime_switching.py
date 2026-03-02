@@ -95,6 +95,12 @@ def simulate_regime_switching_vectorized(
         regime_0_cnt = np.zeros(num_simulations)
         regime_1_cnt = np.zeros(num_simulations)
         
+        # Risk-neutral drift: daily risk-free rate
+        if valid_rf:
+            rf_daily = rf_rate / 252.0
+        else:
+            rf_daily = 0.0
+        
         # Accumulators for each horizon
         default_counts = np.zeros(n_horizons)
         payoff_sums = np.zeros(n_horizons)
@@ -178,9 +184,10 @@ def simulate_regime_switching_vectorized(
             # TRUNCATION: Cap errors at 5 standard deviations (as per paper page 12)
             z_t = np.clip(z_t, -5.0, 5.0)
             
-            # 4. Vectorized Updates (shocks only, no drift)
+            # 4. Vectorized Updates with risk-neutral drift: (r/252 - 0.5*sigma²) + sigma*Z
             r_curr = sigma * z_t
-            log_asset += r_curr
+            drift = rf_daily - 0.5 * sigma * sigma
+            log_asset += drift + r_curr
             
             # 5. Horizon Check
             if is_horizon[day]:

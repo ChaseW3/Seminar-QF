@@ -87,6 +87,12 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         sigma = np.sqrt(np.maximum(sigma2, 1e-12))
         log_asset = np.full(num_simulations, log_v0)
         
+        # Risk-neutral drift: daily risk-free rate
+        if valid_rf:
+            rf_daily = rf_rate / 252.0
+        else:
+            rf_daily = 0.0
+        
         # Accumulators for each horizon
         default_counts = np.zeros(n_horizons)
         payoff_sums = np.zeros(n_horizons)
@@ -136,8 +142,9 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             t_sample = np.clip(t_sample, -5.0, 5.0)
             eps = sigma * t_sample
 
-            # Update log-asset using shocks only (no drift)
-            log_asset += eps
+            # Update log-asset with risk-neutral drift: (r/252 - 0.5*sigma²) + sigma*Z
+            drift = rf_daily - 0.5 * sigma2
+            log_asset += drift + eps
             
             # 3. Horizon Check
             if is_horizon[day]:

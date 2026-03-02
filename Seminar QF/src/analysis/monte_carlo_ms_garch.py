@@ -98,6 +98,12 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
         sigma = np.sqrt(np.maximum(sigma2, 1e-12))
         log_asset = np.full(num_simulations, log_v0)
         
+        # Risk-neutral drift: daily risk-free rate
+        if valid_rf:
+            rf_daily = rf_rate / 252.0
+        else:
+            rf_daily = 0.0
+        
         # Initialize regime state
         regime_1_mask = np.random.random(num_simulations) < regime_prob
         
@@ -175,8 +181,9 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
             # 2. Vectorized Updates with regime-specific parameters
             eps = sigma * t_sample
 
-            # Update log-asset using shocks only (no drift)
-            log_asset += eps
+            # Update log-asset with risk-neutral drift: (r/252 - 0.5*sigma²) + sigma*Z
+            drift = rf_daily - 0.5 * sigma2
+            log_asset += drift + eps
             
             # 3. Horizon Check
             if is_horizon[day]:
