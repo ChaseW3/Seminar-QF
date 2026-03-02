@@ -14,6 +14,7 @@ INPUT_DIR = DATA_DIR / "input"
 OUTPUT_DIR = DATA_DIR / "output"
 INTERMEDIATES_DIR = DATA_DIR / "intermediates"
 DIAGNOSTICS_DIR = DATA_DIR / "diagnostics"
+CDS_FILTER_DIR = DATA_DIR / "cds_filters"
 
 # Input File names
 EQUITY_DATA_FILE = INPUT_DIR / "Jan2025_Accenture_Dataset_ErasmusCase.xlsx"
