@@ -29,14 +29,17 @@ INITIAL_VARIANCE_UPPER_BOUND = 1e5
 
 # Economically meaningful bounds for GARCH parameters
 # Alpha: ARCH effect - must be positive for GARCH to capture volatility clustering
-ALPHA_LOWER = 0.001   # Very small but nonzero
-ALPHA_UPPER = 0.60    # Above this, extreme shock sensitivity
-# Beta: GARCH persistence
-BETA_LOWER = 0.01     # Allow low-persistence regimes (fast mean-reverting vol)
+ALPHA_LOWER = 0.01    # Meaningful ARCH effect (0.001 lets alpha collapse to zero)
+ALPHA_UPPER = 0.50    # Tightened: above this, GARCH is near-IGARCH with any reasonable beta
+# Beta: GARCH persistence — financial volatility is well-documented as highly persistent
+BETA_LOWER = 0.30     # CRITICAL FIX: 0.01 allowed collapsed GARCH (no vol memory), which is
+                       # economically meaningless. Beta < 0.3 implies a half-life of ~1 day.
 BETA_UPPER = 0.995    # Near unit root
 # Transition probabilities: must imply meaningful regime persistence
 P_LOWER = 0.50        # Below 0.5, regime has negative autocorrelation (economically meaningless)
 P_UPPER = 0.995       # Near-absorbing state
+# Minimum persistence (alpha + beta) — prevents GARCH from collapsing to white noise
+PERSISTENCE_LOWER = 0.60  # Below this, GARCH has no meaningful volatility clustering
 
 # Mu bounds (daily mean return in SCALED space, i.e. returns × 100)
 # ±5 in scaled space ≈ ±5% daily return — already extremely generous
@@ -394,8 +397,11 @@ def get_garch_warm_start(returns):
         
         # Bound parameters
         omega = max(omega, 1e-10)
-        alpha = min(max(alpha, 0.001), 0.6)
-        beta = min(max(beta, 0.2), 0.995)
+        alpha = min(max(alpha, ALPHA_LOWER), ALPHA_UPPER)
+        beta = min(max(beta, BETA_LOWER), BETA_UPPER)
+        # Enforce minimum persistence
+        if alpha + beta < PERSISTENCE_LOWER:
+            beta = max(PERSISTENCE_LOWER - alpha, BETA_LOWER)
         nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
         
         return {
@@ -620,6 +626,13 @@ class MSGARCHOptimized:
                 beta_0 = min(beta_0, max(max_beta_0, BETA_LOWER))
                 beta_1 = min(beta_1, max(max_beta_1, BETA_LOWER))
                 
+                # Enforce minimum persistence: alpha + beta >= PERSISTENCE_LOWER
+                # If persistence is too low, boost beta to the floor
+                if alpha_0 + beta_0 < PERSISTENCE_LOWER:
+                    beta_0 = max(beta_0, PERSISTENCE_LOWER - alpha_0)
+                if alpha_1 + beta_1 < PERSISTENCE_LOWER:
+                    beta_1 = max(beta_1, PERSISTENCE_LOWER - alpha_1)
+                
                 mu_0 = self._unconstrained_to_mu(params[6])
                 mu_1 = self._unconstrained_to_mu(params[7])
                 
@@ -668,6 +681,18 @@ class MSGARCHOptimized:
                 persistence_0 = alpha_0 + beta_0
                 persistence_1 = alpha_1 + beta_1
                 
+                # LOW persistence penalty: prevent GARCH collapse to white noise
+                # This is the CRITICAL fix for the inflated unconditional volatility problem.
+                # When persistence < ~0.7, the GARCH model loses meaningful volatility clustering
+                # and the unconditional variance ω/(1-α-β) becomes dominated by ω, producing
+                # unreasonably high unconditional volatility.
+                for persist in [persistence_0, persistence_1]:
+                    if persist < 0.70:
+                        penalty += 300 * (0.70 - persist) ** 2
+                    if persist < PERSISTENCE_LOWER:
+                        penalty += 800 * (PERSISTENCE_LOWER - persist) ** 2
+                
+                # HIGH persistence penalty (upper end)
                 # Low-vol regime: strict stationarity
                 if persistence_0 > 0.98:
                     penalty += 200 * (persistence_0 - 0.98) ** 2
@@ -890,8 +915,12 @@ class MSGARCHOptimized:
             for sfx in ('0', '1'):
                 a = self.params[f'alpha_{sfx}']
                 b = self.params[f'beta_{sfx}']
+                # Upper bound: stationarity
                 if a + b >= 0.998:
                     self.params[f'beta_{sfx}'] = max(0.998 - a, BETA_LOWER)
+                # Lower bound: minimum persistence (prevent GARCH collapse)
+                if a + b < PERSISTENCE_LOWER:
+                    self.params[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
             
             # Compute volatility & regime probs using these fallback params
             p = self.params
@@ -994,6 +1023,12 @@ class MSGARCHOptimized:
         # Apply same stationarity cap as in NLL function
         beta_0 = min(beta_0, max(0.998 - alpha_0, BETA_LOWER))
         beta_1 = min(beta_1, max(0.998 - alpha_1, BETA_LOWER))
+        
+        # Apply same persistence floor as in NLL function (prevent GARCH collapse)
+        if alpha_0 + beta_0 < PERSISTENCE_LOWER:
+            beta_0 = max(beta_0, PERSISTENCE_LOWER - alpha_0)
+        if alpha_1 + beta_1 < PERSISTENCE_LOWER:
+            beta_1 = max(beta_1, PERSISTENCE_LOWER - alpha_1)
         
         mu_0 = self._unconstrained_to_mu(params_opt[6])
         mu_1 = self._unconstrained_to_mu(params_opt[7])
@@ -1416,11 +1451,16 @@ def run_ms_garch_estimation_optimized(data_df,
                         # Absolute last resort: build params from plain GARCH
                         garch_fb = get_garch_warm_start(returns)
                         og = garch_fb['omega']; ag = garch_fb['alpha']; bg = garch_fb['beta']
+                        a0 = max(ag*0.6, ALPHA_LOWER); a1 = min(ag*1.5, ALPHA_UPPER)
+                        b0 = min(bg*1.02, BETA_UPPER); b1 = max(bg*0.90, BETA_LOWER)
+                        # Enforce persistence floor
+                        if a0 + b0 < PERSISTENCE_LOWER: b0 = max(PERSISTENCE_LOWER - a0, BETA_LOWER)
+                        if a1 + b1 < PERSISTENCE_LOWER: b1 = max(PERSISTENCE_LOWER - a1, BETA_LOWER)
                         params = {
-                            'omega_0': og*0.5, 'alpha_0': max(ag*0.6, ALPHA_LOWER),
-                            'beta_0': min(bg*1.02, BETA_UPPER),
-                            'omega_1': og*2.0, 'alpha_1': min(ag*1.5, ALPHA_UPPER),
-                            'beta_1': max(bg*0.90, BETA_LOWER),
+                            'omega_0': og*0.5, 'alpha_0': a0,
+                            'beta_0': b0,
+                            'omega_1': og*2.0, 'alpha_1': a1,
+                            'beta_1': b1,
                             'mu_0': garch_fb['mu'], 'mu_1': garch_fb['mu'],
                             'p00': 0.95, 'p11': 0.90,
                             'nu_0': min(garch_fb['nu']*1.5, 50.0),

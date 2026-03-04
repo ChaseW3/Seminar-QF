@@ -33,6 +33,16 @@ _REGIME_COLORS = {0: _R0_COLOR, 1: _R1_COLOR}
 # A) Parameter extraction + derived metrics
 # ===================================================================
 
+def _trimmed_mean(s, pct=0.05):
+    """Mean after dropping the top and bottom *pct* fraction (NaN-safe)."""
+    s = s.dropna()
+    if len(s) == 0:
+        return np.nan
+    lo, hi = s.quantile(pct), s.quantile(1 - pct)
+    trimmed = s[(s >= lo) & (s <= hi)]
+    return trimmed.mean() if len(trimmed) > 0 else s.median()
+
+
 def extract_regime_metrics(ms_garch_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute cross-sectional *average* per-regime GARCH metrics from the
@@ -45,12 +55,15 @@ def extract_regime_metrics(ms_garch_df: pd.DataFrame) -> pd.DataFrame:
         persistence  (= alpha + beta),
         stationary   (bool, persistence < 1),
         uncond_var   (omega / (1 - persistence) if stationary, else NaN),
-        uncond_vol   (sqrt(uncond_var)),
+        uncond_vol   (sqrt(uncond_var))  — **robust** trimmed mean of per-row values,
         half_life    (ln(0.5) / ln(persistence) if 0 < persistence < 1),
         p_stay       (self-transition probability),
         p_switch     (1 - p_stay),
         steady_state (long-run probability of being in this regime),
         expected_duration (1 / (1 - p_stay)).
+
+    Near-IGARCH rows (persistence >= 0.999) are excluded from unconditional
+    volatility computation to avoid denominator-explosion artefacts.
     """
     required = ['omega_0', 'alpha_0', 'beta_0']
     missing = [c for c in required if c not in ms_garch_df.columns]
@@ -69,12 +82,16 @@ def extract_regime_metrics(ms_garch_df: pd.DataFrame) -> pd.DataFrame:
         persistence = alpha + beta
         stationary  = persistence < 1.0
 
-        if stationary and (1 - persistence) > 1e-12:
-            uncond_var = omega / (1 - persistence)
-        else:
-            uncond_var = np.nan
-
-        uncond_vol = np.sqrt(uncond_var) if not np.isnan(uncond_var) else np.nan
+        # --- Robust per-row unconditional vol ---
+        # Compute per-row, then take trimmed mean to avoid near-IGARCH inflation
+        omega_s = ms_garch_df.get(f'omega_{sfx}', pd.Series(dtype=float))
+        pers_s  = ms_garch_df.get(f'alpha_{sfx}', pd.Series(dtype=float)) + \
+                  ms_garch_df.get(f'beta_{sfx}', pd.Series(dtype=float))
+        denom_s = (1 - pers_s).where((1 - pers_s) > 0.001, other=np.nan)
+        uncond_var_s = omega_s / denom_s
+        uncond_vol_s = np.sqrt(uncond_var_s)
+        uncond_vol = _trimmed_mean(uncond_vol_s)
+        uncond_var = uncond_vol ** 2 if not np.isnan(uncond_vol) else np.nan
 
         if stationary and 0 < persistence < 1:
             half_life = np.log(0.5) / np.log(persistence)
