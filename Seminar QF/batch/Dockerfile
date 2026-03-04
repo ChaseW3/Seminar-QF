@@ -16,6 +16,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir google-cloud-storage pandas-gbq
 
+# Cache buster — change this value to force a fresh rebuild
+ARG CACHE_BUST=25k-20260303
+
 # Copy the source code
 # We copy the 'src' directory to /app/src
 COPY src/ /app/src/
