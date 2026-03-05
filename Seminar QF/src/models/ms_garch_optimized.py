@@ -40,6 +40,8 @@ P_LOWER = 0.50        # Below 0.5, regime has negative autocorrelation (economic
 P_UPPER = 0.995       # Near-absorbing state
 # Minimum persistence (alpha + beta) — prevents GARCH from collapsing to white noise
 PERSISTENCE_LOWER = 0.60  # Below this, GARCH has no meaningful volatility clustering
+# Maximum persistence (alpha + beta) — prevents unconditional variance from exploding
+PERSISTENCE_UPPER = 0.995  # Above this, ω/(1-α-β) produces unrealistically high uncond vol
 
 # Mu bounds (daily mean return in SCALED space, i.e. returns × 100)
 # ±5 in scaled space ≈ ±5% daily return — already extremely generous
@@ -402,6 +404,9 @@ def get_garch_warm_start(returns):
         # Enforce minimum persistence
         if alpha + beta < PERSISTENCE_LOWER:
             beta = max(PERSISTENCE_LOWER - alpha, BETA_LOWER)
+        # Enforce maximum persistence
+        if alpha + beta >= PERSISTENCE_UPPER:
+            beta = max(PERSISTENCE_UPPER - alpha, BETA_LOWER)
         nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
         
         return {
@@ -619,10 +624,10 @@ class MSGARCHOptimized:
                 alpha_1 = self._unconstrained_to_alpha(params[4])
                 beta_1 = self._unconstrained_to_beta(params[5])
                 
-                # Enforce stationarity: alpha + beta < 0.999
-                # Cap beta so that alpha + beta <= 0.998
-                max_beta_0 = 0.998 - alpha_0
-                max_beta_1 = 0.998 - alpha_1
+                # Enforce stationarity: alpha + beta < PERSISTENCE_UPPER
+                # Cap beta so that alpha + beta <= PERSISTENCE_UPPER
+                max_beta_0 = PERSISTENCE_UPPER - alpha_0
+                max_beta_1 = PERSISTENCE_UPPER - alpha_1
                 beta_0 = min(beta_0, max(max_beta_0, BETA_LOWER))
                 beta_1 = min(beta_1, max(max_beta_1, BETA_LOWER))
                 
@@ -644,7 +649,7 @@ class MSGARCHOptimized:
                 nu_1 = self._unconstrained_to_nu(params[11])
                 
                 # Stationarity check (hard constraint)
-                if alpha_0 + beta_0 >= 0.999 or alpha_1 + beta_1 >= 0.999:
+                if alpha_0 + beta_0 >= PERSISTENCE_UPPER or alpha_1 + beta_1 >= PERSISTENCE_UPPER:
                     return 1e10
                 
                 # Call JIT-compiled Hamilton filter
@@ -693,17 +698,17 @@ class MSGARCHOptimized:
                         penalty += 800 * (PERSISTENCE_LOWER - persist) ** 2
                 
                 # HIGH persistence penalty (upper end)
-                # Low-vol regime: strict stationarity
+                # Both regimes: enforce PERSISTENCE_UPPER cap
                 if persistence_0 > 0.98:
                     penalty += 200 * (persistence_0 - 0.98) ** 2
-                if persistence_0 > 0.995:
-                    penalty += 1000 * (persistence_0 - 0.995) ** 2
+                if persistence_0 > 0.99:
+                    penalty += 1000 * (persistence_0 - 0.99) ** 2
                 
-                # High-vol regime: more lenient (allow higher persistence for crisis dynamics)
-                if persistence_1 > 0.995:
-                    penalty += 100 * (persistence_1 - 0.995) ** 2
-                if persistence_1 > 0.999:
-                    penalty += 500 * (persistence_1 - 0.999) ** 2
+                # High-vol regime: slightly more lenient but still respect the cap
+                if persistence_1 > 0.98:
+                    penalty += 150 * (persistence_1 - 0.98) ** 2
+                if persistence_1 > 0.99:
+                    penalty += 800 * (persistence_1 - 0.99) ** 2
                 
                 # 4. Alpha differentiation: high-vol regime should react more to shocks
                 alpha_ratio = max(alpha_1 / max(alpha_0, 0.001), alpha_0 / max(alpha_1, 0.001))
@@ -916,8 +921,8 @@ class MSGARCHOptimized:
                 a = self.params[f'alpha_{sfx}']
                 b = self.params[f'beta_{sfx}']
                 # Upper bound: stationarity
-                if a + b >= 0.998:
-                    self.params[f'beta_{sfx}'] = max(0.998 - a, BETA_LOWER)
+                if a + b >= PERSISTENCE_UPPER:
+                    self.params[f'beta_{sfx}'] = max(PERSISTENCE_UPPER - a, BETA_LOWER)
                 # Lower bound: minimum persistence (prevent GARCH collapse)
                 if a + b < PERSISTENCE_LOWER:
                     self.params[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
@@ -1021,8 +1026,8 @@ class MSGARCHOptimized:
         beta_1 = self._unconstrained_to_beta(params_opt[5])
         
         # Apply same stationarity cap as in NLL function
-        beta_0 = min(beta_0, max(0.998 - alpha_0, BETA_LOWER))
-        beta_1 = min(beta_1, max(0.998 - alpha_1, BETA_LOWER))
+        beta_0 = min(beta_0, max(PERSISTENCE_UPPER - alpha_0, BETA_LOWER))
+        beta_1 = min(beta_1, max(PERSISTENCE_UPPER - alpha_1, BETA_LOWER))
         
         # Apply same persistence floor as in NLL function (prevent GARCH collapse)
         if alpha_0 + beta_0 < PERSISTENCE_LOWER:
@@ -1127,7 +1132,7 @@ class MSGARCHOptimized:
             print(f"     Unconditional volatility: {uncond_vol_0:.4f} ({uncond_vol_0*100:.2f}%)")
             print(f"     Degrees of freedom: ν₀ = {nu_0:.2f}")
             print(f"     Mean return: μ₀ = {mu_0:.6f} ({mu_0*252*100:.2f}% annualized)")
-            print(f"     Stationarity: {'✓ Stationary' if persistence_0 < 0.999 else '✗ Near non-stationary'}")
+            print(f"     Stationarity: {'✓ Stationary' if persistence_0 < PERSISTENCE_UPPER else '✗ Near non-stationary'}")
             
             # Regime 1 (High Volatility)
             print(f"\n  🔴 REGIME 1 (High Volatility / Crisis Period):")
@@ -1136,7 +1141,7 @@ class MSGARCHOptimized:
             print(f"     Unconditional volatility: {uncond_vol_1:.4f} ({uncond_vol_1*100:.2f}%)")
             print(f"     Degrees of freedom: ν₁ = {nu_1:.2f}")
             print(f"     Mean return: μ₁ = {mu_1:.6f} ({mu_1*252*100:.2f}% annualized)")
-            print(f"     Stationarity: {'✓ Stationary' if persistence_1 < 0.999 else '✗ Near non-stationary'}")
+            print(f"     Stationarity: {'✓ Stationary' if persistence_1 < PERSISTENCE_UPPER else '✗ Near non-stationary'}")
             
             # Regime comparison
             print(f"\n  🔄 REGIME DIFFERENTIATION:")
@@ -1456,6 +1461,9 @@ def run_ms_garch_estimation_optimized(data_df,
                         # Enforce persistence floor
                         if a0 + b0 < PERSISTENCE_LOWER: b0 = max(PERSISTENCE_LOWER - a0, BETA_LOWER)
                         if a1 + b1 < PERSISTENCE_LOWER: b1 = max(PERSISTENCE_LOWER - a1, BETA_LOWER)
+                        # Enforce persistence cap
+                        if a0 + b0 >= PERSISTENCE_UPPER: b0 = max(PERSISTENCE_UPPER - a0, BETA_LOWER)
+                        if a1 + b1 >= PERSISTENCE_UPPER: b1 = max(PERSISTENCE_UPPER - a1, BETA_LOWER)
                         params = {
                             'omega_0': og*0.5, 'alpha_0': a0,
                             'beta_0': b0,
