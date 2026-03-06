@@ -57,6 +57,19 @@ OMEGA_CEIL  = 50.0    # Maximum variance intercept (≈ 7% daily vol floor per r
 WARM_START_PERTURBATION_SCALE = 0.08    # Std dev of perturbation in unconstrained space
 FRESH_START_EVERY_N = 6                 # Every N windows, do a fresh GARCH-based start
 
+# Adaptive rolling-window settings
+ADAPTIVE_WINDOW_LOW_VOL = 378           # ~18 months in calm periods
+ADAPTIVE_WINDOW_MID_VOL = 252           # ~12 months baseline
+ADAPTIVE_WINDOW_HIGH_VOL = 126          # ~6 months in turbulent periods
+ADAPTIVE_VOL_LOOKBACK = 63              # ~1 quarter
+
+# Confidence / blending settings
+MSGARCH_CONFIDENCE_THRESHOLD = 0.45
+MSGARCH_MAX_BLEND_WEIGHT = 0.65
+
+# Estimation scope
+MIN_ESTIMATION_DATE = pd.Timestamp("2017-01-01")
+
 # Try to import arch for GARCH warm start
 try:
     from arch import arch_model
@@ -380,6 +393,149 @@ def get_garch_warm_start(returns):
             'nu': 8.0,
             'mu': np.mean(returns)
         }
+
+    try:
+        # Scale returns for better numerical stability
+        scale = np.std(returns) * 100
+        returns_scaled = returns / scale * 100
+
+        # Fit GARCH(1,1) with t-distribution
+        model = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='t', mean='Constant')
+        result = model.fit(disp='off', show_warning=False)
+
+        # Extract and rescale parameters
+        omega = result.params['omega'] / (100**2) * (scale**2)
+        alpha = result.params['alpha[1]']
+        beta = result.params['beta[1]']
+        mu = result.params['mu'] / 100 * scale
+        nu = result.params.get('nu', 8.0)
+
+        # Bound parameters
+        omega = max(omega, 1e-10)
+        alpha = min(max(alpha, ALPHA_LOWER), ALPHA_UPPER)
+        beta = min(max(beta, BETA_LOWER), BETA_UPPER)
+        # Enforce minimum persistence
+        if alpha + beta < PERSISTENCE_LOWER:
+            beta = max(PERSISTENCE_LOWER - alpha, BETA_LOWER)
+        # Enforce maximum persistence
+        if alpha + beta >= PERSISTENCE_UPPER:
+            beta = max(PERSISTENCE_UPPER - alpha, BETA_LOWER)
+        nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
+
+        return {
+            'omega': omega,
+            'alpha': alpha,
+            'beta': beta,
+            'nu': nu,
+            'mu': mu
+        }
+
+    except Exception:
+        # Fallback
+        var_ret = np.var(returns)
+        return {
+            'omega': var_ret * 0.05,
+            'alpha': 0.08,
+            'beta': 0.85,
+            'nu': 8.0,
+            'mu': np.mean(returns)
+        }
+
+
+def _build_two_regime_from_garch(garch_params):
+    """Construct a two-regime parameter set from single-regime GARCH estimates."""
+    omega_g = garch_params['omega']
+    alpha_g = garch_params['alpha']
+    beta_g = garch_params['beta']
+    mu_g = garch_params['mu']
+    nu_g = garch_params['nu']
+
+    out = {
+        'omega_0': omega_g * 0.5,
+        'alpha_0': max(alpha_g * 0.6, ALPHA_LOWER),
+        'beta_0': min(beta_g * 1.02, BETA_UPPER),
+        'omega_1': omega_g * 2.0,
+        'alpha_1': min(alpha_g * 1.5, ALPHA_UPPER),
+        'beta_1': max(beta_g * 0.90, BETA_LOWER),
+        'mu_0': mu_g,
+        'mu_1': mu_g,
+        'p00': 0.95,
+        'p11': 0.90,
+        'nu_0': min(nu_g * 1.5, NU_OPTIMIZER_UPPER_BOUND),
+        'nu_1': max(nu_g * 0.6, NU_LOWER_BOUND),
+    }
+
+    for sfx in ('0', '1'):
+        a = out[f'alpha_{sfx}']
+        b = out[f'beta_{sfx}']
+        if a + b >= PERSISTENCE_UPPER:
+            out[f'beta_{sfx}'] = max(PERSISTENCE_UPPER - a, BETA_LOWER)
+        if a + b < PERSISTENCE_LOWER:
+            out[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
+
+    return out
+
+
+def _compute_msgarch_diagnostics(params):
+    """Compute diagnostics and a confidence score for regime quality."""
+    eps = 1e-10
+    persistence_0 = params['alpha_0'] + params['beta_0']
+    persistence_1 = params['alpha_1'] + params['beta_1']
+    uncond_var_0 = params['omega_0'] / max(1 - persistence_0, 1e-3)
+    uncond_var_1 = params['omega_1'] / max(1 - persistence_1, 1e-3)
+    vol_ratio = np.sqrt(max(uncond_var_1, eps) / max(uncond_var_0, eps))
+    vol_ratio = max(vol_ratio, 1.0 / max(vol_ratio, eps))
+
+    boundary_alpha = int(abs(params['alpha_0'] - ALPHA_LOWER) < 5e-4) + int(abs(params['alpha_1'] - ALPHA_LOWER) < 5e-4)
+    boundary_nu = int(params['nu_0'] > NU_OPTIMIZER_UPPER_BOUND - 0.1) + int(params['nu_1'] > NU_OPTIMIZER_UPPER_BOUND - 0.1)
+    near_transition_boundary = int(params['p00'] < 0.53 or params['p00'] > 0.99) + int(params['p11'] < 0.53 or params['p11'] > 0.99)
+
+    score = 1.0
+    if vol_ratio < 1.35:
+        score -= min(0.45, 0.55 * (1.35 - vol_ratio))
+    if abs(persistence_1 - persistence_0) < 0.05:
+        score -= 0.12
+    score -= 0.08 * boundary_alpha
+    score -= 0.06 * boundary_nu
+    score -= 0.07 * near_transition_boundary
+    score = float(np.clip(score, 0.0, 1.0))
+
+    return {
+        'msgarch_confidence_score': score,
+        'msgarch_vol_ratio': float(vol_ratio),
+        'msgarch_persistence_0': float(persistence_0),
+        'msgarch_persistence_1': float(persistence_1),
+        'msgarch_alpha_boundary_hits': int(boundary_alpha),
+        'msgarch_nu_boundary_hits': int(boundary_nu),
+        'msgarch_transition_boundary_hits': int(near_transition_boundary),
+    }
+
+
+def _blend_params(primary, fallback, blend_weight):
+    """Blend parameter dictionaries while preserving constraints."""
+    w = float(np.clip(blend_weight, 0.0, 1.0))
+    p = {}
+    for key in ['omega_0', 'alpha_0', 'beta_0', 'omega_1', 'alpha_1', 'beta_1', 'mu_0', 'mu_1', 'p00', 'p11', 'nu_0', 'nu_1']:
+        p[key] = (1.0 - w) * primary[key] + w * fallback[key]
+
+    p['alpha_0'] = float(np.clip(p['alpha_0'], ALPHA_LOWER, ALPHA_UPPER))
+    p['alpha_1'] = float(np.clip(p['alpha_1'], ALPHA_LOWER, ALPHA_UPPER))
+    p['beta_0'] = float(np.clip(p['beta_0'], BETA_LOWER, BETA_UPPER))
+    p['beta_1'] = float(np.clip(p['beta_1'], BETA_LOWER, BETA_UPPER))
+    p['p00'] = float(np.clip(p['p00'], P_LOWER, P_UPPER))
+    p['p11'] = float(np.clip(p['p11'], P_LOWER, P_UPPER))
+    p['nu_0'] = float(np.clip(p['nu_0'], NU_LOWER_BOUND, NU_OPTIMIZER_UPPER_BOUND))
+    p['nu_1'] = float(np.clip(p['nu_1'], NU_LOWER_BOUND, NU_OPTIMIZER_UPPER_BOUND))
+
+    for sfx in ('0', '1'):
+        a = p[f'alpha_{sfx}']
+        b = p[f'beta_{sfx}']
+        if a + b >= PERSISTENCE_UPPER:
+            p[f'beta_{sfx}'] = max(PERSISTENCE_UPPER - a, BETA_LOWER)
+        if a + b < PERSISTENCE_LOWER:
+            p[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
+
+    return p
     
     try:
         # Scale returns for better numerical stability
@@ -674,6 +830,15 @@ class MSGARCHOptimized:
                 # Stronger penalty: regimes should differ by at least 1.5x in unconditional vol
                 if vol_ratio < 1.5:
                     penalty += 50 * (1.5 - vol_ratio) ** 2
+
+                # Penalize small unconditional-variance gap directly (identification aid)
+                uncond_var_0 = omega_0 / max(1 - alpha_0 - beta_0, 0.01)
+                uncond_var_1 = omega_1 / max(1 - alpha_1 - beta_1, 0.01)
+                var_gap = abs(uncond_var_1 - uncond_var_0)
+                var_scale = max((uncond_var_1 + uncond_var_0) * 0.5, 1e-8)
+                rel_var_gap = var_gap / var_scale
+                if rel_var_gap < 0.40:
+                    penalty += 60 * (0.40 - rel_var_gap) ** 2
                 
                 # 2. Degrees of Freedom Differentiation: Encourage different tail behavior
                 nu_ratio = max(nu_0 / nu_1, nu_1 / nu_0)
@@ -714,6 +879,19 @@ class MSGARCHOptimized:
                 alpha_ratio = max(alpha_1 / max(alpha_0, 0.001), alpha_0 / max(alpha_1, 0.001))
                 if alpha_ratio < 1.5:
                     penalty += 15 * (1.5 - alpha_ratio) ** 2
+
+                # 5. Discourage boundary pile-up on alpha and nu (softly)
+                for a in (alpha_0, alpha_1):
+                    if a < ALPHA_LOWER + 0.005:
+                        penalty += 8 * (ALPHA_LOWER + 0.005 - a) ** 2
+
+                for nu in (nu_0, nu_1):
+                    if nu > NU_OPTIMIZER_UPPER_BOUND - 0.5:
+                        penalty += 0.25 * (nu - (NU_OPTIMIZER_UPPER_BOUND - 0.5)) ** 2
+
+                # 6. Avoid non-persistent high-vol regime unless data strongly favors it
+                if p11 < 0.58:
+                    penalty += 12 * (0.58 - p11) ** 2
                 
                 return -ll + penalty
                 
@@ -894,38 +1072,7 @@ class MSGARCHOptimized:
                 print("    ⚠ PHASE 1: All candidates failed – falling back to GARCH-based defaults")
             
             garch_fb = get_garch_warm_start(returns_array)
-            omega_g  = garch_fb['omega']
-            alpha_g  = garch_fb['alpha']
-            beta_g   = garch_fb['beta']
-            mu_g     = garch_fb['mu']
-            nu_g     = garch_fb['nu']
-            
-            # Build a synthetic two-regime parameter set from the single GARCH
-            self.params = {
-                'omega_0': omega_g * 0.5,        # calm regime: lower intercept
-                'alpha_0': max(alpha_g * 0.6, ALPHA_LOWER),
-                'beta_0':  min(beta_g * 1.02, BETA_UPPER),
-                'omega_1': omega_g * 2.0,         # crisis regime: higher intercept
-                'alpha_1': min(alpha_g * 1.5, ALPHA_UPPER),
-                'beta_1':  max(beta_g * 0.90, BETA_LOWER),
-                'mu_0':    mu_g,
-                'mu_1':    mu_g,
-                'p00':     0.95,
-                'p11':     0.90,
-                'nu_0':    min(nu_g * 1.5, 50.0),  # thinner tails in calm
-                'nu_1':    max(nu_g * 0.6, NU_LOWER_BOUND),  # fatter tails in crisis
-            }
-            
-            # Enforce stationarity on the fallback
-            for sfx in ('0', '1'):
-                a = self.params[f'alpha_{sfx}']
-                b = self.params[f'beta_{sfx}']
-                # Upper bound: stationarity
-                if a + b >= PERSISTENCE_UPPER:
-                    self.params[f'beta_{sfx}'] = max(PERSISTENCE_UPPER - a, BETA_LOWER)
-                # Lower bound: minimum persistence (prevent GARCH collapse)
-                if a + b < PERSISTENCE_LOWER:
-                    self.params[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
+            self.params = _build_two_regime_from_garch(garch_fb)
             
             # Compute volatility & regime probs using these fallback params
             p = self.params
@@ -1383,7 +1530,7 @@ def run_ms_garch_estimation_optimized(data_df,
         start_date = firm_data['date'].min()
         end_date = firm_data['date'].max()
         try:
-            estimation_start = start_date + pd.DateOffset(months=12)  # Start 1 year in
+            estimation_start = max(start_date + pd.DateOffset(months=12), MIN_ESTIMATION_DATE)
             if estimation_start >= end_date:
                 continue
             month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
@@ -1399,17 +1546,45 @@ def run_ms_garch_estimation_optimized(data_df,
                 # Select all data up to this point
                 data_up_to_point = firm_data[firm_data['date'] <= date_point]
 
-                # Require at least 252 trading days of history (1 year)
-                if len(data_up_to_point) < 252:
+                # Require enough history for adaptive windows
+                if len(data_up_to_point) < ADAPTIVE_WINDOW_HIGH_VOL:
                     continue
 
-                # Take the exact last 252 trading days for the window (1 year)
-                window_df = data_up_to_point.iloc[-252:].copy()
+                # Adaptive window size based on recent realized volatility
+                if "asset_return_daily_scaled" in data_up_to_point.columns:
+                    hist_returns_raw = data_up_to_point["asset_return_daily_scaled"].dropna().values
+                else:
+                    hist_returns_raw = data_up_to_point[return_column].dropna().values
+                    if len(hist_returns_raw) > 0 and np.std(hist_returns_raw) < 0.1:
+                        hist_returns_raw = hist_returns_raw * 100.0
+
+                window_days = ADAPTIVE_WINDOW_MID_VOL
+                window_regime_state = "Intermediate Vol"
+                if len(hist_returns_raw) >= max(ADAPTIVE_VOL_LOOKBACK + 40, 90):
+                    hist_series = pd.Series(hist_returns_raw)
+                    hist_roll_vol = hist_series.rolling(
+                        ADAPTIVE_VOL_LOOKBACK,
+                        min_periods=max(20, ADAPTIVE_VOL_LOOKBACK // 2)
+                    ).std().dropna()
+                    if len(hist_roll_vol) >= 40:
+                        recent_vol = hist_roll_vol.iloc[-1]
+                        q_low = hist_roll_vol.quantile(0.33)
+                        q_high = hist_roll_vol.quantile(0.67)
+                        if recent_vol >= q_high:
+                            window_days = ADAPTIVE_WINDOW_HIGH_VOL
+                            window_regime_state = "High Vol"
+                        elif recent_vol <= q_low:
+                            window_days = ADAPTIVE_WINDOW_LOW_VOL
+                            window_regime_state = "Low Vol"
+
+                window_days = int(min(window_days, len(data_up_to_point)))
+                window_df = data_up_to_point.iloc[-window_days:].copy()
                 
                 # Additional data quality checks
                 valid_count = window_df['asset_return_daily_scaled'].notna().sum() if 'asset_return_daily_scaled' in window_df.columns else window_df['asset_return_daily'].notna().sum()
                 
-                if valid_count < 200:  # Require at least 200 valid observations for 1-year window
+                min_valid_required = max(100, int(0.75 * window_days))
+                if valid_count < min_valid_required:
                     continue
                 
                 # Use centrally scaled returns if available
@@ -1453,27 +1628,8 @@ def run_ms_garch_estimation_optimized(data_df,
                     if last_params_firm is not None:
                         params = last_params_firm.copy()
                     else:
-                        # Absolute last resort: build params from plain GARCH
                         garch_fb = get_garch_warm_start(returns)
-                        og = garch_fb['omega']; ag = garch_fb['alpha']; bg = garch_fb['beta']
-                        a0 = max(ag*0.6, ALPHA_LOWER); a1 = min(ag*1.5, ALPHA_UPPER)
-                        b0 = min(bg*1.02, BETA_UPPER); b1 = max(bg*0.90, BETA_LOWER)
-                        # Enforce persistence floor
-                        if a0 + b0 < PERSISTENCE_LOWER: b0 = max(PERSISTENCE_LOWER - a0, BETA_LOWER)
-                        if a1 + b1 < PERSISTENCE_LOWER: b1 = max(PERSISTENCE_LOWER - a1, BETA_LOWER)
-                        # Enforce persistence cap
-                        if a0 + b0 >= PERSISTENCE_UPPER: b0 = max(PERSISTENCE_UPPER - a0, BETA_LOWER)
-                        if a1 + b1 >= PERSISTENCE_UPPER: b1 = max(PERSISTENCE_UPPER - a1, BETA_LOWER)
-                        params = {
-                            'omega_0': og*0.5, 'alpha_0': a0,
-                            'beta_0': b0,
-                            'omega_1': og*2.0, 'alpha_1': a1,
-                            'beta_1': b1,
-                            'mu_0': garch_fb['mu'], 'mu_1': garch_fb['mu'],
-                            'p00': 0.95, 'p11': 0.90,
-                            'nu_0': min(garch_fb['nu']*1.5, 50.0),
-                            'nu_1': max(garch_fb['nu']*0.6, NU_LOWER_BOUND),
-                        }
+                        params = _build_two_regime_from_garch(garch_fb)
                 
                 # CRITICAL FIX: Deep copy the scaled parameters BEFORE unscaling
                 # This prevents the bug where unscaling affects the warm start parameters
@@ -1501,6 +1657,48 @@ def run_ms_garch_estimation_optimized(data_df,
                     f_probs = kim_smoother_jit(f_probs, f_pred, p['p00'], p['p11'])
                     vol_series = np.sqrt(f_probs[:, 0] * sig2[:, 0] + f_probs[:, 1] * sig2[:, 1])
                     regime_probs = f_probs
+
+                # Confidence diagnostics + conservative blend for weakly-identified regimes
+                diag = _compute_msgarch_diagnostics(params)
+                blend_weight = 0.0
+                if diag['msgarch_confidence_score'] < MSGARCH_CONFIDENCE_THRESHOLD:
+                    garch_fb = get_garch_warm_start(returns)
+                    fallback_params = _build_two_regime_from_garch(garch_fb)
+
+                    shortfall = MSGARCH_CONFIDENCE_THRESHOLD - diag['msgarch_confidence_score']
+                    blend_weight = np.clip(
+                        MSGARCH_MAX_BLEND_WEIGHT * (shortfall / MSGARCH_CONFIDENCE_THRESHOLD),
+                        0.0,
+                        MSGARCH_MAX_BLEND_WEIGHT,
+                    )
+
+                    params = _blend_params(params, fallback_params, blend_weight)
+
+                    ll_blend, f_probs, sig2, f_pred = hamilton_filter_jit(
+                        returns,
+                        params['omega_0'], params['alpha_0'], params['beta_0'],
+                        params['omega_1'], params['alpha_1'], params['beta_1'],
+                        params['mu_0'], params['mu_1'], params['p00'], params['p11'],
+                        params['nu_0'], params['nu_1']
+                    )
+                    f_probs = kim_smoother_jit(f_probs, f_pred, params['p00'], params['p11'])
+                    vol_series = np.sqrt(f_probs[:, 0] * sig2[:, 0] + f_probs[:, 1] * sig2[:, 1])
+                    regime_probs = f_probs
+                    model.log_likelihood = ll_blend
+
+                    diag = _compute_msgarch_diagnostics(params)
+
+                params['msgarch_confidence_score'] = diag['msgarch_confidence_score']
+                params['msgarch_vol_ratio'] = diag['msgarch_vol_ratio']
+                params['msgarch_persistence_0'] = diag['msgarch_persistence_0']
+                params['msgarch_persistence_1'] = diag['msgarch_persistence_1']
+                params['msgarch_alpha_boundary_hits'] = diag['msgarch_alpha_boundary_hits']
+                params['msgarch_nu_boundary_hits'] = diag['msgarch_nu_boundary_hits']
+                params['msgarch_transition_boundary_hits'] = diag['msgarch_transition_boundary_hits']
+                params['msgarch_low_confidence'] = bool(diag['msgarch_confidence_score'] < MSGARCH_CONFIDENCE_THRESHOLD)
+                params['msgarch_blend_weight'] = float(blend_weight)
+                params['adaptive_window_days'] = int(window_days)
+                params['window_regime_state'] = window_regime_state
                 
                 # Unscale parameters for saving (so they match RAW return scale)
                 # This modifies params in place, but last_params_firm is protected by deepcopy
@@ -1578,7 +1776,13 @@ def run_ms_garch_estimation_optimized(data_df,
         params_df = pd.DataFrame(all_params)
         # Include 'date' in columns
         cols = ['gvkey', 'date', 'omega_0', 'alpha_0', 'beta_0', 'omega_1', 'alpha_1', 'beta_1',
-                'mu_0', 'mu_1', 'p00', 'p11', 'nu_0', 'nu_1', 'log_likelihood', 'aic', 'bic', 'n_obs']
+            'mu_0', 'mu_1', 'p00', 'p11', 'nu_0', 'nu_1',
+            'msgarch_confidence_score', 'msgarch_vol_ratio',
+            'msgarch_persistence_0', 'msgarch_persistence_1',
+            'msgarch_alpha_boundary_hits', 'msgarch_nu_boundary_hits',
+            'msgarch_transition_boundary_hits', 'msgarch_low_confidence',
+            'msgarch_blend_weight', 'adaptive_window_days', 'window_regime_state',
+            'log_likelihood', 'aic', 'bic', 'n_obs']
         # Select columns that exist
         params_df = params_df[[c for c in cols if c in params_df.columns]]
         params_df.to_csv(output_file, index=False)

@@ -50,6 +50,27 @@ python -m src.analysis.garch_spread_diagnostics
 
 Outputs are written to `data/diagnostics/` as CSV summaries and PNG charts.
 
+## Paper-Ready Model Comparison (When Each Model Works Best)
+
+Run this to generate clean tables/figures showing model performance by company,
+leverage buckets, maturity, and calendar year, including pairwise DM/HW tests:
+
+```bash
+python -m src.analysis.model_performance_paper
+```
+
+Outputs are written to:
+
+- `data/output/paper_model_comparison/` (tables + test results)
+- `data/output/paper_model_comparison/figures/` (paper-ready PNG plots)
+
+Includes segmented outputs for:
+
+- COVID / pre-COVID / recovery / post-recovery periods
+- High / intermediate / low market-volatility regimes
+- Combined period × volatility slices
+- `msgarch_best_segments.csv` highlighting where MS-GARCH wins most often
+
 ## Faster Monte Carlo (Phase 1 + Phase 2)
 
 ### Phase 1: Local engine speedups
