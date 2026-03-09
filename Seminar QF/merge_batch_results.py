@@ -90,30 +90,34 @@ def main():
     print("BATCH RESULTS CONSOLIDATION")
     print("="*60)
     
-    # Merge GARCH results from the downloaded location
-    garch_batch_dir = output_dir / "garch_batch"
-    garch_output = output_dir / "batch_garch_results.csv"
-    if garch_batch_dir.exists():
-        merge_batch_results(garch_batch_dir, garch_output, "GARCH")
-    else:
-        print(f"⚠ WARNING: GARCH batch directory not found: {garch_batch_dir}")
-    
-    # Merge Regime Switching results (when available)
-    rs_batch_dir = output_dir / "regime_switching_batch"
-    rs_output = output_dir / "batch_regime_switching_results.csv"
-    if rs_batch_dir.exists():
-        merge_batch_results(rs_batch_dir, rs_output, "Regime Switching")
-    else:
-        print(f"⚠ INFO: Regime Switching batch directory not found: {rs_batch_dir}")
+    model_configs = [
+        ("GARCH", ["garch_batch"], "batch_garch_results.csv"),
+        (
+            "Regime Switching",
+            ["regime_switching_batch", "regime-switching_batch", "rs_batch"],
+            "batch_regime_switching_results.csv",
+        ),
+        ("MS-GARCH", ["ms-garch_batch", "ms_garch_batch", "msgarch_batch"], "batch_ms_garch_results.csv"),
+        ("Merton", ["merton_batch"], "batch_merton_results.csv"),
+    ]
+
+    created_files = []
+    for model_name, batch_subdirs, output_name in model_configs:
+        batch_dir = next((output_dir / subdir for subdir in batch_subdirs if (output_dir / subdir).exists()), None)
+        output_file = output_dir / output_name
+        if batch_dir is not None:
+            merge_batch_results(batch_dir, output_file, model_name)
+            created_files.append(output_file.name)
+        else:
+            expected_dirs = ", ".join(str(output_dir / subdir) for subdir in batch_subdirs)
+            print(f"⚠ INFO: {model_name} batch directory not found. Checked: {expected_dirs}")
     
     print("\n" + "="*60)
     print("✓ CONSOLIDATION COMPLETE")
     print("="*60)
     print(f"\nOutput files created in: {output_dir}")
-    if garch_batch_dir.exists():
-        print(f"  - {garch_output.name}")
-    if rs_batch_dir.exists():
-        print(f"  - {rs_output.name}")
+    for file_name in created_files:
+        print(f"  - {file_name}")
     print("\n")
 
 if __name__ == "__main__":

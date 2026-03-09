@@ -34,6 +34,10 @@ DEFAULT_WINDOW_DAYS = 252
 
 # Models and their spread column prefixes in the MC output files
 MODEL_CONFIGS = {
+    'Merton': {
+        'mc_file': 'daily_monte_carlo_merton_results.csv',
+        'spread_prefix': 'merton_mc_implied_spread',
+    },
     'GARCH': {
         'mc_file': 'daily_monte_carlo_garch_results.csv',
         'spread_prefix': 'mc_garch_implied_spread',
@@ -275,7 +279,7 @@ def calibrate_model(
     Parameters
     ----------
     model_name : str
-        One of 'GARCH', 'Regime-Switching', 'MS-GARCH'.
+        One of 'Merton', 'GARCH', 'Regime-Switching', 'MS-GARCH'.
     output_dir : Path
         Directory containing the daily_monte_carlo_*_results.csv files.
     input_dir : Path

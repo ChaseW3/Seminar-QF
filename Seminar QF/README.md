@@ -75,7 +75,7 @@ Includes segmented outputs for:
 
 ### Phase 1: Local engine speedups
 
-- All three Monte Carlo engines now support antithetic variates via `use_antithetic=True`.
+- All four Monte Carlo engines (Merton, GARCH, Regime Switching, MS-GARCH) now support antithetic variates via `use_antithetic=True`.
 - For a 10k-effective run, use 5000 paths with antithetic enabled.
 
 ### Phase 2: Cloud Batch scaling
@@ -92,6 +92,7 @@ Submit model-specific jobs:
 gcloud batch jobs submit garch-10k --location us-central1 --config batch/job_garch_10k.json
 gcloud batch jobs submit rs-10k --location us-central1 --config batch/job_regime_switching_10k.json
 gcloud batch jobs submit msgarch-10k --location us-central1 --config batch/job_ms_garch_10k.json
+gcloud batch jobs submit merton-10k --location us-central1 --config batch/job_merton_10k.json
 ```
 
 Batch outputs are sharded to model folders under `output/results/` in your GCS bucket.
