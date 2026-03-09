@@ -1,0 +1,21 @@
+\begin{table}[htbp]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\caption{Hotelling-Williams tests (overall).}
+\label{tab:hw_overall}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrrl}
+\toprule
+Model\_1 & Model\_2 & n\_obs & r\_market\_m1 & r\_market\_m2 & t\_HW & p\_value & Significance \\
+\midrule
+merton\_mc & garch & 158328 & 0.193200 & 0.177100 & 4.681700 & 0.000000 & *** \\
+merton\_mc & rs & 158328 & 0.193200 & 0.256000 & -18.633800 & 0.000000 & *** \\
+merton\_mc & msgarch & 159488 & 0.198000 & 0.249000 & -15.153000 & 0.000000 & *** \\
+garch & rs & 158328 & 0.177100 & 0.256000 & -23.315500 & 0.000000 & *** \\
+garch & msgarch & 158328 & 0.177100 & 0.246700 & -20.527000 & 0.000000 & *** \\
+rs & msgarch & 158328 & 0.256000 & 0.246700 & 2.788400 & 0.005300 & *** \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

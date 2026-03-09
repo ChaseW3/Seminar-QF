@@ -59,6 +59,15 @@ MODEL_SPECS = {
     },
 }
 
+# Fixed color mapping used across all model comparison plots.
+MODEL_LABEL_ORDER = ["GARCH", "MS-GARCH", "Merton", "Regime-Switching"]
+MODEL_COLORS = {
+    "GARCH": "#4C72B0",
+    "MS-GARCH": "#DD8452",
+    "Merton": "#55A868",
+    "Regime-Switching": "#C44E52",
+}
+
 
 @dataclass
 class AnalysisConfig:
@@ -526,7 +535,15 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
     tbl = best_tables["best_model_share_by_leverage"].copy()
     if not tbl.empty:
         plt.figure(figsize=(11, 6))
-        sns.barplot(data=tbl, x="leverage_group", y="share", hue="best_model_label", errorbar=None)
+        sns.barplot(
+            data=tbl,
+            x="leverage_group",
+            y="share",
+            hue="best_model_label",
+            hue_order=MODEL_LABEL_ORDER,
+            palette=MODEL_COLORS,
+            errorbar=None,
+        )
         plt.title("Best-Performing Model Share by Leverage Group")
         plt.xlabel("Leverage Group")
         plt.ylabel("Share of Dates Where Model Has Lowest Absolute Error")
@@ -559,6 +576,8 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
             x="year",
             y="rmse_bps",
             hue="model_label",
+            hue_order=MODEL_LABEL_ORDER,
+            palette=MODEL_COLORS,
             col="maturity",
             kind="line",
             marker="o",
@@ -575,7 +594,19 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
     perf_firm = compute_performance_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=60)
     if not perf_firm.empty:
         plt.figure(figsize=(12, 6))
-        sns.boxplot(data=perf_firm, x="model_label", y="rmse_bps", showfliers=False)
+        sns.boxplot(
+            data=perf_firm,
+            x="model_label",
+            y="rmse_bps",
+            hue="model_label",
+            hue_order=MODEL_LABEL_ORDER,
+            order=MODEL_LABEL_ORDER,
+            palette=MODEL_COLORS,
+            showfliers=False,
+        )
+        leg = plt.gca().get_legend()
+        if leg is not None:
+            leg.remove()
         plt.title("Firm-Level RMSE Distribution by Model")
         plt.xlabel("Model")
         plt.ylabel("RMSE (bps)")
@@ -593,7 +624,15 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
             value_name="correlation",
         )
         plt.figure(figsize=(10, 5))
-        sns.barplot(data=corr_long, x="maturity", y="correlation", hue="model_label", errorbar=None)
+        sns.barplot(
+            data=corr_long,
+            x="maturity",
+            y="correlation",
+            hue="model_label",
+            hue_order=MODEL_LABEL_ORDER,
+            palette=MODEL_COLORS,
+            errorbar=None,
+        )
         plt.title("Model vs Market Correlation by Maturity")
         plt.xlabel("Maturity")
         plt.ylabel("Correlation")
@@ -607,7 +646,15 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
         period_order = ["Pre-COVID", "COVID Shock", "Recovery", "Post-Recovery"]
         by_period["period"] = pd.Categorical(by_period["period"], categories=period_order, ordered=True)
         plt.figure(figsize=(12, 6))
-        sns.barplot(data=by_period.sort_values(["period", "maturity"]), x="period", y="share", hue="best_model_label", errorbar=None)
+        sns.barplot(
+            data=by_period.sort_values(["period", "maturity"]),
+            x="period",
+            y="share",
+            hue="best_model_label",
+            hue_order=MODEL_LABEL_ORDER,
+            palette=MODEL_COLORS,
+            errorbar=None,
+        )
         plt.title("Best-Performing Model Share by Macro Period")
         plt.xlabel("Period")
         plt.ylabel("Share of Wins")

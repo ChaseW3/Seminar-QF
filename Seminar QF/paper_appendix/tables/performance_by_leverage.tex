@@ -1,0 +1,51 @@
+\begin{table}[htbp]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\caption{Model performance by leverage segment.}
+\label{tab:perf_leverage}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llllrrrrrr}
+\toprule
+leverage\_group & maturity & model & model\_label & n\_obs & rmse\_bps & mae\_bps & bias\_bps & corr\_levels & corr\_changes \\
+\midrule
+High Leverage & 1y & garch & GARCH & 15667 & 27.474800 & 20.802300 & 20.802300 & 0.347000 & 0.008200 \\
+High Leverage & 1y & merton\_mc & Merton & 15827 & 27.488100 & 20.832200 & 20.832200 & 0.347200 & 0.006400 \\
+High Leverage & 1y & msgarch & MS-GARCH & 15827 & 27.467600 & 20.818600 & 20.818600 & 0.425000 & 0.013900 \\
+High Leverage & 1y & rs & Regime-Switching & 15667 & 27.436200 & 20.754200 & 20.754200 & 0.347900 & 0.009200 \\
+High Leverage & 3y & garch & GARCH & 17690 & 44.980500 & 37.394100 & 37.394100 & 0.267900 & 0.027500 \\
+High Leverage & 3y & merton\_mc & Merton & 17870 & 45.106400 & 37.511900 & 37.511900 & 0.289400 & 0.023600 \\
+High Leverage & 3y & msgarch & MS-GARCH & 17870 & 45.080500 & 37.488300 & 37.488300 & 0.327600 & 0.020400 \\
+High Leverage & 3y & rs & Regime-Switching & 17690 & 44.927700 & 37.335400 & 37.335400 & 0.274300 & 0.018300 \\
+High Leverage & 5y & garch & GARCH & 19332 & 69.072600 & 59.794900 & 59.794900 & 0.160500 & 0.036300 \\
+High Leverage & 5y & merton\_mc & Merton & 19552 & 69.451300 & 60.110100 & 60.110100 & 0.194500 & 0.032100 \\
+High Leverage & 5y & msgarch & MS-GARCH & 19552 & 69.424900 & 60.083000 & 60.083000 & 0.197000 & 0.039100 \\
+High Leverage & 5y & rs & Regime-Switching & 19332 & 69.002000 & 59.722600 & 59.722600 & 0.232300 & 0.041400 \\
+Low Leverage & 1y & garch & GARCH & 17587 & 10.669100 & 9.581100 & 9.581100 & 0.090700 & 0.001300 \\
+Low Leverage & 1y & merton\_mc & Merton & 17727 & 10.683000 & 9.598700 & 9.598700 & 0.054200 & 0.002000 \\
+Low Leverage & 1y & msgarch & MS-GARCH & 17727 & 10.682900 & 9.598700 & 9.598700 & 0.132100 & 0.008500 \\
+Low Leverage & 1y & rs & Regime-Switching & 17587 & 10.669100 & 9.581100 & 9.581100 & 0.097700 & 0.007700 \\
+Low Leverage & 3y & garch & GARCH & 17587 & 23.579500 & 20.793600 & 20.793600 & 0.240200 & 0.021700 \\
+Low Leverage & 3y & merton\_mc & Merton & 17727 & 23.726800 & 20.895500 & 20.895500 & 0.225200 & 0.007300 \\
+Low Leverage & 3y & msgarch & MS-GARCH & 17727 & 23.725800 & 20.894700 & 20.894700 & 0.207300 & 0.011200 \\
+Low Leverage & 3y & rs & Regime-Switching & 17587 & 23.579500 & 20.793600 & 20.793600 & 0.247900 & 0.022500 \\
+Low Leverage & 5y & garch & GARCH & 17587 & 40.043900 & 36.007400 & 36.007400 & 0.318000 & 0.040600 \\
+Low Leverage & 5y & merton\_mc & Merton & 17727 & 40.332600 & 36.197100 & 36.197100 & 0.318700 & 0.022400 \\
+Low Leverage & 5y & msgarch & MS-GARCH & 17727 & 40.330500 & 36.195400 & 36.195400 & 0.246200 & 0.014200 \\
+Low Leverage & 5y & rs & Regime-Switching & 17587 & 40.043900 & 36.007400 & 36.007400 & 0.330700 & 0.048000 \\
+Mid Leverage & 1y & garch & GARCH & 17626 & 16.923000 & 14.363800 & 14.363800 & 0.127100 & 0.017300 \\
+Mid Leverage & 1y & merton\_mc & Merton & 17686 & 16.919700 & 14.365300 & 14.365300 & 0.126600 & 0.065100 \\
+Mid Leverage & 1y & msgarch & MS-GARCH & 17686 & 16.918700 & 14.364200 & 14.364200 & 0.098100 & 0.008900 \\
+Mid Leverage & 1y & rs & Regime-Switching & 17626 & 16.923100 & 14.363800 & 14.363800 & 0.097900 & 0.017400 \\
+Mid Leverage & 3y & garch & GARCH & 17626 & 36.411900 & 31.144000 & 31.144000 & 0.322600 & 0.042900 \\
+Mid Leverage & 3y & merton\_mc & Merton & 17686 & 36.410600 & 31.156100 & 31.156100 & 0.172700 & 0.081300 \\
+Mid Leverage & 3y & msgarch & MS-GARCH & 17686 & 36.407500 & 31.153200 & 31.153200 & 0.143600 & 0.011900 \\
+Mid Leverage & 3y & rs & Regime-Switching & 17626 & 36.411700 & 31.143800 & 31.143800 & 0.201900 & 0.013200 \\
+Mid Leverage & 5y & garch & GARCH & 17626 & 61.777900 & 54.379700 & 54.379700 & 0.492200 & 0.092000 \\
+Mid Leverage & 5y & merton\_mc & Merton & 17686 & 61.792200 & 54.413600 & 54.413600 & 0.229100 & 0.083600 \\
+Mid Leverage & 5y & msgarch & MS-GARCH & 17686 & 61.787800 & 54.409500 & 54.409500 & 0.189400 & 0.012800 \\
+Mid Leverage & 5y & rs & Regime-Switching & 17626 & 61.777700 & 54.379500 & 54.379500 & 0.278200 & 0.025300 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

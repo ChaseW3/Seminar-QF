@@ -1,0 +1,33 @@
+\begin{table}[htbp]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\caption{Diebold-Mariano tests (overall).}
+\label{tab:dm_overall}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lllrrrll}
+\toprule
+maturity & model1 & model2 & n\_obs & DM\_stat & p\_value & significance & result \\
+\midrule
+1y & merton\_mc & garch & 50880 & -7.422200 & 0.000000 & *** & Model 2 (lower RMSE) \\
+3y & merton\_mc & garch & 52903 & -16.467700 & 0.000000 & *** & Model 2 (lower RMSE) \\
+5y & merton\_mc & garch & 54545 & -18.431000 & 0.000000 & *** & Model 2 (lower RMSE) \\
+1y & merton\_mc & rs & 50880 & 44.266500 & 0.000000 & *** & Model 2 (lower RMSE) \\
+3y & merton\_mc & rs & 52903 & 63.706800 & 0.000000 & *** & Model 2 (lower RMSE) \\
+5y & merton\_mc & rs & 54545 & 76.380000 & 0.000000 & *** & Model 2 (lower RMSE) \\
+1y & merton\_mc & msgarch & 51240 & 22.977000 & 0.000000 & *** & Model 2 (lower RMSE) \\
+3y & merton\_mc & msgarch & 53283 & 41.883600 & 0.000000 & *** & Model 2 (lower RMSE) \\
+5y & merton\_mc & msgarch & 54965 & 50.988400 & 0.000000 & *** & Model 2 (lower RMSE) \\
+1y & garch & rs & 50880 & 45.781200 & 0.000000 & *** & Model 2 (lower RMSE) \\
+3y & garch & rs & 52903 & 71.410600 & 0.000000 & *** & Model 2 (lower RMSE) \\
+5y & garch & rs & 54545 & 85.326900 & 0.000000 & *** & Model 2 (lower RMSE) \\
+1y & garch & msgarch & 50880 & 24.814100 & 0.000000 & *** & Model 1 (lower RMSE) \\
+3y & garch & msgarch & 52903 & 50.808300 & 0.000000 & *** & Model 1 (lower RMSE) \\
+5y & garch & msgarch & 54545 & 65.817100 & 0.000000 & *** & Model 1 (lower RMSE) \\
+1y & rs & msgarch & 50880 & -26.545800 & 0.000000 & *** & Model 1 (lower RMSE) \\
+3y & rs & msgarch & 52903 & -32.418900 & 0.000000 & *** & Model 1 (lower RMSE) \\
+5y & rs & msgarch & 54545 & -45.365500 & 0.000000 & *** & Model 1 (lower RMSE) \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

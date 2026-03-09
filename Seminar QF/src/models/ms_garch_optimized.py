@@ -64,8 +64,8 @@ ADAPTIVE_WINDOW_HIGH_VOL = 126          # ~6 months in turbulent periods
 ADAPTIVE_VOL_LOOKBACK = 63              # ~1 quarter
 
 # Confidence / blending settings
-MSGARCH_CONFIDENCE_THRESHOLD = 0.45
-MSGARCH_MAX_BLEND_WEIGHT = 0.65
+MSGARCH_CONFIDENCE_THRESHOLD = 0.72
+MSGARCH_MAX_BLEND_WEIGHT = 0.85
 
 # Estimation scope
 MIN_ESTIMATION_DATE = pd.Timestamp("2017-01-01")
@@ -491,13 +491,19 @@ def _compute_msgarch_diagnostics(params):
     near_transition_boundary = int(params['p00'] < 0.53 or params['p00'] > 0.99) + int(params['p11'] < 0.53 or params['p11'] > 0.99)
 
     score = 1.0
+    if vol_ratio < 1.60:
+        score -= min(0.55, 0.70 * (1.60 - vol_ratio))
     if vol_ratio < 1.35:
-        score -= min(0.45, 0.55 * (1.35 - vol_ratio))
-    if abs(persistence_1 - persistence_0) < 0.05:
         score -= 0.12
-    score -= 0.08 * boundary_alpha
-    score -= 0.06 * boundary_nu
-    score -= 0.07 * near_transition_boundary
+    if abs(persistence_1 - persistence_0) < 0.05:
+        score -= 0.18
+    if persistence_1 < 0.75:
+        score -= min(0.30, 0.45 * (0.75 - persistence_1))
+    if params['p11'] < 0.70:
+        score -= min(0.25, 0.60 * (0.70 - params['p11']))
+    score -= 0.12 * boundary_alpha
+    score -= 0.09 * boundary_nu
+    score -= 0.10 * near_transition_boundary
     score = float(np.clip(score, 0.0, 1.0))
 
     return {
@@ -611,6 +617,7 @@ class MSGARCHOptimized:
         self.aic = None
         self.bic = None
         self._garch_warmstart = None
+        self.window_regime_state = "Intermediate Vol"
         
     def fit(self, returns, verbose=True, init_params=None):
         """
@@ -767,6 +774,16 @@ class MSGARCHOptimized:
         
         # Pre-compute constants (caching)
         returns_array = np.ascontiguousarray(returns)  # Ensure memory layout
+        window_state = getattr(self, "window_regime_state", "Intermediate Vol")
+        if window_state == "High Vol":
+            crisis_p11_floor = 0.80
+            crisis_tail_weight = 45.0
+        elif window_state == "Low Vol":
+            crisis_p11_floor = 0.62
+            crisis_tail_weight = 16.0
+        else:
+            crisis_p11_floor = 0.70
+            crisis_tail_weight = 28.0
         
         def neg_log_likelihood(params):
             """Optimized negative log-likelihood with JIT Hamilton filter."""
@@ -809,7 +826,7 @@ class MSGARCHOptimized:
                     return 1e10
                 
                 # Call JIT-compiled Hamilton filter
-                ll, _, _, _ = hamilton_filter_jit(
+                ll, f_probs_tmp, sig2_tmp, _ = hamilton_filter_jit(
                     returns_array, omega_0, alpha_0, beta_0, 
                     omega_1, alpha_1, beta_1,
                     mu_0, mu_1, p00, p11, nu_0, nu_1
@@ -839,11 +856,15 @@ class MSGARCHOptimized:
                 rel_var_gap = var_gap / var_scale
                 if rel_var_gap < 0.40:
                     penalty += 60 * (0.40 - rel_var_gap) ** 2
+                if rel_var_gap < 0.65:
+                    penalty += 90 * (0.65 - rel_var_gap) ** 2
                 
                 # 2. Degrees of Freedom Differentiation: Encourage different tail behavior
                 nu_ratio = max(nu_0 / nu_1, nu_1 / nu_0)
                 if nu_ratio < 1.3:
                     penalty += 10 * (1.3 - nu_ratio) ** 2
+                if nu_ratio < 1.6:
+                    penalty += 16 * (1.6 - nu_ratio) ** 2
                 
                 # 3. Stationarity Penalty: Discourage alpha+beta near 1
                 # More lenient for high-vol regime (alpha_1 + beta_1) to allow
@@ -874,6 +895,10 @@ class MSGARCHOptimized:
                     penalty += 150 * (persistence_1 - 0.98) ** 2
                 if persistence_1 > 0.99:
                     penalty += 800 * (persistence_1 - 0.99) ** 2
+
+                # Encourage clearer persistence separation across regimes
+                if abs(persistence_1 - persistence_0) < 0.08:
+                    penalty += 20 * (0.08 - abs(persistence_1 - persistence_0)) ** 2
                 
                 # 4. Alpha differentiation: high-vol regime should react more to shocks
                 alpha_ratio = max(alpha_1 / max(alpha_0, 0.001), alpha_0 / max(alpha_1, 0.001))
@@ -890,8 +915,19 @@ class MSGARCHOptimized:
                         penalty += 0.25 * (nu - (NU_OPTIMIZER_UPPER_BOUND - 0.5)) ** 2
 
                 # 6. Avoid non-persistent high-vol regime unless data strongly favors it
-                if p11 < 0.58:
-                    penalty += 12 * (0.58 - p11) ** 2
+                if p11 < crisis_p11_floor:
+                    penalty += 30 * (crisis_p11_floor - p11) ** 2
+
+                # 7. Crisis-weighted fit: penalize underestimation in tail observations
+                sigma_mix = np.sqrt(np.maximum(f_probs_tmp[:, 0] * sig2_tmp[:, 0] + f_probs_tmp[:, 1] * sig2_tmp[:, 1], 1e-10))
+                mu_mix = f_probs_tmp[:, 0] * mu_0 + f_probs_tmp[:, 1] * mu_1
+                abs_resid = np.abs(returns_array - mu_mix)
+                q90 = np.quantile(abs_resid, 0.90)
+                tail_mask = abs_resid >= q90
+                if np.any(tail_mask):
+                    tail_excess = np.maximum(abs_resid[tail_mask] - 2.25 * sigma_mix[tail_mask], 0.0)
+                    tail_scale = np.maximum(sigma_mix[tail_mask], 1e-6)
+                    penalty += crisis_tail_weight * np.mean((tail_excess / tail_scale) ** 2)
                 
                 return -ll + penalty
                 
@@ -1605,6 +1641,7 @@ def run_ms_garch_estimation_optimized(data_df,
                 
                 # Initialize and fit OPTIMIZED MS-GARCH
                 model = MSGARCHOptimized()
+                model.window_regime_state = window_regime_state
                 
                 # Use warm start from previous window (with periodic fresh starts)
                 # last_params_firm contains SCALED parameters from the previous iteration
