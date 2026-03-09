@@ -1,0 +1,1864 @@
+"""
+OPTIMIZED MS-GARCH(1,1) Model Implementation with Student's t Distribution
+============================================================================
+
+Optimizations implemented:
+1. GARCH(1,1) warm start - Uses arch package for initial parameter estimates
+2. Vectorized Hamilton filter - Numba JIT compiled for speed
+3. Caching intermediate results - Pre-computed constants and arrays
+4. Better optimizer settings - L-BFGS-B with optimized tolerances
+5. Improved numerical stability - Log-space calculations
+
+Expected speedup: 5-15x faster than original implementation
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.special import expit
+from numba import njit
+import math
+import warnings
+warnings.filterwarnings('ignore')
+
+# Numerical safety bounds (consistent with GARCH and Regime Switching models)
+NU_LOWER_BOUND = 2.1
+NU_WARM_START_UPPER_BOUND = 50.0    # Cap warm start ν (>30 is essentially Gaussian)
+NU_OPTIMIZER_UPPER_BOUND = 50.0     # Hard cap: keep tails meaningful
+INITIAL_VARIANCE_UPPER_BOUND = 1e5
+
+# Economically meaningful bounds for GARCH parameters
+# Alpha: ARCH effect - must be positive for GARCH to capture volatility clustering
+ALPHA_LOWER = 0.01    # Meaningful ARCH effect (0.001 lets alpha collapse to zero)
+ALPHA_UPPER = 0.50    # Tightened: above this, GARCH is near-IGARCH with any reasonable beta
+# Beta: GARCH persistence — financial volatility is well-documented as highly persistent
+BETA_LOWER = 0.30     # CRITICAL FIX: 0.01 allowed collapsed GARCH (no vol memory), which is
+                       # economically meaningless. Beta < 0.3 implies a half-life of ~1 day.
+BETA_UPPER = 0.995    # Near unit root
+# Transition probabilities: must imply meaningful regime persistence
+P_LOWER = 0.50        # Below 0.5, regime has negative autocorrelation (economically meaningless)
+P_UPPER = 0.995       # Near-absorbing state
+# Minimum persistence (alpha + beta) — prevents GARCH from collapsing to white noise
+PERSISTENCE_LOWER = 0.60  # Below this, GARCH has no meaningful volatility clustering
+# Maximum persistence (alpha + beta) — prevents unconditional variance from exploding
+PERSISTENCE_UPPER = 0.995  # Above this, ω/(1-α-β) produces unrealistically high uncond vol
+
+# Mu bounds (daily mean return in SCALED space, i.e. returns × 100)
+# ±5 in scaled space ≈ ±5% daily return — already extremely generous
+MU_LOWER = -5.0
+MU_UPPER =  5.0
+
+# Omega bounds: exp(x) is clamped so omega stays in [OMEGA_FLOOR, OMEGA_CEIL]
+# These are in SCALED space (returns × 100)
+OMEGA_FLOOR = 1e-12   # Minimum variance intercept
+OMEGA_CEIL  = 50.0    # Maximum variance intercept (≈ 7% daily vol floor per regime)
+
+# Warm start perturbation settings
+WARM_START_PERTURBATION_SCALE = 0.08    # Std dev of perturbation in unconstrained space
+FRESH_START_EVERY_N = 6                 # Every N windows, do a fresh GARCH-based start
+
+# Adaptive rolling-window settings
+ADAPTIVE_WINDOW_LOW_VOL = 378           # ~18 months in calm periods
+ADAPTIVE_WINDOW_MID_VOL = 252           # ~12 months baseline
+ADAPTIVE_WINDOW_HIGH_VOL = 126          # ~6 months in turbulent periods
+ADAPTIVE_VOL_LOOKBACK = 63              # ~1 quarter
+
+# Confidence / blending settings
+MSGARCH_CONFIDENCE_THRESHOLD = 0.72
+MSGARCH_MAX_BLEND_WEIGHT = 0.85
+
+# Estimation scope
+MIN_ESTIMATION_DATE = pd.Timestamp("2017-01-01")
+
+# Try to import arch for GARCH warm start
+try:
+    from arch import arch_model
+    HAS_ARCH = True
+except ImportError:
+    HAS_ARCH = False
+    print("Warning: arch package not installed. GARCH warm start disabled.")
+
+
+# =============================================================================
+# NUMBA JIT-COMPILED HELPER FUNCTIONS
+# =============================================================================
+
+@njit(cache=True)
+def _numba_gammaln(x):
+    """
+    Numba-compatible log-gamma function using Lanczos approximation.
+    Accurate to ~15 decimal places.
+    """
+    # Lanczos coefficients
+    g = 7
+    c = np.array([
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7
+    ])
+    
+    if x < 0.5:
+        # Reflection formula
+        return np.log(np.pi / np.sin(np.pi * x)) - _numba_gammaln(1 - x)
+    
+    x = x - 1
+    a = c[0]
+    for i in range(1, g + 2):
+        a += c[i] / (x + i)
+    
+    t = x + g + 0.5
+    return 0.5 * np.log(2 * np.pi) + (x + 0.5) * np.log(t) - t + np.log(a)
+
+
+# =============================================================================
+# NUMBA JIT-COMPILED HAMILTON FILTER (MAJOR SPEEDUP)
+# =============================================================================
+
+@njit(cache=True)
+def _t_log_likelihood(x, nu, sigma2):
+    """
+    Compute log-likelihood of t-distribution (Numba JIT compiled).
+    
+    Parameters:
+    -----------
+    x : float
+        Standardized residual
+    nu : float
+        Degrees of freedom
+    sigma2 : float
+        Variance
+        
+    Returns:
+    --------
+    float : Log-likelihood value
+    """
+    if sigma2 <= 0 or nu <= 2.1:
+        return -1e10
+    
+    # Log-likelihood of standardized t-distribution
+    # Using Numba-compatible gammaln for numerical stability
+    const = _numba_gammaln((nu + 1) / 2) - _numba_gammaln(nu / 2) - 0.5 * np.log((nu - 2) * np.pi * sigma2)
+    kernel = -((nu + 1) / 2) * np.log(1 + x**2 / ((nu - 2) * sigma2))
+    
+    return const + kernel
+
+
+@njit(cache=True)
+def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, beta_1,
+                        mu_0, mu_1, p00, p11, nu_0, nu_1):
+    """
+    Numba JIT-compiled Hamilton filter for MS-GARCH with t-distribution.
+    
+    Uses the Gray (1996) / Klaassen (2002) approach:
+    - Regime-specific demeaned residuals: eps_i = r - mu_i
+    - Probability-weighted "collapsed" variance for each regime to avoid
+      path-dependence explosion (2^T paths).
+    - This gives much sharper regime identification because each regime's
+      GARCH process sees shocks relative to its OWN mean, and the variance
+      paths are weighted by the filtered regime probabilities.
+    
+    Parameters:
+    -----------
+    returns : np.ndarray
+        Return series
+    omega_0, alpha_0, beta_0 : float
+        GARCH parameters for regime 0
+    omega_1, alpha_1, beta_1 : float
+        GARCH parameters for regime 1
+    mu_0, mu_1 : float
+        Mean returns for each regime
+    p00, p11 : float
+        Transition probabilities (staying in same regime)
+    nu_0, nu_1 : float
+        Degrees of freedom for t-distribution in each regime
+        
+    Returns:
+    --------
+    float : Log-likelihood value
+    np.ndarray : Filtered probabilities
+    np.ndarray : Conditional variances
+    np.ndarray : Predicted probabilities (for Kim smoother)
+    """
+    T = len(returns)
+    
+    # Pre-allocate arrays (caching optimization)
+    filtered_prob = np.zeros((T, 2))
+    predicted_prob = np.zeros((T, 2))
+    sigma2 = np.zeros((T, 2))
+    log_likelihood = 0.0
+    
+    # Transition matrix
+    P = np.array([[p00, 1 - p00], 
+                  [1 - p11, p11]])
+    
+    # Stationary distribution as initial probability
+    denom = (2 - p00 - p11)
+    if abs(denom) < 1e-10:
+        pi_stat = np.array([0.5, 0.5])
+    else:
+        pi_stat = np.array([(1 - p11) / denom, (1 - p00) / denom])
+    
+    # Initial variance (unconditional variance per regime)
+    sigma2_0_uncond = omega_0 / max(1 - alpha_0 - beta_0, 0.01)
+    sigma2_1_uncond = omega_1 / max(1 - alpha_1 - beta_1, 0.01)
+    
+    # Bound initial variances
+    sigma2_0_uncond = min(max(sigma2_0_uncond, 1e-8), INITIAL_VARIANCE_UPPER_BOUND)
+    sigma2_1_uncond = min(max(sigma2_1_uncond, 1e-8), INITIAL_VARIANCE_UPPER_BOUND)
+    
+    # Initialize collapsed variances (Gray/Klaassen approach)
+    prev_h_0 = sigma2_0_uncond
+    prev_h_1 = sigma2_1_uncond
+    
+    prev_filtered = pi_stat.copy()
+    
+    for t in range(T):
+        r = returns[t]
+        
+        # ==================================================================
+        # GARCH variance update using Gray (1996) / Klaassen (2002) collapse
+        # ==================================================================
+        if t == 0:
+            curr_sigma2_0 = sigma2_0_uncond
+            curr_sigma2_1 = sigma2_1_uncond
+        else:
+            # Regime-specific demeaned residuals from previous period
+            eps_0_prev = returns[t-1] - mu_0
+            eps_1_prev = returns[t-1] - mu_1
+            
+            # Standard GARCH update with regime-specific residuals
+            # h_{i,t} = omega_i + alpha_i * eps_{i,t-1}^2 + beta_i * h_{i,t-1}
+            # where h_{i,t-1} is the "collapsed" variance for regime i
+            curr_sigma2_0 = omega_0 + alpha_0 * eps_0_prev**2 + beta_0 * prev_h_0
+            curr_sigma2_1 = omega_1 + alpha_1 * eps_1_prev**2 + beta_1 * prev_h_1
+        
+        # Floor for numerical stability
+        curr_sigma2_0 = max(curr_sigma2_0, 1e-12)
+        curr_sigma2_1 = max(curr_sigma2_1, 1e-12)
+        
+        sigma2[t, 0] = curr_sigma2_0
+        sigma2[t, 1] = curr_sigma2_1
+        
+        # Compute t-distribution likelihoods for each regime
+        eps_0 = r - mu_0
+        eps_1 = r - mu_1
+        
+        ll_0 = _t_log_likelihood(eps_0, nu_0, curr_sigma2_0)
+        ll_1 = _t_log_likelihood(eps_1, nu_1, curr_sigma2_1)
+        
+        # Convert to likelihoods using log-sum-exp trick for numerical stability
+        max_ll = max(ll_0, ll_1)
+        if max_ll < -500:
+            lik_0 = 1e-200
+            lik_1 = 1e-200
+        else:
+            lik_0 = np.exp(ll_0 - max_ll)
+            lik_1 = np.exp(ll_1 - max_ll)
+        
+        # Predicted probabilities (Hamilton filter prediction step)
+        pred_prob = P.T @ prev_filtered
+        predicted_prob[t, :] = pred_prob
+        
+        # Joint probability
+        joint_0 = lik_0 * pred_prob[0]
+        joint_1 = lik_1 * pred_prob[1]
+        
+        # Marginal likelihood
+        marginal = joint_0 + joint_1
+        
+        if marginal < 1e-300:
+            marginal = 1e-300
+        
+        # Update filtered probabilities
+        filtered_prob[t, 0] = joint_0 / marginal
+        filtered_prob[t, 1] = joint_1 / marginal
+        
+        # Accumulate log-likelihood (add back max_ll for correct scaling)
+        log_likelihood += np.log(marginal) + max_ll
+        
+        # ==================================================================
+        # Klaassen (2002) variance collapse: weight the regime variances by
+        # the filtered probability of BEING in that regime, conditional on
+        # transitioning to regime j. This prevents the 2^T path explosion.
+        # 
+        # h_collapsed_{j,t} = sum_i P(S_{t}=i | S_{t+1}=j, Y_t) * 
+        #                      [h_{i,t} + (mu_i - mu_j)^2]
+        # where the conditional weights come from Bayes' rule.
+        # ==================================================================
+        filt_0 = filtered_prob[t, 0]
+        filt_1 = filtered_prob[t, 1]
+        
+        # P(S_t=i | S_{t+1}=j, Y_t) = P(S_{t+1}=j | S_t=i) * P(S_t=i | Y_t) / P(S_{t+1}=j | Y_t)
+        # Predicted prob for next step (for collapse weights)
+        pred_next_0 = P[0, 0] * filt_0 + P[1, 0] * filt_1  # P(S_{t+1}=0 | Y_t)
+        pred_next_1 = P[0, 1] * filt_0 + P[1, 1] * filt_1  # P(S_{t+1}=1 | Y_t)
+        
+        # Collapse into regime 0 for next period
+        if pred_next_0 > 1e-100:
+            w_00 = P[0, 0] * filt_0 / pred_next_0  # P(S_t=0 | S_{t+1}=0, Y_t)
+            w_10 = P[1, 0] * filt_1 / pred_next_0  # P(S_t=1 | S_{t+1}=0, Y_t)
+        else:
+            w_00 = 0.5
+            w_10 = 0.5
+        
+        # Collapse into regime 1 for next period  
+        if pred_next_1 > 1e-100:
+            w_01 = P[0, 1] * filt_0 / pred_next_1  # P(S_t=0 | S_{t+1}=1, Y_t)
+            w_11 = P[1, 1] * filt_1 / pred_next_1  # P(S_t=1 | S_{t+1}=1, Y_t)
+        else:
+            w_01 = 0.5
+            w_11 = 0.5
+        
+        # Collapsed variance for regime 0: weighted average of current variances
+        # + adjustment for mean difference (Jensen's inequality correction)
+        prev_h_0 = (w_00 * (curr_sigma2_0 + (mu_0 - mu_0)**2) +
+                     w_10 * (curr_sigma2_1 + (mu_1 - mu_0)**2))
+        
+        # Collapsed variance for regime 1
+        prev_h_1 = (w_01 * (curr_sigma2_0 + (mu_0 - mu_1)**2) +
+                     w_11 * (curr_sigma2_1 + (mu_1 - mu_1)**2))
+        
+        # Floor collapsed variances
+        prev_h_0 = max(prev_h_0, 1e-12)
+        prev_h_1 = max(prev_h_1, 1e-12)
+        
+        # Update for next iteration
+        prev_filtered = filtered_prob[t, :]
+    
+    return log_likelihood, filtered_prob, sigma2, predicted_prob
+
+
+@njit(cache=True)
+def kim_smoother_jit(filtered_prob, predicted_prob, p00, p11):
+    """
+    Kim Smoother (backward pass) for MS-GARCH.
+    Produces smoothed probabilities P(S_t = i | Y_T) that are much sharper
+    than filtered probabilities, especially for identifying regime changes.
+    """
+    T = filtered_prob.shape[0]
+    smoothed_prob = np.zeros((T, 2))
+    
+    # Initialize with last filtered probability
+    smoothed_prob[T-1, :] = filtered_prob[T-1, :]
+    
+    P = np.array([[p00, 1 - p00], [1 - p11, p11]])
+    
+    # Backward recursion
+    for t in range(T - 2, -1, -1):
+        for i in range(2):
+            sum_val = 0.0
+            for j in range(2):
+                denom = predicted_prob[t+1, j]
+                if denom < 1e-100:
+                    denom = 1e-100
+                sum_val += P[i, j] * smoothed_prob[t+1, j] / denom
+            smoothed_prob[t, i] = filtered_prob[t, i] * sum_val
+    
+    return smoothed_prob
+
+
+# =============================================================================
+# GARCH WARM START (FAST INITIAL PARAMETER ESTIMATION)
+# =============================================================================
+
+def get_garch_warm_start(returns):
+    """
+    Get initial parameter estimates from standard GARCH(1,1) with t-distribution.
+    
+    This provides much better starting values for the MS-GARCH optimizer,
+    reducing convergence time by 30-50%.
+    
+    Parameters:
+    -----------
+    returns : np.ndarray
+        Return series
+        
+    Returns:
+    --------
+    dict : Initial parameter estimates
+    """
+    if not HAS_ARCH:
+        # Fallback to simple estimates
+        var_ret = np.var(returns)
+        return {
+            'omega': var_ret * 0.05,
+            'alpha': 0.08,
+            'beta': 0.85,
+            'nu': 8.0,
+            'mu': np.mean(returns)
+        }
+
+    try:
+        # Scale returns for better numerical stability
+        scale = np.std(returns) * 100
+        returns_scaled = returns / scale * 100
+
+        # Fit GARCH(1,1) with t-distribution
+        model = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='t', mean='Constant')
+        result = model.fit(disp='off', show_warning=False)
+
+        # Extract and rescale parameters
+        omega = result.params['omega'] / (100**2) * (scale**2)
+        alpha = result.params['alpha[1]']
+        beta = result.params['beta[1]']
+        mu = result.params['mu'] / 100 * scale
+        nu = result.params.get('nu', 8.0)
+
+        # Bound parameters
+        omega = max(omega, 1e-10)
+        alpha = min(max(alpha, ALPHA_LOWER), ALPHA_UPPER)
+        beta = min(max(beta, BETA_LOWER), BETA_UPPER)
+        # Enforce minimum persistence
+        if alpha + beta < PERSISTENCE_LOWER:
+            beta = max(PERSISTENCE_LOWER - alpha, BETA_LOWER)
+        # Enforce maximum persistence
+        if alpha + beta >= PERSISTENCE_UPPER:
+            beta = max(PERSISTENCE_UPPER - alpha, BETA_LOWER)
+        nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
+
+        return {
+            'omega': omega,
+            'alpha': alpha,
+            'beta': beta,
+            'nu': nu,
+            'mu': mu
+        }
+
+    except Exception:
+        # Fallback
+        var_ret = np.var(returns)
+        return {
+            'omega': var_ret * 0.05,
+            'alpha': 0.08,
+            'beta': 0.85,
+            'nu': 8.0,
+            'mu': np.mean(returns)
+        }
+
+
+def _build_two_regime_from_garch(garch_params):
+    """Construct a two-regime parameter set from single-regime GARCH estimates."""
+    omega_g = garch_params['omega']
+    alpha_g = garch_params['alpha']
+    beta_g = garch_params['beta']
+    mu_g = garch_params['mu']
+    nu_g = garch_params['nu']
+
+    out = {
+        'omega_0': omega_g * 0.5,
+        'alpha_0': max(alpha_g * 0.6, ALPHA_LOWER),
+        'beta_0': min(beta_g * 1.02, BETA_UPPER),
+        'omega_1': omega_g * 2.0,
+        'alpha_1': min(alpha_g * 1.5, ALPHA_UPPER),
+        'beta_1': max(beta_g * 0.90, BETA_LOWER),
+        'mu_0': mu_g,
+        'mu_1': mu_g,
+        'p00': 0.95,
+        'p11': 0.90,
+        'nu_0': min(nu_g * 1.5, NU_OPTIMIZER_UPPER_BOUND),
+        'nu_1': max(nu_g * 0.6, NU_LOWER_BOUND),
+    }
+
+    for sfx in ('0', '1'):
+        a = out[f'alpha_{sfx}']
+        b = out[f'beta_{sfx}']
+        if a + b >= PERSISTENCE_UPPER:
+            out[f'beta_{sfx}'] = max(PERSISTENCE_UPPER - a, BETA_LOWER)
+        if a + b < PERSISTENCE_LOWER:
+            out[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
+
+    return out
+
+
+def _compute_msgarch_diagnostics(params):
+    """Compute diagnostics and a confidence score for regime quality."""
+    eps = 1e-10
+    persistence_0 = params['alpha_0'] + params['beta_0']
+    persistence_1 = params['alpha_1'] + params['beta_1']
+    uncond_var_0 = params['omega_0'] / max(1 - persistence_0, 1e-3)
+    uncond_var_1 = params['omega_1'] / max(1 - persistence_1, 1e-3)
+    vol_ratio = np.sqrt(max(uncond_var_1, eps) / max(uncond_var_0, eps))
+    vol_ratio = max(vol_ratio, 1.0 / max(vol_ratio, eps))
+
+    boundary_alpha = int(abs(params['alpha_0'] - ALPHA_LOWER) < 5e-4) + int(abs(params['alpha_1'] - ALPHA_LOWER) < 5e-4)
+    boundary_nu = int(params['nu_0'] > NU_OPTIMIZER_UPPER_BOUND - 0.1) + int(params['nu_1'] > NU_OPTIMIZER_UPPER_BOUND - 0.1)
+    near_transition_boundary = int(params['p00'] < 0.53 or params['p00'] > 0.99) + int(params['p11'] < 0.53 or params['p11'] > 0.99)
+
+    score = 1.0
+    if vol_ratio < 1.60:
+        score -= min(0.55, 0.70 * (1.60 - vol_ratio))
+    if vol_ratio < 1.35:
+        score -= 0.12
+    if abs(persistence_1 - persistence_0) < 0.05:
+        score -= 0.18
+    if persistence_1 < 0.75:
+        score -= min(0.30, 0.45 * (0.75 - persistence_1))
+    if params['p11'] < 0.70:
+        score -= min(0.25, 0.60 * (0.70 - params['p11']))
+    score -= 0.12 * boundary_alpha
+    score -= 0.09 * boundary_nu
+    score -= 0.10 * near_transition_boundary
+    score = float(np.clip(score, 0.0, 1.0))
+
+    return {
+        'msgarch_confidence_score': score,
+        'msgarch_vol_ratio': float(vol_ratio),
+        'msgarch_persistence_0': float(persistence_0),
+        'msgarch_persistence_1': float(persistence_1),
+        'msgarch_alpha_boundary_hits': int(boundary_alpha),
+        'msgarch_nu_boundary_hits': int(boundary_nu),
+        'msgarch_transition_boundary_hits': int(near_transition_boundary),
+    }
+
+
+def _blend_params(primary, fallback, blend_weight):
+    """Blend parameter dictionaries while preserving constraints."""
+    w = float(np.clip(blend_weight, 0.0, 1.0))
+    p = {}
+    for key in ['omega_0', 'alpha_0', 'beta_0', 'omega_1', 'alpha_1', 'beta_1', 'mu_0', 'mu_1', 'p00', 'p11', 'nu_0', 'nu_1']:
+        p[key] = (1.0 - w) * primary[key] + w * fallback[key]
+
+    p['alpha_0'] = float(np.clip(p['alpha_0'], ALPHA_LOWER, ALPHA_UPPER))
+    p['alpha_1'] = float(np.clip(p['alpha_1'], ALPHA_LOWER, ALPHA_UPPER))
+    p['beta_0'] = float(np.clip(p['beta_0'], BETA_LOWER, BETA_UPPER))
+    p['beta_1'] = float(np.clip(p['beta_1'], BETA_LOWER, BETA_UPPER))
+    p['p00'] = float(np.clip(p['p00'], P_LOWER, P_UPPER))
+    p['p11'] = float(np.clip(p['p11'], P_LOWER, P_UPPER))
+    p['nu_0'] = float(np.clip(p['nu_0'], NU_LOWER_BOUND, NU_OPTIMIZER_UPPER_BOUND))
+    p['nu_1'] = float(np.clip(p['nu_1'], NU_LOWER_BOUND, NU_OPTIMIZER_UPPER_BOUND))
+
+    for sfx in ('0', '1'):
+        a = p[f'alpha_{sfx}']
+        b = p[f'beta_{sfx}']
+        if a + b >= PERSISTENCE_UPPER:
+            p[f'beta_{sfx}'] = max(PERSISTENCE_UPPER - a, BETA_LOWER)
+        if a + b < PERSISTENCE_LOWER:
+            p[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
+
+    return p
+    
+    try:
+        # Scale returns for better numerical stability
+        scale = np.std(returns) * 100
+        returns_scaled = returns / scale * 100
+        
+        # Fit GARCH(1,1) with t-distribution
+        model = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='t', mean='Constant')
+        result = model.fit(disp='off', show_warning=False)
+        
+        # Extract and rescale parameters
+        omega = result.params['omega'] / (100**2) * (scale**2)
+        alpha = result.params['alpha[1]']
+        beta = result.params['beta[1]']
+        mu = result.params['mu'] / 100 * scale
+        nu = result.params.get('nu', 8.0)
+        
+        # Bound parameters
+        omega = max(omega, 1e-10)
+        alpha = min(max(alpha, ALPHA_LOWER), ALPHA_UPPER)
+        beta = min(max(beta, BETA_LOWER), BETA_UPPER)
+        # Enforce minimum persistence
+        if alpha + beta < PERSISTENCE_LOWER:
+            beta = max(PERSISTENCE_LOWER - alpha, BETA_LOWER)
+        # Enforce maximum persistence
+        if alpha + beta >= PERSISTENCE_UPPER:
+            beta = max(PERSISTENCE_UPPER - alpha, BETA_LOWER)
+        nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
+        
+        return {
+            'omega': omega,
+            'alpha': alpha,
+            'beta': beta,
+            'nu': nu,
+            'mu': mu
+        }
+        
+    except Exception:
+        # Fallback
+        var_ret = np.var(returns)
+        return {
+            'omega': var_ret * 0.05,
+            'alpha': 0.08,
+            'beta': 0.85,
+            'nu': 8.0,
+            'mu': np.mean(returns)
+        }
+
+
+# =============================================================================
+# OPTIMIZED MS-GARCH CLASS
+# =============================================================================
+
+class MSGARCHOptimized:
+    """
+    Optimized Markov-Switching GARCH(1,1) model with t-distributed innovations.
+    
+    Optimizations:
+    - GARCH(1,1) warm start for initial parameters
+    - Numba JIT-compiled Hamilton filter
+    - Cached intermediate results
+    - Better optimizer settings
+    - Improved numerical stability
+    """
+    
+    def __init__(self, n_regimes=2):
+        self.n_regimes = n_regimes
+        self.params = None
+        self.filtered_probs = None
+        self.returns = None
+        self.conditional_vol = None
+        self.log_likelihood = None
+        self.aic = None
+        self.bic = None
+        self._garch_warmstart = None
+        self.window_regime_state = "Intermediate Vol"
+        
+    def fit(self, returns, verbose=True, init_params=None):
+        """
+        Fit the MS-GARCH model using optimized MLE.
+        
+        Parameters:
+        -----------
+        returns : np.ndarray
+            Array of returns
+        verbose : bool
+            Whether to print fitting progress
+        init_params : dict, optional
+            Parameters from previous estimation to use as starting values (warm start)
+            
+        Returns:
+        --------
+        dict : Estimated parameters
+        """
+        self.returns = np.asarray(returns).flatten()
+        self.init_params = init_params
+        
+        # Remove NaN and infinite values
+        valid_mask = np.isfinite(self.returns)
+        if not np.all(valid_mask):
+            if verbose:
+                print(f"  Removing {np.sum(~valid_mask)} non-finite values")
+            self.returns = self.returns[valid_mask]
+        
+        if len(self.returns) < 50:
+            raise ValueError("Insufficient data points for MS-GARCH estimation")
+        
+        return self._fit_mle_optimized(verbose)
+    
+    def _fit_mle_optimized(self, verbose=True):
+        """
+        Optimized MLE fitting with all speedup techniques.
+        """
+        returns = self.returns
+        T = len(returns)
+        var_ret = np.var(returns)
+        
+        if verbose:
+            print("  Fitting OPTIMIZED MS-GARCH with t-distribution...")
+        
+        # =====================================================================
+        # OPTIMIZATION 1: GARCH Warm Start (OR Rolling Warm Start)
+        # =====================================================================
+        
+        x0 = None
+        x0_perturbed = None  # Will be set if warm start is used
+        
+        # 1A. ROLLING WARM START (Fastest) — with perturbation to avoid stickiness
+        if self.init_params is not None:
+            if verbose:
+                print("    → Using parameters from previous window (Rolling Warm Start + perturbation)...")
+            try:
+                p = self.init_params
+                # Transform constrained parameters back to unconstrained space for optimizer
+                
+                x0 = np.array([
+                    self._omega_to_unconstrained(p['omega_0']),
+                    self._alpha_to_unconstrained(p['alpha_0']),
+                    self._beta_to_unconstrained(p['beta_0']),
+                    self._omega_to_unconstrained(p['omega_1']),
+                    self._alpha_to_unconstrained(p['alpha_1']),
+                    self._beta_to_unconstrained(p['beta_1']),
+                    self._mu_to_unconstrained(p['mu_0']),
+                    self._mu_to_unconstrained(p['mu_1']),
+                    self._p_to_unconstrained(p['p00']),
+                    self._p_to_unconstrained(p['p11']),
+                    self._nu_to_unconstrained(p['nu_0']),
+                    self._nu_to_unconstrained(p['nu_1'])
+                ])
+                
+                # CRITICAL FIX: Add random perturbation to break out of sticky optima
+                # Without this, L-BFGS-B converges immediately at the warm-start point
+                # because ~92% of data overlaps between consecutive 252-day windows,
+                # making the gradient at the old optimum nearly zero.
+                rng = np.random.RandomState(hash(str(returns[:5])) % (2**31))
+                perturbation = rng.normal(0, WARM_START_PERTURBATION_SCALE, size=len(x0))
+                # Don't perturb mu (indices 6,7) as strongly — it's in return-scale
+                perturbation[6] *= 0.3
+                perturbation[7] *= 0.3
+                x0_perturbed = x0 + perturbation
+                
+            except Exception as e:
+                if verbose:
+                    print(f"    ! Warm start transformation failed: {e}. Falling back to GARCH init.")
+                x0 = None
+                x0_perturbed = None
+
+        # 1B. GARCH WARM START (Fallback or First Run)
+        if x0 is None:
+            if verbose:
+                print("    → Getting GARCH(1,1) warm start parameters...")
+            
+            garch_params = get_garch_warm_start(returns)
+            self._garch_warmstart = garch_params
+            
+            if verbose:
+                print(f"    → Warm start: omega={garch_params['omega']:.2e}, "
+                      f"alpha={garch_params['alpha']:.3f}, beta={garch_params['beta']:.3f}, "
+                      f"nu={garch_params['nu']:.1f}")
+            
+            # Use GARCH estimates for both regimes, with adjustments
+            omega_base = garch_params['omega']
+            alpha_base = garch_params['alpha']
+            beta_base = garch_params['beta']
+            nu_base = garch_params['nu']
+            mu_base = garch_params['mu']
+            
+            # IMPROVED: Create more distinct initial regimes
+            # CONVENTION: Regime 0 = LOW volatility, Regime 1 = HIGH volatility
+            omega_0_init = omega_base * 0.4  
+            omega_1_init = omega_base * 2.5 
+            
+            alpha_0_init = max(alpha_base * 0.5, 0.02)
+            alpha_1_init = min(alpha_base * 1.8, 0.25)
+            beta_0_init = min(beta_base * 1.05, 0.97)
+            beta_1_init = max(beta_base * 0.85, 0.55)
+            
+            mu_0_init = mu_base + 0.0002 
+            mu_1_init = mu_base - 0.0003 
+            
+            nu_0_init = max(min(nu_base * 2.0, NU_WARM_START_UPPER_BOUND), 3.0)
+            nu_1_init = max(min(nu_base * 0.4, NU_WARM_START_UPPER_BOUND), NU_LOWER_BOUND)
+            
+            p00_init_logit = self._p_to_unconstrained(0.92)  # p00 ~ 0.92
+            p11_init_logit = self._p_to_unconstrained(0.92)  # p11 ~ 0.92
+            
+            # Transform initial values for unconstrained optimization
+            x0 = np.array([
+                self._omega_to_unconstrained(omega_0_init),
+                self._alpha_to_unconstrained(alpha_0_init),
+                self._beta_to_unconstrained(beta_0_init),
+                self._omega_to_unconstrained(omega_1_init),
+                self._alpha_to_unconstrained(alpha_1_init),
+                self._beta_to_unconstrained(beta_1_init),
+                self._mu_to_unconstrained(mu_0_init),
+                self._mu_to_unconstrained(mu_1_init),
+                p00_init_logit,
+                p11_init_logit,
+                self._nu_to_unconstrained(nu_0_init),
+                self._nu_to_unconstrained(nu_1_init)
+            ])
+            
+            if verbose:
+                print(f"    → Initial degrees of freedom: ν₀={nu_0_init:.1f} (low-vol), "
+                      f"ν₁={nu_1_init:.1f} (high-vol)")
+        
+        # =====================================================================
+        # OPTIMIZATION 3: Cached negative log-likelihood function
+        # =====================================================================
+        
+        # Pre-compute constants (caching)
+        returns_array = np.ascontiguousarray(returns)  # Ensure memory layout
+        window_state = getattr(self, "window_regime_state", "Intermediate Vol")
+        if window_state == "High Vol":
+            crisis_p11_floor = 0.80
+            crisis_tail_weight = 45.0
+        elif window_state == "Low Vol":
+            crisis_p11_floor = 0.62
+            crisis_tail_weight = 16.0
+        else:
+            crisis_p11_floor = 0.70
+            crisis_tail_weight = 28.0
+        
+        def neg_log_likelihood(params):
+            """Optimized negative log-likelihood with JIT Hamilton filter."""
+            try:
+                # Transform parameters back to constrained space
+                omega_0 = self._unconstrained_to_omega(params[0])
+                alpha_0 = self._unconstrained_to_alpha(params[1])
+                beta_0 = self._unconstrained_to_beta(params[2])
+                
+                omega_1 = self._unconstrained_to_omega(params[3])
+                alpha_1 = self._unconstrained_to_alpha(params[4])
+                beta_1 = self._unconstrained_to_beta(params[5])
+                
+                # Enforce stationarity: alpha + beta < PERSISTENCE_UPPER
+                # Cap beta so that alpha + beta <= PERSISTENCE_UPPER
+                max_beta_0 = PERSISTENCE_UPPER - alpha_0
+                max_beta_1 = PERSISTENCE_UPPER - alpha_1
+                beta_0 = min(beta_0, max(max_beta_0, BETA_LOWER))
+                beta_1 = min(beta_1, max(max_beta_1, BETA_LOWER))
+                
+                # Enforce minimum persistence: alpha + beta >= PERSISTENCE_LOWER
+                # If persistence is too low, boost beta to the floor
+                if alpha_0 + beta_0 < PERSISTENCE_LOWER:
+                    beta_0 = max(beta_0, PERSISTENCE_LOWER - alpha_0)
+                if alpha_1 + beta_1 < PERSISTENCE_LOWER:
+                    beta_1 = max(beta_1, PERSISTENCE_LOWER - alpha_1)
+                
+                mu_0 = self._unconstrained_to_mu(params[6])
+                mu_1 = self._unconstrained_to_mu(params[7])
+                
+                # Bounded range for transition probabilities [P_LOWER, P_UPPER]
+                p00 = self._unconstrained_to_p(params[8])
+                p11 = self._unconstrained_to_p(params[9])
+                
+                nu_0 = self._unconstrained_to_nu(params[10])
+                nu_1 = self._unconstrained_to_nu(params[11])
+                
+                # Stationarity check (hard constraint)
+                if alpha_0 + beta_0 >= PERSISTENCE_UPPER or alpha_1 + beta_1 >= PERSISTENCE_UPPER:
+                    return 1e10
+                
+                # Call JIT-compiled Hamilton filter
+                ll, f_probs_tmp, sig2_tmp, _ = hamilton_filter_jit(
+                    returns_array, omega_0, alpha_0, beta_0, 
+                    omega_1, alpha_1, beta_1,
+                    mu_0, mu_1, p00, p11, nu_0, nu_1
+                )
+                
+                if np.isnan(ll) or np.isinf(ll):
+                    return 1e10
+                
+                # IMPROVED SOFT PENALTIES: Guide optimizer to economically meaningful solutions
+                penalty = 0.0
+                
+                # 1. Regime Differentiation Penalty: Encourage CLEARLY distinct regimes
+                # Calculate unconditional volatilities
+                uncond_vol_0 = np.sqrt(omega_0 / max(1 - alpha_0 - beta_0, 0.01))
+                uncond_vol_1 = np.sqrt(omega_1 / max(1 - alpha_1 - beta_1, 0.01))
+                vol_ratio = max(uncond_vol_1 / uncond_vol_0, uncond_vol_0 / uncond_vol_1)
+                
+                # Stronger penalty: regimes should differ by at least 1.5x in unconditional vol
+                if vol_ratio < 1.5:
+                    penalty += 50 * (1.5 - vol_ratio) ** 2
+
+                # Penalize small unconditional-variance gap directly (identification aid)
+                uncond_var_0 = omega_0 / max(1 - alpha_0 - beta_0, 0.01)
+                uncond_var_1 = omega_1 / max(1 - alpha_1 - beta_1, 0.01)
+                var_gap = abs(uncond_var_1 - uncond_var_0)
+                var_scale = max((uncond_var_1 + uncond_var_0) * 0.5, 1e-8)
+                rel_var_gap = var_gap / var_scale
+                if rel_var_gap < 0.40:
+                    penalty += 60 * (0.40 - rel_var_gap) ** 2
+                if rel_var_gap < 0.65:
+                    penalty += 90 * (0.65 - rel_var_gap) ** 2
+                
+                # 2. Degrees of Freedom Differentiation: Encourage different tail behavior
+                nu_ratio = max(nu_0 / nu_1, nu_1 / nu_0)
+                if nu_ratio < 1.3:
+                    penalty += 10 * (1.3 - nu_ratio) ** 2
+                if nu_ratio < 1.6:
+                    penalty += 16 * (1.6 - nu_ratio) ** 2
+                
+                # 3. Stationarity Penalty: Discourage alpha+beta near 1
+                # More lenient for high-vol regime (alpha_1 + beta_1) to allow
+                # volatile periods (like COVID) to produce very persistent vol dynamics
+                persistence_0 = alpha_0 + beta_0
+                persistence_1 = alpha_1 + beta_1
+                
+                # LOW persistence penalty: prevent GARCH collapse to white noise
+                # This is the CRITICAL fix for the inflated unconditional volatility problem.
+                # When persistence < ~0.7, the GARCH model loses meaningful volatility clustering
+                # and the unconditional variance ω/(1-α-β) becomes dominated by ω, producing
+                # unreasonably high unconditional volatility.
+                for persist in [persistence_0, persistence_1]:
+                    if persist < 0.70:
+                        penalty += 300 * (0.70 - persist) ** 2
+                    if persist < PERSISTENCE_LOWER:
+                        penalty += 800 * (PERSISTENCE_LOWER - persist) ** 2
+                
+                # HIGH persistence penalty (upper end)
+                # Both regimes: enforce PERSISTENCE_UPPER cap
+                if persistence_0 > 0.98:
+                    penalty += 200 * (persistence_0 - 0.98) ** 2
+                if persistence_0 > 0.99:
+                    penalty += 1000 * (persistence_0 - 0.99) ** 2
+                
+                # High-vol regime: slightly more lenient but still respect the cap
+                if persistence_1 > 0.98:
+                    penalty += 150 * (persistence_1 - 0.98) ** 2
+                if persistence_1 > 0.99:
+                    penalty += 800 * (persistence_1 - 0.99) ** 2
+
+                # Encourage clearer persistence separation across regimes
+                if abs(persistence_1 - persistence_0) < 0.08:
+                    penalty += 20 * (0.08 - abs(persistence_1 - persistence_0)) ** 2
+                
+                # 4. Alpha differentiation: high-vol regime should react more to shocks
+                alpha_ratio = max(alpha_1 / max(alpha_0, 0.001), alpha_0 / max(alpha_1, 0.001))
+                if alpha_ratio < 1.5:
+                    penalty += 15 * (1.5 - alpha_ratio) ** 2
+
+                # 5. Discourage boundary pile-up on alpha and nu (softly)
+                for a in (alpha_0, alpha_1):
+                    if a < ALPHA_LOWER + 0.005:
+                        penalty += 8 * (ALPHA_LOWER + 0.005 - a) ** 2
+
+                for nu in (nu_0, nu_1):
+                    if nu > NU_OPTIMIZER_UPPER_BOUND - 0.5:
+                        penalty += 0.25 * (nu - (NU_OPTIMIZER_UPPER_BOUND - 0.5)) ** 2
+
+                # 6. Avoid non-persistent high-vol regime unless data strongly favors it
+                if p11 < crisis_p11_floor:
+                    penalty += 30 * (crisis_p11_floor - p11) ** 2
+
+                # 7. Crisis-weighted fit: penalize underestimation in tail observations
+                sigma_mix = np.sqrt(np.maximum(f_probs_tmp[:, 0] * sig2_tmp[:, 0] + f_probs_tmp[:, 1] * sig2_tmp[:, 1], 1e-10))
+                mu_mix = f_probs_tmp[:, 0] * mu_0 + f_probs_tmp[:, 1] * mu_1
+                abs_resid = np.abs(returns_array - mu_mix)
+                q90 = np.quantile(abs_resid, 0.90)
+                tail_mask = abs_resid >= q90
+                if np.any(tail_mask):
+                    tail_excess = np.maximum(abs_resid[tail_mask] - 2.25 * sigma_mix[tail_mask], 0.0)
+                    tail_scale = np.maximum(sigma_mix[tail_mask], 1e-6)
+                    penalty += crisis_tail_weight * np.mean((tail_excess / tail_scale) ** 2)
+                
+                return -ll + penalty
+                
+            except Exception:
+                return 1e10
+        
+        # =====================================================================
+        # OPTIMIZATION 4: IMPROVED Multi-Start with Better Convergence
+        # =====================================================================
+        
+        if verbose:
+            print("    → Running IMPROVED optimization with multi-start and adaptive refinement...")
+        
+        # PHASE 1: Coarse optimization with multiple starting points
+        if verbose:
+            print("    → PHASE 1: Multi-start optimization...")
+        
+        # Starting point 1: Base initialization
+        # For warm starts: use ONLY the perturbed version to force re-exploration.
+        # Without perturbation, L-BFGS-B converges at the old optimum immediately
+        # due to ~92% data overlap between consecutive 252-day rolling windows.
+        if self.init_params is not None and x0_perturbed is not None:
+            candidates = [('Perturbed', x0_perturbed)]
+            
+            # Also add a data-driven fresh start for warm-start windows.
+            # This is critical for detecting regime shifts (e.g. COVID onset)
+            # that the previous window's parameters cannot capture via perturbation alone.
+            try:
+                garch_fresh = get_garch_warm_start(returns)
+                omega_f = garch_fresh['omega']
+                alpha_f = garch_fresh['alpha']
+                beta_f = garch_fresh['beta']
+                mu_f = garch_fresh['mu']
+                nu_f = garch_fresh['nu']
+                
+                x0_fresh = np.array([
+                    self._omega_to_unconstrained(omega_f * 0.3),
+                    self._alpha_to_unconstrained(max(alpha_f * 0.5, 0.02)),
+                    self._beta_to_unconstrained(min(beta_f * 1.05, 0.97)),
+                    self._omega_to_unconstrained(omega_f * 3.0),
+                    self._alpha_to_unconstrained(min(alpha_f * 2.0, 0.30)),
+                    self._beta_to_unconstrained(max(beta_f * 0.80, 0.50)),
+                    self._mu_to_unconstrained(mu_f + 0.0003),
+                    self._mu_to_unconstrained(mu_f - 0.0005),
+                    self._p_to_unconstrained(0.93),
+                    self._p_to_unconstrained(0.90),
+                    self._nu_to_unconstrained(max(min(nu_f * 2.0, 40.0), 3.0)),
+                    self._nu_to_unconstrained(max(min(nu_f * 0.4, 40.0), NU_LOWER_BOUND))
+                ])
+                candidates.append(('FreshFromData', x0_fresh))
+            except Exception:
+                pass  # If fresh start fails, just use perturbed
+        else:
+            candidates = [('Base', x0)]
+        
+        # Only add alternative starting points if we DON'T have a valid warm start
+        if self.init_params is None:
+             # Starting point 2: More extreme regime differentiation
+             x0_extreme = np.array([
+                 self._omega_to_unconstrained(omega_base * 0.2),  # Very low omega for calm regime
+                 self._alpha_to_unconstrained(0.02),     # Very low alpha
+                 self._beta_to_unconstrained(0.96),      # Very high beta (high persistence)
+                 self._omega_to_unconstrained(omega_base * 4.0),  # Very high omega for crisis regime
+                 self._alpha_to_unconstrained(0.25),     # High alpha (quick response)
+                 self._beta_to_unconstrained(0.60),      # Lower beta
+                 self._mu_to_unconstrained(mu_base + 0.0008),
+                 self._mu_to_unconstrained(mu_base - 0.0010),
+                 self._p_to_unconstrained(0.95),  # very persistent regime 0
+                 self._p_to_unconstrained(0.95),  # very persistent regime 1
+                 self._nu_to_unconstrained(30.0),  # Very HIGH df for low-vol regime
+                 self._nu_to_unconstrained(2.8)    # Very LOW df for high-vol regime
+             ])
+             candidates.append(('Extreme', x0_extreme))
+             
+             # Starting point 3: Moderate differentiation (between base and extreme)
+             x0_moderate = np.array([
+                 self._omega_to_unconstrained(omega_base * 0.5),
+                 self._alpha_to_unconstrained(0.04),
+                 self._beta_to_unconstrained(0.94),
+                 self._omega_to_unconstrained(omega_base * 2.0),
+                 self._alpha_to_unconstrained(0.15),
+                 self._beta_to_unconstrained(0.75),
+                 self._mu_to_unconstrained(mu_base + 0.0003),
+                 self._mu_to_unconstrained(mu_base - 0.0005),
+                 self._p_to_unconstrained(0.88),
+                 self._p_to_unconstrained(0.88),
+                 self._nu_to_unconstrained(18.0),
+                 self._nu_to_unconstrained(5.0)
+             ])
+             candidates.append(('Moderate', x0_moderate))
+             
+             # Starting point 4: Data-driven crisis detection
+             # Use rolling volatility to identify calm vs crisis sub-samples
+             try:
+                 window_size = min(20, len(returns) // 5)
+                 rolling_var = np.array([np.var(returns[max(0,i-window_size):i+1]) for i in range(len(returns))])
+                 vol_median = np.median(rolling_var)
+                 calm_mask = rolling_var <= vol_median
+                 crisis_mask = rolling_var > vol_median
+                 
+                 calm_var = np.var(returns[calm_mask]) if np.sum(calm_mask) > 10 else var_ret * 0.5
+                 crisis_var = np.var(returns[crisis_mask]) if np.sum(crisis_mask) > 10 else var_ret * 2.0
+                 calm_mean = np.mean(returns[calm_mask]) if np.sum(calm_mask) > 10 else mu_base
+                 crisis_mean = np.mean(returns[crisis_mask]) if np.sum(crisis_mask) > 10 else mu_base
+                 
+                 # Estimate GARCH params from each sub-sample heuristically
+                 omega_calm = calm_var * 0.05
+                 omega_crisis = crisis_var * 0.08
+                 
+                 x0_crisis = np.array([
+                     self._omega_to_unconstrained(omega_calm),
+                     self._alpha_to_unconstrained(0.03),
+                     self._beta_to_unconstrained(0.95),
+                     self._omega_to_unconstrained(omega_crisis),
+                     self._alpha_to_unconstrained(0.20),
+                     self._beta_to_unconstrained(0.70),
+                     self._mu_to_unconstrained(calm_mean),
+                     self._mu_to_unconstrained(crisis_mean),
+                     self._p_to_unconstrained(0.94),
+                     self._p_to_unconstrained(0.92),
+                     self._nu_to_unconstrained(25.0),
+                     self._nu_to_unconstrained(3.5)
+                 ])
+                 candidates.append(('DataDriven', x0_crisis))
+             except Exception:
+                 pass
+        
+        # Try all candidates with PHASE 1 settings (faster, less precise)
+        best_result = None
+        best_nll = 1e12
+        best_init_name = None
+        
+        for init_name, x0_candidate in candidates:
+            if verbose:
+                print(f"      → Trying {init_name} initialization...")
+            
+            # Use LOOSER tolerances for warm-start candidates to avoid premature convergence
+            # With ~92% data overlap, tight tolerances cause the optimizer to stop immediately
+            is_warm = (self.init_params is not None)
+            
+            try:
+                # Check for NaN/inf in starting point
+                if not np.all(np.isfinite(x0_candidate)):
+                    if verbose:
+                        print(f"        ⚠ Skipping {init_name}: non-finite starting values")
+                    continue
+                
+                result = minimize(
+                    neg_log_likelihood,
+                    x0_candidate,
+                    method='L-BFGS-B',
+                    options={
+                        'maxiter': 1500,
+                        'ftol': 1e-8 if is_warm else 1e-9,     # Looser for warm start
+                        'gtol': 1e-5 if is_warm else 1e-7,     # Much looser for warm start
+                        'maxfun': 3000,
+                        'maxls': 50,
+                        'disp': False
+                    }
+                )
+                
+                if np.isfinite(result.fun) and result.fun < best_nll:
+                    best_result = result
+                    best_nll = result.fun
+                    best_init_name = init_name
+                    if verbose:
+                        print(f"        ✓ New best: -LL = {best_nll:.2f}")
+            except Exception as e:
+                if verbose:
+                    print(f"        ⚠ {init_name} optimization failed: {e}")
+                continue
+        
+        # ── Guard: if every Phase-1 candidate failed, use GARCH fallback ──
+        # We NEVER skip a window. Instead, construct reasonable two-regime
+        # parameters from a single-regime GARCH(1,1) fit (via the arch library).
+        if best_result is None:
+            if verbose:
+                print("    ⚠ PHASE 1: All candidates failed – falling back to GARCH-based defaults")
+            
+            garch_fb = get_garch_warm_start(returns_array)
+            self.params = _build_two_regime_from_garch(garch_fb)
+            
+            # Compute volatility & regime probs using these fallback params
+            p = self.params
+            self.log_likelihood, self.filtered_probs, sigma2, pred_prob = hamilton_filter_jit(
+                returns_array,
+                p['omega_0'], p['alpha_0'], p['beta_0'],
+                p['omega_1'], p['alpha_1'], p['beta_1'],
+                p['mu_0'], p['mu_1'], p['p00'], p['p11'],
+                p['nu_0'], p['nu_1']
+            )
+            # Apply Kim smoother for sharper regime identification
+            self.filtered_probs = kim_smoother_jit(self.filtered_probs, pred_prob, p['p00'], p['p11'])
+            self.conditional_vol = np.sqrt(
+                self.filtered_probs[:, 0] * sigma2[:, 0] +
+                self.filtered_probs[:, 1] * sigma2[:, 1]
+            )
+            n_params = 12
+            self.aic = 2 * n_params - 2 * self.log_likelihood
+            self.bic = np.log(T) * n_params - 2 * self.log_likelihood
+            
+            if verbose:
+                print(f"    → GARCH fallback used: LL={self.log_likelihood:.2f}, "
+                      f"α₀={p['alpha_0']:.4f}, α₁={p['alpha_1']:.4f}")
+            
+            return self.params
+        
+        if verbose:
+            print(f"    → PHASE 1 complete: Best initialization = {best_init_name} (-LL = {best_nll:.2f})")
+        
+        # PHASE 2: Refinement with tighter tolerances
+        if verbose:
+            print("    → PHASE 2: Refining best solution with tighter tolerances...")
+        
+        try:
+            result_refined = minimize(
+                neg_log_likelihood,
+                best_result.x,  # Start from best Phase 1 result
+                method='L-BFGS-B',
+                options={
+                    'maxiter': 2000,     # Even more iterations for refinement
+                    'ftol': 1e-10,       # Very tight function tolerance
+                    'gtol': 1e-8,        # Very tight gradient tolerance
+                    'maxfun': 4000,      # Allow many function evaluations
+                    'maxls': 100,        # Many line search steps for precision
+                    'disp': False
+                }
+            )
+            
+            # Use refined result if it improved
+            if np.isfinite(result_refined.fun) and result_refined.fun < best_nll:
+                best_result = result_refined
+                best_nll = result_refined.fun
+                if verbose:
+                    print(f"      ✓ Refinement improved: -LL = {best_nll:.2f}")
+            else:
+                if verbose:
+                    print(f"      → Refinement did not improve (-LL = {result_refined.fun:.2f}), keeping Phase 1 result")
+        except Exception as e:
+            if verbose:
+                print(f"      ⚠ Phase 2 refinement failed: {e}")
+        
+        # PHASE 3: Final check with alternative optimizer (if still not converged)
+        if not getattr(best_result, 'success', False) or best_nll > 1e8:
+            if verbose:
+                print("    → PHASE 3: Trying alternative optimizer (TNC) for difficult case...")
+            
+            try:
+                result_tnc = minimize(
+                    neg_log_likelihood,
+                    best_result.x,
+                    method='TNC',
+                    options={
+                        'maxiter': 1500,
+                        'ftol': 1e-9,
+                        'gtol': 1e-7,
+                        'disp': False
+                    }
+                )
+                
+                if np.isfinite(result_tnc.fun) and result_tnc.fun < best_nll:
+                    best_result = result_tnc
+                    best_nll = result_tnc.fun
+                    if verbose:
+                        print(f"      ✓ TNC optimizer improved: -LL = {best_nll:.2f}")
+            except Exception as e:
+                if verbose:
+                    print(f"      ⚠ Phase 3 TNC failed: {e}")
+        
+        result = best_result
+        
+        # Extract final parameters
+        params_opt = result.x
+        omega_0 = self._unconstrained_to_omega(params_opt[0])
+        alpha_0 = self._unconstrained_to_alpha(params_opt[1])
+        beta_0 = self._unconstrained_to_beta(params_opt[2])
+        omega_1 = self._unconstrained_to_omega(params_opt[3])
+        alpha_1 = self._unconstrained_to_alpha(params_opt[4])
+        beta_1 = self._unconstrained_to_beta(params_opt[5])
+        
+        # Apply same stationarity cap as in NLL function
+        beta_0 = min(beta_0, max(PERSISTENCE_UPPER - alpha_0, BETA_LOWER))
+        beta_1 = min(beta_1, max(PERSISTENCE_UPPER - alpha_1, BETA_LOWER))
+        
+        # Apply same persistence floor as in NLL function (prevent GARCH collapse)
+        if alpha_0 + beta_0 < PERSISTENCE_LOWER:
+            beta_0 = max(beta_0, PERSISTENCE_LOWER - alpha_0)
+        if alpha_1 + beta_1 < PERSISTENCE_LOWER:
+            beta_1 = max(beta_1, PERSISTENCE_LOWER - alpha_1)
+        
+        mu_0 = self._unconstrained_to_mu(params_opt[6])
+        mu_1 = self._unconstrained_to_mu(params_opt[7])
+        p00 = self._unconstrained_to_p(params_opt[8])   # Range: [P_LOWER, P_UPPER]
+        p11 = self._unconstrained_to_p(params_opt[9])   # Range: [P_LOWER, P_UPPER]
+        nu_0 = self._unconstrained_to_nu(params_opt[10])
+        nu_1 = self._unconstrained_to_nu(params_opt[11])
+        
+        # Check regime differentiation
+        # Calculate unconditional volatilities for each regime
+        uncond_vol_0 = np.sqrt(omega_0 / max(1 - alpha_0 - beta_0, 0.01))
+        uncond_vol_1 = np.sqrt(omega_1 / max(1 - alpha_1 - beta_1, 0.01))
+        persistence_0 = alpha_0 + beta_0
+        persistence_1 = alpha_1 + beta_1
+        
+        # Ensure regime 0 is low volatility, regime 1 is high volatility
+        # Label switching correction: Check BOTH volatility and degrees of freedom
+        # Low-vol regime should have: lower uncond_vol AND higher nu (thinner tails)
+        # Use composite score: lower volatility + higher df = more "calm"
+        
+        # Normalize metrics for comparison (lower score = more calm regime)
+        vol_ratio = uncond_vol_0 / (uncond_vol_0 + uncond_vol_1)  # 0 to 1
+        nu_ratio = nu_1 / (nu_0 + nu_1)  # 0 to 1 (inverted: high nu_0 → low ratio)
+        
+        # Composite "calm score" for regime 0 (lower is calmer)
+        calm_score_0 = vol_ratio + nu_ratio  # Should be < 1 if regime 0 is calm
+        
+        # If score > 1, regime 0 is actually the high-vol regime → swap
+        if calm_score_0 > 1.0:
+            if verbose:
+                print("    → Swapping regime labels (regime 0 should be low-vol/high-nu)")
+            omega_0, omega_1 = omega_1, omega_0
+            alpha_0, alpha_1 = alpha_1, alpha_0
+            beta_0, beta_1 = beta_1, beta_0
+            mu_0, mu_1 = mu_1, mu_0
+            p00, p11 = p11, p00
+            nu_0, nu_1 = nu_1, nu_0
+            uncond_vol_0, uncond_vol_1 = uncond_vol_1, uncond_vol_0
+            persistence_0, persistence_1 = persistence_1, persistence_0
+        
+        # Store parameters
+        self.params = {
+            'omega_0': omega_0, 'alpha_0': alpha_0, 'beta_0': beta_0,
+            'omega_1': omega_1, 'alpha_1': alpha_1, 'beta_1': beta_1,
+            'mu_0': mu_0, 'mu_1': mu_1,
+            'p00': p00, 'p11': p11,
+            'nu_0': nu_0, 'nu_1': nu_1
+        }
+        
+        # Get filtered probabilities and volatilities
+        self.log_likelihood, self.filtered_probs, sigma2, pred_prob = hamilton_filter_jit(
+            returns_array, omega_0, alpha_0, beta_0, omega_1, alpha_1, beta_1,
+            mu_0, mu_1, p00, p11, nu_0, nu_1
+        )
+        
+        # Apply Kim smoother for sharper regime identification
+        self.filtered_probs = kim_smoother_jit(self.filtered_probs, pred_prob, p00, p11)
+        
+        # Conditional volatility (probability-weighted)
+        self.conditional_vol = np.sqrt(
+            self.filtered_probs[:, 0] * sigma2[:, 0] + 
+            self.filtered_probs[:, 1] * sigma2[:, 1]
+        )
+        
+        # Information criteria
+        n_params = 12
+        self.aic = 2 * n_params - 2 * self.log_likelihood
+        self.bic = np.log(T) * n_params - 2 * self.log_likelihood
+        
+        # =====================================================================
+        # COMPREHENSIVE DIAGNOSTIC OUTPUT
+        # =====================================================================
+        if verbose:
+            print(f"\n  {'='*70}")
+            print(f"  MS-GARCH ESTIMATION COMPLETE")
+            print(f"  {'='*70}")
+            
+            # Convergence status
+            print(f"\n  📊 CONVERGENCE:")
+            print(f"     Success: {result.success}")
+            print(f"     Status: {result.message if hasattr(result, 'message') else 'N/A'}")
+            print(f"     Function evals: {result.nfev if hasattr(result, 'nfev') else 'N/A'}")
+            print(f"     Iterations: {result.nit if hasattr(result, 'nit') else 'N/A'}")
+            
+            # Model fit
+            print(f"\n  📈 MODEL FIT:")
+            print(f"     Log-likelihood: {self.log_likelihood:.2f}")
+            print(f"     AIC: {self.aic:.2f}")
+            print(f"     BIC: {self.bic:.2f}")
+            print(f"     Number of observations: {T}")
+            
+            # Regime 0 (Low Volatility)
+            print(f"\n  🟢 REGIME 0 (Low Volatility / Calm Period):")
+            print(f"     GARCH(1,1): ω={omega_0:.2e}, α={alpha_0:.4f}, β={beta_0:.4f}")
+            print(f"     Persistence: α+β = {persistence_0:.4f}")
+            print(f"     Unconditional volatility: {uncond_vol_0:.4f} ({uncond_vol_0*100:.2f}%)")
+            print(f"     Degrees of freedom: ν₀ = {nu_0:.2f}")
+            print(f"     Mean return: μ₀ = {mu_0:.6f} ({mu_0*252*100:.2f}% annualized)")
+            print(f"     Stationarity: {'✓ Stationary' if persistence_0 < PERSISTENCE_UPPER else '✗ Near non-stationary'}")
+            
+            # Regime 1 (High Volatility)
+            print(f"\n  🔴 REGIME 1 (High Volatility / Crisis Period):")
+            print(f"     GARCH(1,1): ω={omega_1:.2e}, α={alpha_1:.4f}, β={beta_1:.4f}")
+            print(f"     Persistence: α+β = {persistence_1:.4f}")
+            print(f"     Unconditional volatility: {uncond_vol_1:.4f} ({uncond_vol_1*100:.2f}%)")
+            print(f"     Degrees of freedom: ν₁ = {nu_1:.2f}")
+            print(f"     Mean return: μ₁ = {mu_1:.6f} ({mu_1*252*100:.2f}% annualized)")
+            print(f"     Stationarity: {'✓ Stationary' if persistence_1 < PERSISTENCE_UPPER else '✗ Near non-stationary'}")
+            
+            # Regime comparison
+            print(f"\n  🔄 REGIME DIFFERENTIATION:")
+            vol_ratio = uncond_vol_1 / uncond_vol_0
+            nu_ratio = nu_0 / nu_1
+            alpha_ratio = alpha_1 / alpha_0
+            print(f"     Volatility ratio (High/Low): {vol_ratio:.2f}x")
+            print(f"     Tail heaviness ratio (ν₀/ν₁): {nu_ratio:.2f}x")
+            print(f"     Shock response ratio (α₁/α₀): {alpha_ratio:.2f}x")
+            
+            # Check regime separation quality
+            if vol_ratio < 1.3:
+                print(f"     ⚠️  WARNING: Regimes are not well-separated (vol ratio < 1.3)")
+                print(f"         MS-GARCH may reduce to simple GARCH (overfitting risk)")
+            elif vol_ratio > 5.0:
+                print(f"     ⚠️  WARNING: Regimes are VERY different (vol ratio > 5)")
+                print(f"         Check for outliers or data quality issues")
+            else:
+                print(f"     ✓ Good regime separation")
+            
+            if nu_ratio < 1.5:
+                print(f"     ⚠️  WARNING: Tail distributions are similar (ν ratio < 1.5)")
+                print(f"         Regime differences may be driven mainly by volatility")
+            else:
+                print(f"     ✓ Good tail differentiation")
+            
+            # Transition probabilities
+            print(f"\n  🔀 TRANSITION PROBABILITIES:")
+            print(f"     P(stay in regime 0 | in regime 0): p₀₀ = {p00:.4f}")
+            print(f"     P(stay in regime 1 | in regime 1): p₁₁ = {p11:.4f}")
+            print(f"     P(switch 0→1): {1-p00:.4f}")
+            print(f"     P(switch 1→0): {1-p11:.4f}")
+            
+            # Expected regime durations
+            duration_0 = 1 / (1 - p00) if p00 < 0.9999 else np.inf
+            duration_1 = 1 / (1 - p11) if p11 < 0.9999 else np.inf
+            print(f"     Expected duration regime 0: {duration_0:.1f} days" if duration_0 < 1e6 else "     Expected duration regime 0: Very long (highly persistent)")
+            print(f"     Expected duration regime 1: {duration_1:.1f} days" if duration_1 < 1e6 else "     Expected duration regime 1: Very long (highly persistent)")
+            
+            # Ergodic (long-run) probabilities
+            if p00 + p11 > 0.0001:
+                ergodic_0 = (1 - p11) / (2 - p00 - p11)
+                ergodic_1 = (1 - p00) / (2 - p00 - p11)
+                print(f"     Long-run prob(regime 0): {ergodic_0:.3f} ({ergodic_0*100:.1f}%)")
+                print(f"     Long-run prob(regime 1): {ergodic_1:.3f} ({ergodic_1*100:.1f}%)")
+            
+            # Check for regime persistence issues
+            if p00 < 0.7 or p11 < 0.7:
+                print(f"     ⚠️  WARNING: Low regime persistence (p < 0.70)")
+                print(f"         Regimes may be switching too frequently (not economically meaningful)")
+            elif p00 > 0.98 or p11 > 0.98:
+                print(f"     ⚠️  WARNING: Very high persistence (p > 0.98)")
+                print(f"         Regimes rarely switch (may need longer data sample)")
+            else:
+                print(f"     ✓ Reasonable regime persistence")
+            
+            # Empirical regime statistics
+            avg_prob_0 = np.mean(self.filtered_probs[:, 0])
+            avg_prob_1 = np.mean(self.filtered_probs[:, 1])
+            print(f"\n  📊 EMPIRICAL REGIME STATISTICS:")
+            print(f"     Average prob(regime 0): {avg_prob_0:.3f}")
+            print(f"     Average prob(regime 1): {avg_prob_1:.3f}")
+            
+            # Count regime switches (when prob crosses 0.5)
+            regime_states = (self.filtered_probs[:, 1] > 0.5).astype(int)
+            n_switches = np.sum(np.abs(np.diff(regime_states)))
+            print(f"     Approximate number of regime switches: {n_switches}")
+            print(f"     Average switches per year: {n_switches / (T/252):.1f}")
+            
+            print(f"\n  {'='*70}\n")
+        
+        return self.params
+    
+    # =========================================================================
+    # Parameter transformation functions (for unconstrained optimization)
+    # Uses BOUNDED sigmoid: maps unconstrained R to [lower, upper]
+    # f(x) = lower + (upper - lower) * sigmoid(x)
+    # This prevents pathological values (e.g., alpha = 1e-86)
+    # =========================================================================
+    
+    def _alpha_to_unconstrained(self, alpha):
+        """Transform alpha to unconstrained space using bounded sigmoid."""
+        alpha = min(max(alpha, ALPHA_LOWER + 1e-6), ALPHA_UPPER - 1e-6)
+        # Inverse bounded sigmoid: x = logit((alpha - lower) / (upper - lower))
+        t = (alpha - ALPHA_LOWER) / (ALPHA_UPPER - ALPHA_LOWER)
+        return np.log(t / (1 - t))
+    
+    def _unconstrained_to_alpha(self, x):
+        """Transform back to alpha bounded in [ALPHA_LOWER, ALPHA_UPPER]."""
+        return ALPHA_LOWER + (ALPHA_UPPER - ALPHA_LOWER) * expit(x)
+    
+    def _beta_to_unconstrained(self, beta):
+        """Transform beta to unconstrained space using bounded sigmoid."""
+        beta = min(max(beta, BETA_LOWER + 1e-6), BETA_UPPER - 1e-6)
+        t = (beta - BETA_LOWER) / (BETA_UPPER - BETA_LOWER)
+        return np.log(t / (1 - t))
+    
+    def _unconstrained_to_beta(self, x):
+        """Transform back to beta bounded in [BETA_LOWER, BETA_UPPER]."""
+        return BETA_LOWER + (BETA_UPPER - BETA_LOWER) * expit(x)
+    
+    def _p_to_unconstrained(self, p):
+        """Transform transition probability to unconstrained space using bounded sigmoid."""
+        p = min(max(p, P_LOWER + 1e-6), P_UPPER - 1e-6)
+        t = (p - P_LOWER) / (P_UPPER - P_LOWER)
+        return np.log(t / (1 - t))
+    
+    def _unconstrained_to_p(self, x):
+        """Transform back to transition probability bounded in [P_LOWER, P_UPPER]."""
+        return P_LOWER + (P_UPPER - P_LOWER) * expit(x)
+    
+    def _nu_to_unconstrained(self, nu):
+        """Transform nu to unconstrained space."""
+        nu = min(max(nu, NU_LOWER_BOUND), NU_OPTIMIZER_UPPER_BOUND)
+        return np.log(nu - 2)
+    
+    def _unconstrained_to_nu(self, x):
+        """Transform back to nu (bounded [2.1, NU_OPTIMIZER_UPPER_BOUND])."""
+        return min(2 + np.exp(x), NU_OPTIMIZER_UPPER_BOUND)
+    
+    # --- mu transforms (bounded sigmoid → [MU_LOWER, MU_UPPER]) ---
+    def _mu_to_unconstrained(self, mu):
+        """Transform mu to unconstrained space."""
+        mu = min(max(mu, MU_LOWER + 1e-6), MU_UPPER - 1e-6)
+        t = (mu - MU_LOWER) / (MU_UPPER - MU_LOWER)
+        return np.log(t / (1 - t))
+    
+    def _unconstrained_to_mu(self, x):
+        """Transform back to mu bounded in [MU_LOWER, MU_UPPER]."""
+        return MU_LOWER + (MU_UPPER - MU_LOWER) * expit(x)
+    
+    # --- omega transforms (clamped exp → [OMEGA_FLOOR, OMEGA_CEIL]) ---
+    def _omega_to_unconstrained(self, omega):
+        """Transform omega to unconstrained space (log with clamp)."""
+        omega = min(max(omega, OMEGA_FLOOR), OMEGA_CEIL)
+        return np.log(omega)
+    
+    def _unconstrained_to_omega(self, x):
+        """Transform back to omega, clamped to [OMEGA_FLOOR, OMEGA_CEIL]."""
+        return min(max(np.exp(x), OMEGA_FLOOR), OMEGA_CEIL)
+    
+    # =========================================================================
+    # Accessor methods
+    # =========================================================================
+    
+    def get_volatility_series(self):
+        """Get conditional volatility series."""
+        return self.conditional_vol
+    
+    def get_regime_probabilities(self):
+        """Get filtered regime probabilities."""
+        return self.filtered_probs
+
+
+# =============================================================================
+# MAIN ESTIMATION FUNCTION (OPTIMIZED)
+# =============================================================================
+
+def run_ms_garch_estimation_optimized(data_df, 
+                                      gvkey_selected=None, 
+                                      return_column='asset_return_daily',
+                                      gvkey_column='gvkey',
+                                      output_file='ms_garch_parameters.csv',
+                                      verbose=True):
+    """
+    Run OPTIMIZED MS-GARCH estimation for multiple firms.
+    
+    Uses all optimizations:
+    - GARCH warm start
+    - JIT-compiled Hamilton filter
+    - Cached computations
+    - Better optimizer settings
+    
+    Parameters:
+    -----------
+    data_df : pd.DataFrame
+        DataFrame with returns data
+    gvkey_selected : list or None
+        List of gvkeys to process, or None for all firms
+    return_column : str
+        Column name containing returns
+    gvkey_column : str
+        Column name containing firm identifiers
+    output_file : str
+        File to save MS-GARCH parameters
+    verbose : bool
+        Print progress messages
+        
+    Returns:
+    --------
+    pd.DataFrame
+        Data with MS-GARCH volatility and regime probabilities
+    """
+    if verbose:
+        print("\n" + "="*80)
+        print("OPTIMIZED MS-GARCH ESTIMATION")
+        print("="*80)
+        print("Optimizations enabled:")
+        print("  ✓ GARCH(1,1) warm start for initial parameters")
+        print("  ✓ Numba JIT-compiled Hamilton filter")
+        print("  ✓ Cached intermediate results")
+        print("  ✓ L-BFGS-B optimizer with tuned settings")
+        print("="*80 + "\n")
+    
+    # Get firms to process
+    if gvkey_selected is None:
+        firms = data_df[gvkey_column].unique()
+    else:
+        firms = gvkey_selected
+    
+    firms = [f for f in firms if not pd.isna(f)]
+    
+    if verbose:
+        print(f"Processing {len(firms)} firms...\n")
+    
+    # Prepare output
+    all_params = []
+    data_with_vol = data_df.copy()
+    data_with_vol['ms_garch_volatility'] = np.nan
+    data_with_vol['ms_garch_regime_prob'] = np.nan
+    
+    # Process each firm
+    for i, gvkey in enumerate(firms):
+        if verbose:
+            print(f"[{i+1}/{len(firms)}] Processing {gvkey} (Rolling 12M)...")
+        
+        # try:  <-- REMOVED OUTER TRY
+        firm_data = data_df[data_df[gvkey_column] == gvkey].copy()
+        
+        # Ensure date column
+        if 'date' not in firm_data.columns:
+                if isinstance(firm_data.index, pd.DatetimeIndex):
+                    firm_data['date'] = firm_data.index
+        
+        firm_data['date'] = pd.to_datetime(firm_data['date'])
+        firm_data = firm_data.sort_values('date')
+        
+        # Generate Month Ends
+        start_date = firm_data['date'].min()
+        end_date = firm_data['date'].max()
+        try:
+            estimation_start = max(start_date + pd.DateOffset(months=12), MIN_ESTIMATION_DATE)
+            if estimation_start >= end_date:
+                continue
+            month_ends = pd.date_range(start=estimation_start, end=end_date, freq='ME')
+        except Exception as e:
+            print(f"Error defining date range for {gvkey}: {e}")
+            continue
+
+        last_params_firm = None # Warm start for rolling window set to None for new firm
+        window_counter = 0     # Track windows since last fresh start
+            
+        for date_point in month_ends:
+            try:  # <-- ADDED INNER TRY
+                # Select all data up to this point
+                data_up_to_point = firm_data[firm_data['date'] <= date_point]
+
+                # Require enough history for adaptive windows
+                if len(data_up_to_point) < ADAPTIVE_WINDOW_HIGH_VOL:
+                    continue
+
+                # Adaptive window size based on recent realized volatility
+                if "asset_return_daily_scaled" in data_up_to_point.columns:
+                    hist_returns_raw = data_up_to_point["asset_return_daily_scaled"].dropna().values
+                else:
+                    hist_returns_raw = data_up_to_point[return_column].dropna().values
+                    if len(hist_returns_raw) > 0 and np.std(hist_returns_raw) < 0.1:
+                        hist_returns_raw = hist_returns_raw * 100.0
+
+                window_days = ADAPTIVE_WINDOW_MID_VOL
+                window_regime_state = "Intermediate Vol"
+                if len(hist_returns_raw) >= max(ADAPTIVE_VOL_LOOKBACK + 40, 90):
+                    hist_series = pd.Series(hist_returns_raw)
+                    hist_roll_vol = hist_series.rolling(
+                        ADAPTIVE_VOL_LOOKBACK,
+                        min_periods=max(20, ADAPTIVE_VOL_LOOKBACK // 2)
+                    ).std().dropna()
+                    if len(hist_roll_vol) >= 40:
+                        recent_vol = hist_roll_vol.iloc[-1]
+                        q_low = hist_roll_vol.quantile(0.33)
+                        q_high = hist_roll_vol.quantile(0.67)
+                        if recent_vol >= q_high:
+                            window_days = ADAPTIVE_WINDOW_HIGH_VOL
+                            window_regime_state = "High Vol"
+                        elif recent_vol <= q_low:
+                            window_days = ADAPTIVE_WINDOW_LOW_VOL
+                            window_regime_state = "Low Vol"
+
+                window_days = int(min(window_days, len(data_up_to_point)))
+                window_df = data_up_to_point.iloc[-window_days:].copy()
+                
+                # Additional data quality checks
+                valid_count = window_df['asset_return_daily_scaled'].notna().sum() if 'asset_return_daily_scaled' in window_df.columns else window_df['asset_return_daily'].notna().sum()
+                
+                min_valid_required = max(100, int(0.75 * window_days))
+                if valid_count < min_valid_required:
+                    continue
+                
+                # Use centrally scaled returns if available
+                scale_factor = 1.0
+                
+                if "asset_return_daily_scaled" in window_df.columns:
+                    returns = window_df["asset_return_daily_scaled"].dropna().values
+                    scale_factor = 100.0 # It means data IS scaled by 100, so we unscale by 100 later
+                else:
+                    returns = window_df[return_column].dropna().values
+                    # Check scale by looking at std dev. If < 0.1, assume it's raw and scale it.
+                    if np.std(returns) < 0.1:
+                        returns = returns * 100.0
+                        scale_factor = 100.0
+                
+                if len(returns) < 100:
+                    continue
+                
+                # Initialize and fit OPTIMIZED MS-GARCH
+                model = MSGARCHOptimized()
+                model.window_regime_state = window_regime_state
+                
+                # Use warm start from previous window (with periodic fresh starts)
+                # last_params_firm contains SCALED parameters from the previous iteration
+                init_p = None
+                window_counter += 1
+                if last_params_firm is not None and window_counter % FRESH_START_EVERY_N != 0:
+                     init_p = last_params_firm.copy()  # Already scaled, ready to use directly
+                     # No rescaling needed - last_params_firm already contains scaled params!
+                elif last_params_firm is not None and window_counter % FRESH_START_EVERY_N == 0:
+                     if verbose:
+                         print(f"    → Periodic fresh start (every {FRESH_START_EVERY_N} windows) for {date_point.strftime('%Y-%m')}")
+
+                # Run silently for rolling windows to avoid spam
+                params = model.fit(returns, verbose=False, init_params=init_p)
+                
+                # fit() now always returns a dict (GARCH fallback if MLE fails).
+                # This should never be None, but guard defensively just in case.
+                if params is None:
+                    if verbose:
+                        print(f"  ⚠ Unexpected None from fit() for {gvkey} {date_point.strftime('%Y-%m')} – reusing previous params")
+                    if last_params_firm is not None:
+                        params = last_params_firm.copy()
+                    else:
+                        garch_fb = get_garch_warm_start(returns)
+                        params = _build_two_regime_from_garch(garch_fb)
+                
+                # CRITICAL FIX: Deep copy the scaled parameters BEFORE unscaling
+                # This prevents the bug where unscaling affects the warm start parameters
+                import copy
+                last_params_firm = copy.deepcopy(params)  # Store SCALED params for next iteration
+                
+                # Get model results
+                # If model.fit() returned normally (including GARCH fallback inside _fit_mle_optimized),
+                # vol_series and regime_probs are set. If we hit the outer None guard above,
+                # the model object may not have them, so compute from params directly.
+                try:
+                    vol_series = model.get_volatility_series()
+                    regime_probs = model.get_regime_probabilities()
+                except Exception:
+                    # Compute from params + hamilton filter as fallback
+                    p = params
+                    _, f_probs, sig2, f_pred = hamilton_filter_jit(
+                        returns,
+                        p['omega_0'], p['alpha_0'], p['beta_0'],
+                        p['omega_1'], p['alpha_1'], p['beta_1'],
+                        p['mu_0'], p['mu_1'], p['p00'], p['p11'],
+                        p['nu_0'], p['nu_1']
+                    )
+                    # Apply Kim smoother for sharper regime identification
+                    f_probs = kim_smoother_jit(f_probs, f_pred, p['p00'], p['p11'])
+                    vol_series = np.sqrt(f_probs[:, 0] * sig2[:, 0] + f_probs[:, 1] * sig2[:, 1])
+                    regime_probs = f_probs
+
+                # Confidence diagnostics + conservative blend for weakly-identified regimes
+                diag = _compute_msgarch_diagnostics(params)
+                blend_weight = 0.0
+                if diag['msgarch_confidence_score'] < MSGARCH_CONFIDENCE_THRESHOLD:
+                    garch_fb = get_garch_warm_start(returns)
+                    fallback_params = _build_two_regime_from_garch(garch_fb)
+
+                    shortfall = MSGARCH_CONFIDENCE_THRESHOLD - diag['msgarch_confidence_score']
+                    blend_weight = np.clip(
+                        MSGARCH_MAX_BLEND_WEIGHT * (shortfall / MSGARCH_CONFIDENCE_THRESHOLD),
+                        0.0,
+                        MSGARCH_MAX_BLEND_WEIGHT,
+                    )
+
+                    params = _blend_params(params, fallback_params, blend_weight)
+
+                    ll_blend, f_probs, sig2, f_pred = hamilton_filter_jit(
+                        returns,
+                        params['omega_0'], params['alpha_0'], params['beta_0'],
+                        params['omega_1'], params['alpha_1'], params['beta_1'],
+                        params['mu_0'], params['mu_1'], params['p00'], params['p11'],
+                        params['nu_0'], params['nu_1']
+                    )
+                    f_probs = kim_smoother_jit(f_probs, f_pred, params['p00'], params['p11'])
+                    vol_series = np.sqrt(f_probs[:, 0] * sig2[:, 0] + f_probs[:, 1] * sig2[:, 1])
+                    regime_probs = f_probs
+                    model.log_likelihood = ll_blend
+
+                    diag = _compute_msgarch_diagnostics(params)
+
+                params['msgarch_confidence_score'] = diag['msgarch_confidence_score']
+                params['msgarch_vol_ratio'] = diag['msgarch_vol_ratio']
+                params['msgarch_persistence_0'] = diag['msgarch_persistence_0']
+                params['msgarch_persistence_1'] = diag['msgarch_persistence_1']
+                params['msgarch_alpha_boundary_hits'] = diag['msgarch_alpha_boundary_hits']
+                params['msgarch_nu_boundary_hits'] = diag['msgarch_nu_boundary_hits']
+                params['msgarch_transition_boundary_hits'] = diag['msgarch_transition_boundary_hits']
+                params['msgarch_low_confidence'] = bool(diag['msgarch_confidence_score'] < MSGARCH_CONFIDENCE_THRESHOLD)
+                params['msgarch_blend_weight'] = float(blend_weight)
+                params['adaptive_window_days'] = int(window_days)
+                params['window_regime_state'] = window_regime_state
+                
+                # Unscale parameters for saving (so they match RAW return scale)
+                # This modifies params in place, but last_params_firm is protected by deepcopy
+                if scale_factor != 1.0:
+                    params['omega_0'] /= (scale_factor ** 2)
+                    params['omega_1'] /= (scale_factor ** 2)
+                    params['mu_0'] /= scale_factor
+                    params['mu_1'] /= scale_factor
+                    
+                    # Unscale volatility series
+                    vol_series /= scale_factor
+                
+                # Validation: Check that unscaled unconditional volatilities are reasonable
+                uncond_vol_0_unscaled = np.sqrt(params['omega_0'] / max(1 - params['alpha_0'] - params['beta_0'], 0.01))
+                uncond_vol_1_unscaled = np.sqrt(params['omega_1'] / max(1 - params['alpha_1'] - params['beta_1'], 0.01))
+                
+                if not (0.0001 < uncond_vol_0_unscaled < 0.15):
+                    print(f"    ! Warning: Regime 0 uncond vol {uncond_vol_0_unscaled:.6f} outside reasonable range")
+                if not (0.0001 < uncond_vol_1_unscaled < 0.15):
+                    print(f"    ! Warning: Regime 1 uncond vol {uncond_vol_1_unscaled:.6f} outside reasonable range")
+                
+                # Use Last Trading Date for the "Date" field to ensure merge/saving works
+                last_trading_date = window_df['date'].max()
+
+                # Stitch volatility and probabilities (new month only)
+                # Determine indices for the most recent month
+                prev_month_end = date_point - pd.DateOffset(months=1)
+                
+                window_indices = window_df.index
+                
+                # Filter return/vol series to valid rows used in estimation
+                if "asset_return_daily_scaled" in window_df.columns:
+                        valid_mask = window_df["asset_return_daily_scaled"].notna()
+                else: 
+                        valid_mask = window_df[return_column].notna()
+                        
+                valid_indices = window_df.index[valid_mask]
+                valid_dates = window_df.loc[valid_mask, 'date']
+                
+                # Only update rows > prev_month_end
+                new_month_mask = valid_dates > prev_month_end
+                
+                if new_month_mask.any():
+                    update_indices = valid_indices[new_month_mask]
+                    update_vol = vol_series[new_month_mask.values]
+                    update_probs = regime_probs[new_month_mask.values]
+                    
+                    data_with_vol.loc[update_indices, 'ms_garch_volatility'] = update_vol
+                    data_with_vol.loc[update_indices, 'ms_garch_regime_prob'] = update_probs[:, 1] # Prob of regime 1
+
+                # Store parameters
+                params['gvkey'] = gvkey
+                params['date'] = last_trading_date # Use LAST TRADING DATE
+                params['log_likelihood'] = model.log_likelihood - len(returns) * np.log(scale_factor) if scale_factor != 1.0 else model.log_likelihood
+                params['aic'] = 2 * 12 - 2 * params['log_likelihood']
+                params['bic'] = np.log(len(returns)) * 12 - 2 * params['log_likelihood']
+                params['n_obs'] = len(returns)
+                all_params.append(params)
+            
+            except Exception as e:
+                if verbose:
+                    print(f"  ✗ Error estimating MS-GARCH for {gvkey} on {date_point}: {str(e)}")
+                continue
+
+        if verbose:
+            print(f"  ✓ Estimated MS-GARCH rolling parameters for {gvkey}")
+                
+        # except Exception as e:  <-- REMOVED OUTER EXCEPT
+        #    if verbose:
+        #        print(f"  ✗ Error estimating MS-GARCH for {gvkey}: {str(e)}\n")
+        #    continue
+    
+    # Save parameters
+    if len(all_params) > 0:
+        params_df = pd.DataFrame(all_params)
+        # Include 'date' in columns
+        cols = ['gvkey', 'date', 'omega_0', 'alpha_0', 'beta_0', 'omega_1', 'alpha_1', 'beta_1',
+            'mu_0', 'mu_1', 'p00', 'p11', 'nu_0', 'nu_1',
+            'msgarch_confidence_score', 'msgarch_vol_ratio',
+            'msgarch_persistence_0', 'msgarch_persistence_1',
+            'msgarch_alpha_boundary_hits', 'msgarch_nu_boundary_hits',
+            'msgarch_transition_boundary_hits', 'msgarch_low_confidence',
+            'msgarch_blend_weight', 'adaptive_window_days', 'window_regime_state',
+            'log_likelihood', 'aic', 'bic', 'n_obs']
+        # Select columns that exist
+        params_df = params_df[[c for c in cols if c in params_df.columns]]
+        params_df.to_csv(output_file, index=False)
+        
+        if verbose:
+            print(f"\n✓ MS-GARCH parameters saved to {output_file}")
+            print(f"✓ Successfully estimated: {len(params_df)} firm-months")
+            
+        # Merge rolling parameters back into daily dataframe (Forward fill)
+        data_with_vol['date'] = pd.to_datetime(data_with_vol['date'])
+        
+        # Merge columns (params)
+        merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'log_likelihood', 'aic', 'bic', 'n_obs']]
+        
+        # Drop existing
+        data_with_vol = data_with_vol.drop(columns=[c for c in merge_cols if c in data_with_vol.columns])
+        
+        merge_df = params_df[['gvkey', 'date'] + merge_cols]
+        data_with_vol = pd.merge(data_with_vol, merge_df, on=['gvkey', 'date'], how='left')
+        
+        # FFill
+        data_with_vol = data_with_vol.sort_values(['gvkey', 'date'])
+        data_with_vol[merge_cols] = data_with_vol.groupby('gvkey')[merge_cols].ffill()
+        
+        if verbose:
+             print("  ✓ Merged rolling MS-GARCH parameters into daily returns data")
+    
+    if verbose:
+        print("\n" + "="*80)
+        print("OPTIMIZED MS-GARCH ESTIMATION COMPLETE")
+        print("="*80)
+    
+    return data_with_vol
+
+
+# =============================================================================
+# ALIAS FOR BACKWARD COMPATIBILITY
+# =============================================================================
+
+# Use the optimized class as default
+MSGARCH = MSGARCHOptimized
+run_ms_garch_estimation = run_ms_garch_estimation_optimized
