@@ -36,6 +36,12 @@ except ImportError:
 
 MATURITIES = [1, 3, 5]
 MIN_CDS_COMPARISON_DATE = pd.Timestamp("2017-01-01")
+DEFAULT_PERIOD_RANGES = {
+    "Pre-COVID": (None, "2020-02-29"),
+    "COVID Shock": ("2020-03-01", "2020-12-31"),
+    "Recovery": ("2021-01-01", "2022-12-31"),
+    "Post-Recovery": ("2023-01-01", None),
+}
 MODEL_SPECS = {
     "merton_mc": {
         "file": "daily_monte_carlo_merton_results.csv",
@@ -77,6 +83,96 @@ class AnalysisConfig:
     min_obs_firm: int = 60
     leverage_quantiles: int = 3
     volatility_window_days: int = 63
+    period_ranges: dict[str, tuple[str | None, str | None]] | None = None
+
+
+def _normalize_maturity_values(values: list[int | str]) -> list[str]:
+    normalized = []
+    for value in values:
+        if isinstance(value, int):
+            normalized.append(f"{value}y")
+            continue
+
+        token = str(value).strip().lower()
+        if token.endswith("y"):
+            normalized.append(token)
+            continue
+
+        if token.isdigit():
+            normalized.append(f"{token}y")
+            continue
+
+        raise ValueError(f"Invalid maturity selector: {value}. Use 1, 3, 5, or '1y'/'3y'/'5y'.")
+
+    return normalized
+
+
+def _to_selector_list(selector: int | str | list[int | str] | None) -> list[int | str] | None:
+    if selector is None:
+        return None
+    if isinstance(selector, list):
+        return selector
+    return [selector]
+
+
+def _apply_runtime_filters(
+    panel: pd.DataFrame,
+    maturity: int | str | list[int | str] | None,
+    period: str | list[str] | None,
+    leverage_group: str | list[str] | None,
+) -> tuple[pd.DataFrame, dict[str, str | int]]:
+    filtered = panel.copy()
+    metadata: dict[str, str | int] = {
+        "rows_before_filter": int(len(panel)),
+    }
+
+    maturity_values = _to_selector_list(maturity)
+    period_values = _to_selector_list(period)
+    leverage_values = _to_selector_list(leverage_group)
+
+    if maturity_values is not None:
+        selected = _normalize_maturity_values(maturity_values)
+        available = set(filtered["maturity"].dropna().unique())
+        invalid = sorted(set(selected) - available)
+        if invalid:
+            raise ValueError(f"Invalid maturity selector(s): {invalid}. Available values: {sorted(available)}")
+        filtered = filtered[filtered["maturity"].isin(selected)].copy()
+        metadata["selected_maturity"] = ",".join(selected)
+    else:
+        metadata["selected_maturity"] = "ALL"
+
+    if period_values is not None:
+        selected = [str(p).strip() for p in period_values]
+        available = set(filtered["period"].dropna().unique())
+        invalid = sorted(set(selected) - available)
+        if invalid:
+            raise ValueError(f"Invalid period selector(s): {invalid}. Available values: {sorted(available)}")
+        filtered = filtered[filtered["period"].isin(selected)].copy()
+        metadata["selected_period"] = ",".join(selected)
+    else:
+        metadata["selected_period"] = "ALL"
+
+    if leverage_values is not None:
+        selected = [str(v).strip() for v in leverage_values]
+        available = set(filtered["leverage_group"].dropna().unique())
+        invalid = sorted(set(selected) - available)
+        if invalid:
+            raise ValueError(f"Invalid leverage selector(s): {invalid}. Available values: {sorted(available)}")
+        filtered = filtered[filtered["leverage_group"].isin(selected)].copy()
+        metadata["selected_leverage_group"] = ",".join(selected)
+    else:
+        metadata["selected_leverage_group"] = "ALL"
+
+    metadata["rows_after_filter"] = int(len(filtered))
+    metadata["firms_after_filter"] = int(filtered["gvkey"].nunique())
+    if len(filtered) > 0:
+        metadata["date_min"] = str(filtered["date"].min().date())
+        metadata["date_max"] = str(filtered["date"].max().date())
+    else:
+        metadata["date_min"] = "NA"
+        metadata["date_max"] = "NA"
+
+    return filtered, metadata
 
 
 def _to_long_market(cds_market_df: pd.DataFrame) -> pd.DataFrame:
@@ -201,10 +297,18 @@ def add_change_series(panel: pd.DataFrame) -> pd.DataFrame:
 def add_period_and_volatility_regimes(panel: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
     out = panel.copy()
 
-    out["period"] = "Pre-COVID"
-    out.loc[(out["date"] >= "2020-03-01") & (out["date"] <= "2020-12-31"), "period"] = "COVID Shock"
-    out.loc[(out["date"] >= "2021-01-01") & (out["date"] <= "2022-12-31"), "period"] = "Recovery"
-    out.loc[out["date"] >= "2023-01-01", "period"] = "Post-Recovery"
+    period_ranges = DEFAULT_PERIOD_RANGES.copy()
+    if cfg.period_ranges:
+        period_ranges.update(cfg.period_ranges)
+
+    out["period"] = "Unassigned"
+    for label, (start, end) in period_ranges.items():
+        mask = pd.Series(True, index=out.index)
+        if start is not None:
+            mask &= out["date"] >= pd.Timestamp(start)
+        if end is not None:
+            mask &= out["date"] <= pd.Timestamp(end)
+        out.loc[mask, "period"] = label
 
     market_unique = (
         out[["gvkey", "date", "maturity", "market_spread_bps"]]
@@ -683,13 +787,17 @@ def run_model_performance_paper(
     output_dir: Path | None = None,
     input_dir: Path | None = None,
     save_subdir: str = "paper_model_comparison",
+    maturity: int | str | list[int | str] | None = None,
+    period: str | list[str] | None = None,
+    leverage_group: str | list[str] | None = None,
+    period_ranges: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> dict[str, Path]:
     if output_dir is None:
         output_dir = config.OUTPUT_DIR
     if input_dir is None:
         input_dir = config.INPUT_DIR
 
-    cfg = AnalysisConfig(output_dir=Path(output_dir), input_dir=Path(input_dir))
+    cfg = AnalysisConfig(output_dir=Path(output_dir), input_dir=Path(input_dir), period_ranges=period_ranges)
     out_dir = cfg.output_dir / save_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -700,9 +808,25 @@ def run_model_performance_paper(
     panel = build_panel(cfg)
     panel = add_period_and_volatility_regimes(panel, cfg)
     panel = add_change_series(panel)
+    panel, filter_meta = _apply_runtime_filters(panel, maturity=maturity, period=period, leverage_group=leverage_group)
+
+    if panel.empty:
+        raise ValueError(
+            "No rows remain after applying filters. "
+            f"Selected maturity={filter_meta['selected_maturity']}, "
+            f"period={filter_meta['selected_period']}, "
+            f"leverage_group={filter_meta['selected_leverage_group']}."
+        )
 
     print(f"Unified panel observations: {len(panel):,}")
+    print(
+        "Active filters: "
+        f"maturity={filter_meta['selected_maturity']}; "
+        f"period={filter_meta['selected_period']}; "
+        f"leverage_group={filter_meta['selected_leverage_group']}"
+    )
     panel.to_csv(out_dir / "model_comparison_panel.csv", index=False)
+    pd.DataFrame([filter_meta]).to_csv(out_dir / "filter_metadata.csv", index=False)
 
     print("Computing performance tables...")
     overall_perf = compute_performance_summary(panel, ["maturity"], min_obs=cfg.min_obs_segment)
@@ -761,6 +885,14 @@ def run_model_performance_paper(
         f.write(f"Total panel rows: {len(panel):,}\n")
         f.write(f"Firms: {panel['gvkey'].nunique()}\n")
         f.write(f"Years: {int(panel['year'].min())} - {int(panel['year'].max())}\n\n")
+        f.write("Active Filters:\n")
+        f.write(f"  - Maturity: {filter_meta['selected_maturity']}\n")
+        f.write(f"  - Period: {filter_meta['selected_period']}\n")
+        f.write(f"  - Leverage Group: {filter_meta['selected_leverage_group']}\n")
+        f.write(
+            "  - Rows before/after filter: "
+            f"{filter_meta['rows_before_filter']}/{filter_meta['rows_after_filter']}\n\n"
+        )
 
         if not overall_perf.empty:
             f.write("Overall RMSE by maturity and model:\n")
@@ -802,6 +934,7 @@ def run_model_performance_paper(
         "period_volatility": out_dir / "performance_by_period_volatility.csv",
         "firm": out_dir / "performance_by_company.csv",
         "msgarch_best": out_dir / "msgarch_best_segments.csv",
+        "filters": out_dir / "filter_metadata.csv",
         "summary": out_dir / "analysis_summary.txt",
         "figures": out_dir / "figures",
     }
