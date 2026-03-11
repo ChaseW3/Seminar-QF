@@ -1,19 +1,3 @@
-"""
-Paper-ready model performance comparison for Monte Carlo CDS models.
-
-This script compares Merton, GARCH, Regime-Switching, and MS-GARCH model-implied
-spreads against market CDS spreads and identifies where each model performs best:
-
-1) By company
-2) By leverage bucket
-3) By maturity (1Y/3Y/5Y)
-4) By calendar year
-
-Outputs:
-- CSV tables for paper appendices/results
-- PNG charts for manuscript figures
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,6 +17,8 @@ except ImportError:
     from cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
     from src.utils import config
 
+# Compare Merton, GARCH, Regime-Switching, and MS-GARCH implied spreads
+# against market CDS spreads
 
 MATURITIES = [1, 3, 5]
 MIN_CDS_COMPARISON_DATE = pd.Timestamp("2017-01-01")
@@ -65,7 +51,6 @@ MODEL_SPECS = {
     },
 }
 
-# Fixed color mapping used across all model comparison plots.
 MODEL_LABEL_ORDER = ["GARCH", "MS-GARCH", "Merton", "Regime-Switching"]
 MODEL_COLORS = {
     "GARCH": "#4C72B0",
@@ -197,7 +182,7 @@ def _load_company_mapping(merton_file: Path) -> pd.DataFrame:
     merton_df["date"] = pd.to_datetime(merton_df["date"], errors="coerce")
     merton_df = merton_df.dropna(subset=["gvkey", "company", "date"])
 
-    # Prefer liabilities / asset_value; fallback liabilities / mkt_cap if asset_value missing.
+    # Prefer liabilities / asset_value, only fallback to liabilities / mkt_cap
     merton_df["leverage_ratio"] = np.where(
         merton_df["asset_value"].gt(0),
         merton_df["liabilities_total"] / merton_df["asset_value"],
@@ -236,6 +221,7 @@ def _load_model_long(model_key: str, spec: dict, output_dir: Path) -> pd.DataFra
     return model_long.dropna(subset=["gvkey", "date", "model_spread_bps"])
 
 
+# Build the unified panel: merge all model spreads with market CDS data
 def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     print("Loading market CDS data...")
     cds_market = load_all_market_cds_data(cfg.input_dir)
@@ -287,14 +273,15 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     return panel
 
 
+# Add day-over-day change columns for model and market spreads
 def add_change_series(panel: pd.DataFrame) -> pd.DataFrame:
     out = panel.copy()
     out["delta_model"] = out.groupby(["gvkey", "model", "maturity"])["model_spread_bps"].diff()
     out["delta_market"] = out.groupby(["gvkey", "maturity"])["market_spread_bps"].diff()
     return out
 
-
 def add_period_and_volatility_regimes(panel: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
+    # Assign macro-period labels and rolling volatility regimes
     out = panel.copy()
 
     period_ranges = DEFAULT_PERIOD_RANGES.copy()
@@ -344,6 +331,7 @@ def add_period_and_volatility_regimes(panel: pd.DataFrame, cfg: AnalysisConfig) 
     return out
 
 
+# Compute RMSE, MAE, bias, and correlation metrics per segment
 def compute_performance_summary(panel: pd.DataFrame, segment_cols: list[str], min_obs: int) -> pd.DataFrame:
     records = []
 
@@ -379,6 +367,7 @@ def compute_performance_summary(panel: pd.DataFrame, segment_cols: list[str], mi
     return pd.DataFrame(records)
 
 
+# Diebold-Mariano test for predictive accuracy
 def _dm_test(loss_a: pd.Series, loss_b: pd.Series) -> tuple[float, float]:
     diff = (loss_a - loss_b).dropna()
     n = len(diff)
@@ -393,6 +382,7 @@ def _dm_test(loss_a: pd.Series, loss_b: pd.Series) -> tuple[float, float]:
     return float(stat), float(pval)
 
 
+# Hotelling-Williams test for comparing two dependent correlations with market
 def _hw_corr_diff_test(df: pd.DataFrame, model_a: str, model_b: str) -> tuple[float, float, float, float]:
     wide = df.pivot_table(
         index=["gvkey", "date", "maturity"],
@@ -440,6 +430,7 @@ def _sig_stars(p: float) -> str:
     return ""
 
 
+# Run DM and Hotelling-Williams tests for all model pairs within each segment
 def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     dm_rows = []
     hw_rows = []
@@ -514,6 +505,7 @@ def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.D
     return pd.DataFrame(dm_rows), pd.DataFrame(hw_rows)
 
 
+# For each observation, pick the model with lowest absolute error
 def compute_best_model_tables(panel: pd.DataFrame) -> dict[str, pd.DataFrame]:
     base = panel[
         [
@@ -589,6 +581,7 @@ def compute_best_model_tables(panel: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
+# Identify segments where MS-GARCH has the highest win share
 def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     parts = []
 
@@ -631,11 +624,13 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
 
 
 def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], output_dir: Path) -> None:
+    # Generate and save plots
+
     sns.set_theme(style="whitegrid")
     fig_dir = output_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Winner share by leverage and maturity
+    # Winner share by leverage and maturity
     tbl = best_tables["best_model_share_by_leverage"].copy()
     if not tbl.empty:
         plt.figure(figsize=(11, 6))
@@ -656,7 +651,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
         plt.savefig(fig_dir / "best_model_share_by_leverage.png", dpi=220)
         plt.close()
 
-    # 2) Year-maturity heatmaps of best model shares
+    # Year-maturity heatmaps of best model shares
     by_year = best_tables["best_model_share_by_year"].copy()
     if not by_year.empty:
         for model_label in sorted(by_year["best_model_label"].unique()):
@@ -672,7 +667,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
             plt.savefig(fig_dir / f"heatmap_wins_{safe_name}.png", dpi=220)
             plt.close()
 
-    # 3) RMSE trend by year
+    # RMSE trends by year
     perf_year = compute_performance_summary(panel, ["year", "maturity"], min_obs=30)
     if not perf_year.empty:
         g = sns.relplot(
@@ -694,7 +689,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
         g.savefig(fig_dir / "rmse_trend_by_year.png", dpi=220)
         plt.close("all")
 
-    # 4) Firm-level RMSE distribution
+    # Firm-level RMSE distribution
     perf_firm = compute_performance_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=60)
     if not perf_firm.empty:
         plt.figure(figsize=(12, 6))
@@ -718,7 +713,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
         plt.savefig(fig_dir / "firm_rmse_boxplot.png", dpi=220)
         plt.close()
 
-    # 5) Correlation comparison
+    # Correlation comparison
     perf_overall = compute_performance_summary(panel, ["maturity"], min_obs=60)
     if not perf_overall.empty:
         corr_long = perf_overall.melt(
@@ -744,7 +739,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
         plt.savefig(fig_dir / "correlation_by_model_maturity.png", dpi=220)
         plt.close()
 
-    # 6) Winner share by period (focus on different macro periods including COVID)
+    # Winner share by period
     by_period = best_tables.get("best_model_share_by_period", pd.DataFrame())
     if not by_period.empty:
         period_order = ["Pre-COVID", "COVID Shock", "Recovery", "Post-Recovery"]
@@ -766,7 +761,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
         plt.savefig(fig_dir / "best_model_share_by_period.png", dpi=220)
         plt.close()
 
-    # 7) MS-GARCH wins across period x volatility x maturity
+    # MS-GARCH wins across period, volatility and maturity
     by_period_vol = best_tables.get("best_model_share_by_period_volatility", pd.DataFrame())
     if not by_period_vol.empty:
         msg = by_period_vol[by_period_vol["best_model_label"] == "MS-GARCH"].copy()
@@ -792,6 +787,7 @@ def run_model_performance_paper(
     leverage_group: str | list[str] | None = None,
     period_ranges: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> dict[str, Path]:
+    # Build panel, compute all metrics, run tests, save outputs
     if output_dir is None:
         output_dir = config.OUTPUT_DIR
     if input_dir is None:

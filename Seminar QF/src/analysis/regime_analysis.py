@@ -1,28 +1,14 @@
-"""
-MS-GARCH Parameter Analysis & GARCH Dynamics Visualization.
-
-Provides:
-  - extract_regime_metrics(ms_garch_df) → DataFrame of derived per-regime metrics
-  - plot_parameter_comparison(metrics_df)
-  - plot_persistence_and_volatility(metrics_df)
-  - plot_news_impact_curves(metrics_df)
-  - plot_volatility_impulse_response(metrics_df)
-  - plot_regime_probabilities_ts(ms_garch_df)  [only if smoothed probs exist]
-  - run_ms_garch_analysis(ms_garch_df)  ← convenience wrapper
-
-All functions are designed to work with the ms_garch DataFrame as loaded from
-``data/output/ms_garch_parameters.csv`` (columns: omega_0/1, alpha_0/1, beta_0/1,
-nu_0/1, mu_0/1, p00, p11, …).
-"""
+# regime_analysis.py
+# MS-GARCH parameter analysis and GARCH dynamics visualization.
+# Extracts per-regime metrics (persistence, unconditional vol, half-life, etc.)
+# and produces diagnostic plots (bar charts, news impact curves, impulse responses).
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
 
-# ---------------------------------------------------------------------------
-# Colours consistent with the rest of regime_analysis.ipynb
-# ---------------------------------------------------------------------------
+# Colour palette consistent with the regime_analysis notebook
 _R0_COLOR = '#3498db'
 _R1_COLOR = '#e74c3c'
 _REGIME_LABELS = {0: 'Regime 0 (Low Vol)', 1: 'Regime 1 (High Vol)'}
@@ -30,11 +16,11 @@ _REGIME_COLORS = {0: _R0_COLOR, 1: _R1_COLOR}
 
 
 # ===================================================================
-# A) Parameter extraction + derived metrics
+# A) Parameter extraction and derived metrics
 # ===================================================================
 
+# Trimmed mean — drops top/bottom 5% to avoid near-IGARCH inflation
 def _trimmed_mean(s, pct=0.05):
-    """Mean after dropping the top and bottom *pct* fraction (NaN-safe)."""
     s = s.dropna()
     if len(s) == 0:
         return np.nan
@@ -43,28 +29,8 @@ def _trimmed_mean(s, pct=0.05):
     return trimmed.mean() if len(trimmed) > 0 else s.median()
 
 
+# Compute cross-sectional average per-regime GARCH metrics (persistence, uncond vol, half-life, etc.)
 def extract_regime_metrics(ms_garch_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute cross-sectional *average* per-regime GARCH metrics from the
-    MS-GARCH parameter DataFrame.
-
-    Returns a tidy DataFrame with rows = regimes, columns = metrics.
-
-    Metrics computed:
-        omega, alpha, beta, nu, mu,
-        persistence  (= alpha + beta),
-        stationary   (bool, persistence < 1),
-        uncond_var   (omega / (1 - persistence) if stationary, else NaN),
-        uncond_vol   (sqrt(uncond_var))  — **robust** trimmed mean of per-row values,
-        half_life    (ln(0.5) / ln(persistence) if 0 < persistence < 1),
-        p_stay       (self-transition probability),
-        p_switch     (1 - p_stay),
-        steady_state (long-run probability of being in this regime),
-        expected_duration (1 / (1 - p_stay)).
-
-    Near-IGARCH rows (persistence >= 0.999) are excluded from unconditional
-    volatility computation to avoid denominator-explosion artefacts.
-    """
     required = ['omega_0', 'alpha_0', 'beta_0']
     missing = [c for c in required if c not in ms_garch_df.columns]
     if missing:
@@ -82,8 +48,8 @@ def extract_regime_metrics(ms_garch_df: pd.DataFrame) -> pd.DataFrame:
         persistence = alpha + beta
         stationary  = persistence < 1.0
 
-        # --- Robust per-row unconditional vol ---
-        # Compute per-row, then take trimmed mean to avoid near-IGARCH inflation
+        # Robust unconditional vol — compute per-row, then trimmed-mean to
+        # avoid near-IGARCH rows inflating the average
         omega_s = ms_garch_df.get(f'omega_{sfx}', pd.Series(dtype=float))
         pers_s  = ms_garch_df.get(f'alpha_{sfx}', pd.Series(dtype=float)) + \
                   ms_garch_df.get(f'beta_{sfx}', pd.Series(dtype=float))
@@ -143,10 +109,8 @@ def extract_regime_metrics(ms_garch_df: pd.DataFrame) -> pd.DataFrame:
 # B) Plots
 # ===================================================================
 
-# --- 1) Parameter comparison bar chart -----------------------------------
-
+# Grouped bar chart of omega, alpha, beta per regime (+ separate nu panel)
 def plot_parameter_comparison(metrics_df: pd.DataFrame, figsize=(14, 5)):
-    """Grouped bar chart of omega, alpha, beta per regime (+ separate nu panel if available)."""
     garch_params = ['omega', 'alpha', 'beta']
     has_nu = 'nu' in metrics_df.columns and metrics_df['nu'].notna().all()
 
@@ -203,10 +167,8 @@ def plot_parameter_comparison(metrics_df: pd.DataFrame, figsize=(14, 5)):
     plt.show()
 
 
-# --- 2) Persistence + unconditional volatility --------------------------
-
+# Two-panel figure: persistence per regime (left) and unconditional volatility (right)
 def plot_persistence_and_volatility(metrics_df: pd.DataFrame, figsize=(14, 5)):
-    """Two-panel figure: persistence per regime (left) and unconditional volatility (right)."""
     fig, axes = plt.subplots(1, 2, figsize=figsize)
 
     regimes = metrics_df.index.tolist()
@@ -242,26 +204,17 @@ def plot_persistence_and_volatility(metrics_df: pd.DataFrame, figsize=(14, 5)):
     plt.show()
 
 
-# --- 3) News Impact Curve -----------------------------------------------
-
+# News Impact Curve per regime: h_next(eps) = omega + alpha·eps² + beta·h_bar
 def plot_news_impact_curves(metrics_df: pd.DataFrame, k: float = 4.0,
                             n_points: int = 500, figsize=(12, 6)):
-    """
-    News Impact Curve per regime.
-
-    h_next(eps) = omega_r + alpha_r * eps^2 + beta_r * h_bar_r
-
-    where h_bar_r is unconditional variance (if stationary) or falls back to
-    omega / 0.05 as a rough proxy.
-    """
     fig, ax = plt.subplots(figsize=figsize)
 
-    # Determine shared eps range from the regime with highest h_bar
+    # Shared eps range based on the regime with highest unconditional variance
     h_bars = {}
     for r in metrics_df.index:
         uv = metrics_df.loc[r, 'uncond_var']
         if np.isnan(uv):
-            # fallback: omega / 0.05 as rough proxy
+            # Fallback for non-stationary regimes — rough proxy
             uv = metrics_df.loc[r, 'omega'] / 0.05
             warnings.warn(f"Regime {r} non-stationary; using fallback h_bar = {uv:.2e}")
         h_bars[r] = uv
@@ -277,7 +230,7 @@ def plot_news_impact_curves(metrics_df: pd.DataFrame, k: float = 4.0,
         h_bar = h_bars[r]
 
         h_next = omega + alpha * eps ** 2 + beta * h_bar
-        # Convert to volatility (%) for intuitive y-axis
+        # Convert to volatility (%) for an intuitive y-axis
         vol_next = np.sqrt(h_next) * 100
 
         ax.plot(eps * 100, vol_next, color=_REGIME_COLORS[r],
@@ -292,18 +245,11 @@ def plot_news_impact_curves(metrics_df: pd.DataFrame, k: float = 4.0,
     plt.show()
 
 
-# --- 4) Volatility Impulse Response -------------------------------------
-
+# Volatility impulse-response: start at shocked variance, propagate with eps=0
 def plot_volatility_impulse_response(metrics_df: pd.DataFrame,
                                      shock_multiplier: float = 4.0,
                                      horizon: int = 50,
                                      figsize=(12, 6)):
-    """
-    Volatility impulse-response per regime.
-
-    Start at h0 = h_bar + shock_multiplier * h_bar, then propagate with
-    eps = 0: h_{t+1} = omega + beta * h_t.
-    """
     fig, ax = plt.subplots(figsize=figsize)
 
     for r in metrics_df.index:
@@ -338,20 +284,11 @@ def plot_volatility_impulse_response(metrics_df: pd.DataFrame,
     plt.show()
 
 
-# --- 5) (Optional) Smoothed regime probabilities over time ---------------
-
+# Plot ergodic regime probabilities averaged across firms over time
 def plot_regime_probabilities_ts(ms_garch_df: pd.DataFrame, figsize=(14, 5)):
-    """
-    Plot *steady-state* regime probabilities averaged across firms over time.
-
-    Uses columns ``steady_state_regime_0`` / ``steady_state_regime_1`` if they
-    exist (computed earlier in the notebook), otherwise computes them from
-    p00 / p11.  This is *not* a full Hamilton-filter; it's only the ergodic
-    probability implied by each firm's estimated transition matrix.
-    """
     df = ms_garch_df.copy()
 
-    # Ensure steady-state cols exist
+    # Compute steady-state probabilities if not already present
     for col, r in [('steady_state_regime_0', 0), ('steady_state_regime_1', 1)]:
         if col not in df.columns:
             if 'p00' in df.columns and 'p11' in df.columns:
@@ -396,67 +333,14 @@ _MATURITY_MAP = {'1Y': '1Y', '3Y': '3Y', '5Y': '5Y',
                  '1': '1Y', '3': '3Y', '5': '5Y'}
 
 
+# Compute summary statistics of alpha/beta over the actual simulation window per firm
 def compute_param_summary_by_company(
     df: pd.DataFrame,
     windows_df: pd.DataFrame,
     maturity: str | int,
     save_path: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Compute summary statistics of the alpha and beta parameters **over the
-    actual simulation window** for each company (gvkey), for a given CDS
-    maturity.
-
-    Only firms that have a window defined for the requested maturity are
-    included — firms without a window (e.g. those excluded from the CDS
-    comparison for that maturity) are silently dropped.
-
-    The statistics are computed exclusively over the date range
-    [start_date, end_date] from ``gvkey_maturity_simulation_windows.csv``,
-    matching the window actually used in the Monte Carlo and CDS comparison.
-    Two extra columns — ``window_start`` and ``window_end`` — are added to
-    the output so the window is always visible alongside the statistics.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame loaded from ``daily_asset_returns_with_msgarch.csv``.
-        Must contain columns: gvkey, date, alpha_0, beta_0, alpha_1, beta_1.
-    windows_df : pd.DataFrame
-        DataFrame loaded from ``gvkey_maturity_simulation_windows.csv``.
-        Must contain columns: gvkey, maturity, start_date, end_date.
-    maturity : str or int
-        CDS maturity to filter on.  Accepts ``'1Y'``, ``'3Y'``, ``'5Y'``
-        or the integer equivalents ``1``, ``3``, ``5``.
-    save_path : str | None
-        If provided, the long-form result is saved as a CSV to this path.
-
-    Returns
-    -------
-    pd.DataFrame
-        Long-form DataFrame with one row per (gvkey, regime, parameter).
-        Columns: gvkey, window_start, window_end, regime, param,
-        count, mean, median, std, min, Q1, Q3, max, range, IQR, n_outliers.
-
-    Statistics computed per (gvkey, regime, parameter)
-    ---------------------------------------------------
-        count       – number of non-null observations inside the window
-        mean        – arithmetic mean
-        median      – 50th percentile
-        std         – standard deviation (volatility of the parameter)
-        min / max   – extremes
-        Q1 / Q3     – 25th / 75th percentile
-        range       – max − min
-        IQR         – interquartile range (Q3 − Q1)
-        n_outliers  – values beyond 1.5 × IQR from the hinges (Tukey fences)
-
-    Examples
-    --------
-    >>> summary = compute_param_summary_by_company(df_msgarch, windows_df, maturity='5Y')
-    >>> summary = compute_param_summary_by_company(df_msgarch, windows_df, maturity=1,
-    ...                                            save_path='summary_1y.csv')
-    """
-    # -- Validate maturity --
+    # Validate maturity
     mat_key = _MATURITY_MAP.get(maturity)
     if mat_key is None:
         raise ValueError(
@@ -473,7 +357,7 @@ def compute_param_summary_by_company(
     if missing_w:
         raise ValueError(f"windows_df is missing required columns: {missing_w}")
 
-    # -- Filter windows to the requested maturity --
+    # Filter windows to the requested maturity
     win = windows_df[windows_df['maturity'] == mat_key].copy()
     win['gvkey']      = win['gvkey'].astype(int)
     win['start_date'] = pd.to_datetime(win['start_date'])
@@ -482,12 +366,12 @@ def compute_param_summary_by_company(
     if len(win) == 0:
         raise ValueError(f"No windows found for maturity '{mat_key}'.")
 
-    # -- Prepare msgarch DataFrame --
+    # Prepare MS-GARCH data
     df_work = df.copy()
     df_work['gvkey'] = df_work['gvkey'].astype(int)
     df_work['date']  = pd.to_datetime(df_work['date'])
 
-    # -- Helper: per-series statistics --
+    # Per-series descriptive statistics
     def _stats(s: pd.Series) -> dict:
         s = s.dropna()
         if len(s) == 0:
@@ -569,14 +453,8 @@ def compute_param_summary_by_company(
     return summary
 
 
+# Pretty-print the per-company alpha/beta summary as a wide pivot table
 def display_param_summary(summary: pd.DataFrame):
-    """
-    Pretty-print the per-company alpha/beta summary table produced by
-    :func:`compute_param_summary_by_company`.
-
-    Pivots the tidy long-form table into a wide format:
-    rows = gvkey (with window_start / window_end), columns = (regime, param, statistic).
-    """
     try:
         from IPython.display import display as ipy_display
         _display = ipy_display
@@ -610,26 +488,12 @@ def display_param_summary(summary: pd.DataFrame):
 
 
 # ===================================================================
-# Convenience wrapper
+# Convenience wrapper — run all analysis and plots in one call
 # ===================================================================
 
+# Extract metrics, print summary, and produce all diagnostic plots
 def run_ms_garch_analysis(ms_garch_df: pd.DataFrame, verbose: bool = True):
-    """
-    Run full MS-GARCH GARCH-dynamics analysis and print/plot everything.
-
-    Parameters
-    ----------
-    ms_garch_df : pd.DataFrame
-        The DataFrame loaded from ``ms_garch_parameters.csv``.
-    verbose : bool
-        If True, print the derived metrics table.
-
-    Returns
-    -------
-    pd.DataFrame
-        The derived regime metrics table.
-    """
-    # A) Extract & display metrics
+    # Extract and display metrics
     metrics = extract_regime_metrics(ms_garch_df)
 
     if verbose:
@@ -645,7 +509,7 @@ def run_ms_garch_analysis(ms_garch_df: pd.DataFrame, verbose: bool = True):
             print(metrics[display_cols].to_string())
         print()
 
-    # B) Plots
+    # Plots
     plot_parameter_comparison(metrics)
     plot_persistence_and_volatility(metrics)
     plot_news_impact_curves(metrics)

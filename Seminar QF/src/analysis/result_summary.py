@@ -2,11 +2,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 
+# Generate summary statistics and time-series plots from PD results.
+
 def generate_results_summary(results_file="monthly_pd_results.csv"):
-    """
-    Reads the PD results file, prints summary statistics, and generates a plot
-    of the average Probability of Default (PD) over time.
-    """
+    # Read PD results, print descriptive stats, and produce diagnostic plots
     if not os.path.exists(results_file):
         print(f"Error: {results_file} not found.")
         return
@@ -15,45 +14,40 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
     
     df = pd.read_csv(results_file)
     
-    # Ensure month_year is datetime
     df['month_year'] = pd.to_datetime(df['month_year'])
     
-    # Calculate Leverage (Liabilities / Assets)
+    # Leverage = liabilities / assets
     if 'liabilities_total' in df.columns and 'asset_value' in df.columns:
         df['leverage_ratio'] = df['liabilities_total'] / df['asset_value']
 
-    # --- 1. Extended Summary Statistics ---
+    # Descriptive Statistics
     cols_to_summarize = ['merton_pd', 'asset_volatility', 'asset_return_monthly', 'risk_free_rate', 'leverage_ratio']
-    # Filter for columns that actually exist
+    # Keep only columns that exist in the data
     cols_to_summarize = [c for c in cols_to_summarize if c in df.columns]
     
     print("\n--- Descriptive Statistics ---")
     desc_stats = df[cols_to_summarize].describe()
     print(desc_stats)
 
-    # --- 2. Correlation Matrix ---
+    # Correlation Matrix
     print("\n--- Correlation Matrix ---")
     corr_matrix = df[cols_to_summarize].corr()
     print(corr_matrix)
     
-    # --- 3. Plotting ---
+    # Plot average PD over time
     
-    # Plot 1: Average Merton PD Over Time (Separate Plots per Model)
-    
-    # Check for wide-format result columns (e.g. merton_pd_garch)
     pd_cols = [c for c in df.columns if 'merton_pd_' in c]
     
     if pd_cols:
         model_colors = {
-            'GARCH': '#1f77b4',      # Blue
-            'REGIME': '#ff7f0e',     # Orange
-            'MSGARCH': '#2ca02c',    # Green
+            'GARCH': '#1f77b4',
+            'REGIME': '#ff7f0e',
+            'MSGARCH': '#2ca02c',
         }
 
         for col in pd_cols:
             model_suffix = col.replace('merton_pd_', '').upper()
             
-            # Create a new figure for EACH model
             plt.figure(figsize=(10, 6))
             
             # Group by date and calculate mean
@@ -71,14 +65,12 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
             plt.legend()
             plt.tight_layout()
             
-            # Save separate files
             filename = f"average_pd_over_time_{model_suffix.lower()}.png"
             plt.savefig(filename)
             print(f"Saved plot: {filename}")
             plt.show()
 
     elif 'model' in df.columns:
-        # Plot each model separately (long format)
         for model_name in df['model'].unique():
             plt.figure(figsize=(10, 6))
             subset = df[df['model'] == model_name]
@@ -95,7 +87,6 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
             plt.show()
             
     elif 'merton_pd' in df.columns:
-        # Fallback for single model result without 'model' column
         avg_pd_over_time = df.groupby('month_year')['merton_pd'].mean()
         plt.figure(figsize=(10, 6))
         plt.plot(avg_pd_over_time.index, avg_pd_over_time.values, label='Average Merton PD', color='blue')
@@ -108,8 +99,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
         plt.savefig("average_pd_over_time.png")
         plt.show() 
 
-    
-    # Plot 2: MS-GARCH Regime Probability Over Time (if available)
+    # MS-GARCH regime probability over time
     if 'msgarch_prob_0' in df.columns:
         avg_prob0_over_time = df.groupby('month_year')['msgarch_prob_0'].mean()
         
@@ -126,14 +116,13 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
         print(f"\nPlot saved to regime_probability_over_time.png")
         plt.show() # Show second plot
 
-    # Plot 3: Asset Volatility vs Risk Free Rate (scatter)
-    # Check for any volatility column
+    # Asset volatility vs risk-free rate scatter
     vol_cols = [c for c in df.columns if 'volatility' in c and 'asset' not in c]
     if 'asset_volatility' in df.columns:
          y_col = 'asset_volatility'
          y_label = 'Asset Volatility'
     elif vol_cols:
-         y_col = vol_cols[0] # Take first available model volatility
+         y_col = vol_cols[0]
          y_label = f'{y_col} (Model)'
     else:
          y_col = None
@@ -150,8 +139,6 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
         print(f"\nPlot saved to volatility_vs_rate.png")
         plt.show()
 
-
-    # --- 4. Save Text Report ---
     with open("summary_report.txt", "w") as f:
         f.write("Results Summary Report\n")
         f.write("======================\n\n")

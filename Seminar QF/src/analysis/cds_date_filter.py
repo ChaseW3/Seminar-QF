@@ -1,9 +1,13 @@
 import pandas as pd
 from typing import Union
 
+# cds_date_filter.py
+# Utility functions for filtering simulation dates to match CDS data availability.
+# Supports several input formats: date-only, firm-date pairs, and firm-window files.
+
 
 def _normalize_gvkey_key(value) -> str:
-    """Normalize gvkey values into stable string keys across int/float/string inputs."""
+    # Normalize gvkey values to consistent string keys across int/float/string inputs
     if pd.isna(value):
         return ''
     text = str(value).strip()
@@ -19,7 +23,7 @@ def _normalize_gvkey_key(value) -> str:
 
 
 def _maturity_to_horizon_days(value):
-    """Map maturity labels like 1Y/3Y/5Y to trading-day horizons."""
+    # Map maturity labels (1Y/3Y/5Y) to trading-day horizons (252/756/1260)
     if pd.isna(value):
         return None
     text = str(value).strip().upper()
@@ -33,18 +37,8 @@ def _maturity_to_horizon_days(value):
 
 
 def load_allowed_cds_dates(cds_filter_file: str, use_column: str = 'Use_For_Model') -> Union[pd.DatetimeIndex, pd.DataFrame]:
-    """Load allowed simulation dates from CDS quality-screen output.
-
-        Supported file formats:
-            1) Date-level screen file with Use_For_Model column
-            2) Lightweight date-only file (single Date/date column)
-            3) Firm-date file with gvkey + Date/date columns
-            4) Firm-window file with gvkey + start_date + end_date columns
-            5) Firm-window-by-maturity with gvkey + maturity + start_date + end_date columns
-    Required columns:
-      - Date (or date) OR (start_date and end_date with gvkey)
-            - Optional Use_For_Model (default), optionally bool-like values
-    """
+    # Load allowed simulation dates from a CDS quality-screen file.
+    # Supports multiple formats: date-level, firm-date, firm-window, and firm-window-by-maturity.
     df = pd.read_csv(cds_filter_file)
 
     if {'gvkey', 'maturity', 'start_date', 'end_date'}.issubset(df.columns):
@@ -112,7 +106,7 @@ def load_allowed_cds_dates(cds_filter_file: str, use_column: str = 'Use_For_Mode
 
 
 def filter_df_to_allowed_dates(df: pd.DataFrame, allowed_dates: Union[pd.DatetimeIndex, pd.DataFrame], date_col: str = 'date', firm_col: str = 'gvkey') -> pd.DataFrame:
-    """Filter a dataframe to allowed normalized dates (or allowed firm-date pairs)."""
+    # Filter a DataFrame to rows that fall within allowed dates or firm-date windows
     if date_col not in df.columns:
         return df
 
@@ -196,7 +190,7 @@ def filter_df_to_allowed_dates(df: pd.DataFrame, allowed_dates: Union[pd.Datetim
             out = lhs.merge(rhs, on=['__date_norm', '__firm_key'], how='inner')
             return out.drop(columns=['__date_norm', '__firm_key'])
 
-        # Fallback to date-only if firm key is unavailable
+        # Fallback to date-only filtering if firm key is unavailable
         allowed_index = pd.DatetimeIndex(pd.to_datetime(allowed_dates[allowed_date_col], errors='coerce').dropna().dt.normalize().drop_duplicates())
         return work[work[date_col].dt.normalize().isin(allowed_index)].copy()
 

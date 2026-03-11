@@ -1,4 +1,7 @@
 # monte_carlo_ms_garch.py
+# Monte Carlo simulation under Markov-Switching GARCH dynamics.
+# Each regime has its own GARCH(1,1)-t process; transitions follow a Markov chain.
+# Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
 
 import pandas as pd
 import numpy as np
@@ -9,17 +12,15 @@ from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 
-MIN_RISK_FREE_RATE = 0.02
+MIN_RISK_FREE_RATE = 0.02  # Floor for risk-free rate
 
-# Daily variance cap: prevents impossible variance accumulation over multi-year horizons.
-# Set to (5%)² = 0.0025, corresponding to ~79% annualized volatility.
-# This preserves extreme real-world events (COVID VIX peak ≈ 80% annualized ≈ 5% daily σ)
-# while preventing the -0.5σ² risk-neutral drift from compounding destructively
-# over 1260 days for high-leverage firms.
-SIGMA2_MAX_DAILY = 0.0025  # (0.05)^2 — consistent across all three models
+# Daily variance cap: prevents variance from compounding destructively over multi-year horizons.
+# (5%)² = 0.0025, roughly 79% annualized vol — preserves real extreme events like COVID
+SIGMA2_MAX_DAILY = 0.0025
 
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
+    # Build the vector of horizon checkpoints (252d=1Y, 756d=3Y, 1260d=5Y)
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
     if max_days <= 756:
@@ -37,11 +38,8 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                                        horizon_days, v0_arr, liability_arr, rf_arr,
                                        use_antithetic=False,
                                        spread_cap=0.5):
-    """
-    Optimized Monte Carlo MS-GARCH simulation that computes only PD and spreads.
-    Uses log-asset evolution and sigma2 state to minimize exp() calls.
-    Returns only per-firm, per-horizon aggregates (no per-simulation arrays).
-    """
+    # JIT-compiled MS-GARCH Monte Carlo: simulates asset paths with regime-switching
+    # GARCH dynamics and per-regime t-distributed innovations
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
@@ -50,7 +48,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
     spread_out = np.full((n_horizons, num_firms), np.nan)
     debt_out = np.full((n_horizons, num_firms), np.nan)
     
-    # Pre-compute horizon mask
+    # Pre-compute which days correspond to output horizons
     is_horizon = np.zeros(max_days, dtype=np.int32)
     horizon_map = np.full(max_days, -1, dtype=np.int32)
     for h in range(n_horizons):
@@ -59,9 +57,9 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
             is_horizon[day_idx] = 1
             horizon_map[day_idx] = h
     
-    # Process firms sequentially (Joblib handles parallel dates)
+    # Process each firm sequentially (parallelism is across dates via Joblib)
     for f in range(num_firms):
-        # Constants
+        # Firm-level parameters for both regimes
         omega_0 = omega_0_arr[f]
         omega_1 = omega_1_arr[f]
         alpha_0 = alpha_0_arr[f]
@@ -78,21 +76,21 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
         liability = liability_arr[f]
         rf_rate = rf_arr[f]
         
-        # Check validity of Merton inputs
+        # Skip firms with missing or invalid Merton inputs
         valid_merton = (not np.isnan(v0)) and (not np.isnan(liability)) and (v0 > 0) and (liability > 0)
         valid_rf = (not np.isnan(rf_rate))
         if valid_rf:
             rf_rate = max(rf_rate, MIN_RISK_FREE_RATE)
         
         if not valid_merton:
-            # Skip this firm - outputs remain NaN
             continue
         
-        # Initialize log-space
+        # Work in log-space for numerical stability
         log_v0 = np.log(v0)
         liability_horizon = np.full(n_horizons, liability)
         log_liability_horizon = np.full(n_horizons, np.log(liability))
         if valid_rf:
+            # Grow the default barrier at the risk-free rate for each horizon
             rf_compound = max(rf_rate, 0.0)
             for h in range(n_horizons):
                 T_years = horizon_days[h] / 252.0
@@ -100,26 +98,26 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                 liability_horizon[h] = liability_T
                 log_liability_horizon[h] = np.log(liability_T)
         
-        # State Vectors (Size: num_simulations)
+        # Initialize variance state and log-asset paths for all simulations
         sigma2 = np.full(num_simulations, initial_sigma ** 2)
-        sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)  # Apply daily variance cap
+        sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)
         sigma = np.sqrt(np.maximum(sigma2, 1e-12))
         log_asset = np.full(num_simulations, log_v0)
         
-        # Risk-neutral drift: daily risk-free rate
+        # Daily risk-neutral drift component
         if valid_rf:
             rf_daily = rf_rate / 252.0
         else:
             rf_daily = 0.0
         
-        # Initialize regime state
+        # Randomly assign initial regime per simulation path
         regime_1_mask = np.random.random(num_simulations) < regime_prob
         
         # Accumulators for each horizon
         default_counts = np.zeros(n_horizons)
         payoff_sums = np.zeros(n_horizons)
         
-        # T-dist parameters
+        # T-distribution scaling factors per regime
         check_normal_0 = (nu_0 >= 100)
         check_normal_1 = (nu_1 >= 100)
         
@@ -136,7 +134,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
             t_factor_1 = np.sqrt((safe_nu_1 - 2) / safe_nu_1)
         
         for day in range(max_days):
-            # 1. Vectorized Random Generation per regime
+            # Draw random innovations (antithetic variates for variance reduction)
             if use_antithetic and num_simulations > 1:
                 half = num_simulations // 2
                 z_half = np.random.standard_normal(half)
@@ -148,7 +146,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
             else:
                 z = np.random.standard_normal(num_simulations)
             
-            # Generate t-distributed samples for both regimes
+            # Generate t-distributed samples for each regime separately
             if check_normal_0:
                 t_sample_0 = z
             else:
@@ -181,58 +179,57 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
                 v1 = np.maximum(v1, 1e-12)
                 t_sample_1 = z / np.sqrt(v1 / nu_1) * t_factor_1
 
+            # Select innovation based on current regime of each path
             t_sample = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
-            # TRUNCATION: Cap errors at 5 standard deviations (as per paper page 12)
+            # Truncate at ±5σ to prevent extreme tail draws
             t_sample = np.clip(t_sample, -5.0, 5.0)
             
-            # 2. Vectorized Updates with regime-specific parameters
+            # Update asset paths with regime-specific volatility
             eps = sigma * t_sample
 
-            # Update log-asset with risk-neutral drift: (r/252 - 0.5*sigma²) + sigma*Z
+            # Risk-neutral dynamics: log(V_t+1) = log(V_t) + (r - 0.5σ²) + σ·Z
             drift = rf_daily - 0.5 * sigma2
             log_asset += drift + eps
             
-            # 3. Horizon Check
+            # Check if today is a horizon date — record defaults and payoffs
             if is_horizon[day]:
                 h = horizon_map[day]
                 log_liability_T = log_liability_horizon[h]
                 liability_T = liability_horizon[h]
                 
-                # Default detection in log-space
+                # Default if asset value falls below liability at horizon
                 defaults = (log_asset < log_liability_T).astype(np.float64)
                 default_counts[h] = np.sum(defaults)
                 
-                # Compute asset values at horizon (exp only here)
+                # Compute recovery values (creditors get min of asset, liability)
                 asset_T = np.exp(log_asset)
                 payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)
             
-            # 4. GARCH Update using sigma2 state with regime-specific parameters
+            # Update GARCH variance with regime-specific parameters
             sigma2 = np.where(
                 regime_1_mask,
                 omega_1 + alpha_1 * eps**2 + beta_1 * sigma2,
                 omega_0 + alpha_0 * eps**2 + beta_0 * sigma2,
             )
-            sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)  # Daily variance cap
+            sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)
             sigma2 = np.maximum(sigma2, 1e-12)
             sigma = np.sqrt(sigma2)
             
-            # 5. Regime Transition
+            # Markov regime transition
             u = np.random.random(num_simulations)
             switch_to_0 = regime_1_mask & (u > p11)
             switch_to_1 = (~regime_1_mask) & (u > p00)
             regime_1_mask = (regime_1_mask & (~switch_to_0)) | switch_to_1
         
-        # Compute PD and spreads for each horizon
+        # Convert simulation counts to PD and implied spreads
         for h in range(n_horizons):
-            # PD
             pd_out[h, f] = default_counts[h] / num_simulations
             
-            # Expected payoff and debt value
             expected_payoff = payoff_sums[h] / num_simulations
             
-            # Compute spreads only if rf_rate is valid
+            # CDS spread = yield-to-maturity minus risk-free rate
             if valid_rf:
                 T_years = horizon_days[h] / 252.0
                 liability_T = liability_horizon[h]
@@ -248,20 +245,7 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
 
 
 def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False, spread_cap=0.5):
-    """
-    Parameters:
-    -----------
-    date_data : tuple
-        (date, df_date, merton_data_dict) 
-    num_simulations : int
-        Number of Monte Carlo paths
-    num_days : int
-        Forecast horizon in days (should be max of horizons, e.g., 1260 for 5y)
-        
-    Returns:
-    --------
-    list : Results for all firms on this date
-    """
+    # Process all firms for a single date — called in parallel by Joblib
     date, df_date, merton_data_dict = date_data
     
     if df_date.empty:
@@ -304,7 +288,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
         else:
             has_estimated_model_params &= False
 
-    # Vectorized parameter extraction with defaults and floors
+    # Extract MS-GARCH parameters with safe defaults for numerical stability
     omega_0_arr = np.maximum(series_map['omega_0'].fillna(1e-6).values, 1e-8)
     omega_1_arr = np.maximum(series_map['omega_1'].fillna(1e-6).values, 1e-8)
     alpha_0_arr = np.maximum(series_map['alpha_0'].fillna(0.05).values, 1e-4)
@@ -312,9 +296,8 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     beta_0_arr = np.maximum(series_map['beta_0'].fillna(0.93).values, 0.0)
     beta_1_arr = np.maximum(series_map['beta_1'].fillna(0.93).values, 0.0)
     
-    # CRITICAL FIX: Ensure omega values have a reasonable floor to prevent variance collapse
-    # Omega should be at least (1-alpha-beta) * (min_reasonable_variance)
-    # where min_reasonable_variance ≈ (0.001)^2 = 1e-6 (0.1% daily vol)
+    # CRITICAL FIX: Floor omega to prevent variance collapse toward zero
+    # Omega must be at least (1 - persistence) × min_reasonable_variance
     min_variance = 1e-6
     for idx in range(len(omega_0_arr)):
         persistence_0 = alpha_0_arr[idx] + beta_0_arr[idx]
@@ -329,7 +312,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
     p00_arr = series_map['p00'].fillna(0.95).values
     p11_arr = series_map['p11'].fillna(0.95).values
 
-    # Light stability bounds for Monte Carlo inputs (consistent across all models)
+    # Clip nu to [2.1, 200] — below 2.1 variance is infinite, above 200 is indistinguishable from normal
     nu_min, nu_max = 2.1, 200.0
     nu_0_arr = np.clip(series_map['nu_0'].fillna(30.0).values, nu_min, nu_max)
     nu_1_arr = np.clip(series_map['nu_1'].fillna(30.0).values, nu_min, nu_max)
