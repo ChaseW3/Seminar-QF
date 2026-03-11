@@ -1,7 +1,3 @@
-# monte_carlo_merton.py
-# Monte Carlo simulation of asset paths under the classic Merton model (constant volatility).
-# Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
-
 import pandas as pd
 import numpy as np
 import numba
@@ -9,12 +5,14 @@ from datetime import timedelta
 from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
+# Monte Carlo simulation of asset paths under the classic Merton model (constant volatility).
+# Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
 
 MIN_RISK_FREE_RATE = 0.02  # Floor for risk-free rate
 
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
-    # Build the vector of horizon checkpoints (252d=1Y, 756d=3Y, 1260d=5Y)
+    # Build the vector of horizon checkpoints
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
     if max_days <= 756:
@@ -27,12 +25,10 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
                                     num_simulations, num_firms,
                                     horizon_days, v0_arr, liability_arr, rf_arr,
                                     spread_cap=0.5):
-    # JIT-compiled Merton Monte Carlo: simulates asset paths with constant
-    # volatility and normal innovations, returns PD and spreads per horizon
+    # Simulates asset paths with constant volatility and normal innovations
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
-    # Output arrays: (n_horizons, num_firms)
     pd_out = np.full((n_horizons, num_firms), np.nan)
     spread_out = np.full((n_horizons, num_firms), np.nan)
     debt_out = np.full((n_horizons, num_firms), np.nan)
@@ -46,7 +42,7 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
             is_horizon[day_idx] = 1
             horizon_map[day_idx] = h
     
-    # Process each firm sequentially (parallelism is across dates via Joblib)
+    # Process each firm sequentially (parallelism across dates)
     for f in range(num_firms):
         # Firm-level parameters
         sigma = sigma_daily_arr[f]
@@ -97,19 +93,19 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
             # Truncate at ±5σ to prevent extreme tail draws
             z = np.clip(z, -5.0, 5.0)
             
-            # Update asset paths: constant volatility version
+            # Update asset paths, constant volatility version
             eps = sigma * z
             
             # Risk-neutral dynamics: log(V_t+1) = log(V_t) + drift + σ·Z
             log_asset += drift_daily + eps
             
-            # Check if today is a horizon date — record defaults and payoffs
+            # Check if today is a horizon date, record defaults and payoffs
             if is_horizon[day]:
                 h = horizon_map[day]
                 log_liability_T = log_liability_horizon[h]
                 liability_T = liability_horizon[h]
                 
-                # Default if asset falls below liability (terminal PD for Merton)
+                # Default if asset falls below liability
                 defaults = (log_asset < log_liability_T).astype(np.float64)
                 default_counts[h] = np.sum(defaults)
                 
@@ -142,19 +138,17 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
 
 
 def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_cap=0.5):
-    # Process all firms for a single date — called in parallel by Joblib
+    # Process all firms for a single date
     date, df_date = date_data
     
     if df_date.empty:
         return []
     
-    # Vectorized preparation: drop duplicates and sort
+    # Drop duplicates and sort
     df_firms = df_date.drop_duplicates('gvkey', keep='first').sort_values('gvkey').reset_index(drop=True)
     firms_list = df_firms['gvkey'].tolist()
     num_firms = len(firms_list)
     
-    # Vectorized parameter extraction with defaults and floors
-    # asset_volatility from Merton estimation is already daily, not annual
     sigma_daily_arr = np.maximum(df_firms.get('asset_volatility', pd.Series([0.2/np.sqrt(252)]*num_firms)).fillna(0.2/np.sqrt(252)).values, 1e-4)
     
     # Prepare Merton arrays

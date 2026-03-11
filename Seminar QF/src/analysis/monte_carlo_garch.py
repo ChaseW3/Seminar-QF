@@ -1,25 +1,21 @@
-# monte_carlo_garch.py
-# Monte Carlo simulation of asset paths under GARCH(1,1)-t volatility dynamics.
-# Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
-
 import pandas as pd
 import numpy as np
-import os
 from datetime import timedelta
 import numba
 from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
+# Monte Carlo simulation of asset paths under GARCH(1,1) t volatility dynamics.
+# Computes default probabilities and CDS-implied spreads
 
 MIN_RISK_FREE_RATE = 0.02  # Floor for risk-free rate
 
-# Daily variance cap: prevents variance from compounding destructively over multi-year horizons.
-# (5%)² = 0.0025, roughly 79% annualized vol — preserves real extreme events like COVID
+# Daily variance cap: prevents variance from compounding destructively over multi-year horizons
 SIGMA2_MAX_DAILY = 0.0025
 
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
-    # Build the vector of horizon checkpoints (252d=1Y, 756d=3Y, 1260d=5Y)
+    # Build the vector of horizon checkpoints 
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
     if max_days <= 756:
@@ -34,8 +30,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
                                     horizon_days, v0_arr, liability_arr, rf_arr,
                                     use_antithetic=False,
                                     spread_cap=0.5):
-    # JIT-compiled GARCH Monte Carlo: simulates asset paths with time-varying
-    # volatility and t-distributed innovations, returns PD and spreads per horizon
+    # Simulates asset paths with time-varying volatility and t-distributed innovations
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
@@ -53,7 +48,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             is_horizon[day_idx] = 1
             horizon_map[day_idx] = h
     
-    # Process each firm sequentially (parallelism is across dates via Joblib)
+    # Process each firm sequentially
     for f in range(num_firms):
         # Firm-level GARCH and Merton parameters
         omega = omega_arr[f]
@@ -73,7 +68,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         if not valid_merton:
             continue
         
-        # Work in log-space for numerical stability
+        # Log-space
         log_v0 = np.log(v0)
         liability_horizon = np.full(n_horizons, liability)
         log_liability_horizon = np.full(n_horizons, np.log(liability))
@@ -102,7 +97,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
         default_counts = np.zeros(n_horizons)
         payoff_sums = np.zeros(n_horizons)
         
-        # T-distribution scaling factor — ensures unit variance after rescaling
+        # T-dist parameters
         check_normal = (nu >= 100)
         
         if nu > 2.05:
@@ -112,7 +107,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             t_factor = np.sqrt((safe_nu - 2) / safe_nu)
         
         for day in range(max_days):
-            # Draw random innovations (antithetic variates for variance reduction)
+            # Draw random innovations
             if use_antithetic and num_simulations > 1:
                 half = num_simulations // 2
                 z_half = np.random.standard_normal(half)
@@ -141,7 +136,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
                 v = np.maximum(v, 1e-12)
                 t_sample = z / np.sqrt(v / nu) * t_factor
             
-            # 2. Vectorized Updates
+
             # Truncate innovations at ±5σ to prevent extreme tail draws
             t_sample = np.clip(t_sample, -5.0, 5.0)
             eps = sigma * t_sample
@@ -150,7 +145,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
             drift = rf_daily - 0.5 * sigma2
             log_asset += drift + eps
             
-            # 3. Check if today is a horizon date — record defaults and payoffs
+            # Check if today is a horizon date, record defaults and payoffs
             if is_horizon[day]:
                 h = horizon_map[day]
                 log_liability_T = log_liability_horizon[h]
@@ -165,7 +160,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
                 payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)
             
-            # 4. Update GARCH variance: σ²_{t+1} = ω + α·ε² + β·σ²_t
+            # Update GARCH variance: σ²_{t+1} = ω + α·ε² + β·σ²_t
             sigma2 = omega + alpha * eps**2 + beta * sigma2
             sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)
             sigma2 = np.maximum(sigma2, 1e-12)
@@ -195,7 +190,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
 
 
 def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_garch=True, use_antithetic=False, spread_cap=0.5):
-    # Process all firms for a single date — called in parallel by Joblib
+    # Process all firms for a single date
     date, df_date, merton_data_dict = date_data
     
     if df_date.empty:
@@ -212,18 +207,17 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     else:
         has_estimated_garch_params = np.zeros(num_firms, dtype=bool)
 
-    # Extract GARCH parameters with safe defaults — firms without estimated params
-    # are excluded from output when exclude_firms_without_estimated_garch=True
+    # Extract GARCH parameters
     omega_arr = np.maximum(df_firms.get('garch_omega', pd.Series([1e-6]*num_firms)).fillna(1e-6).values, 1e-8)
     alpha_arr = np.maximum(df_firms.get('garch_alpha', pd.Series([0.05]*num_firms)).fillna(0.05).values, 1e-4)
     beta_arr = np.maximum(df_firms.get('garch_beta', pd.Series([0.93]*num_firms)).fillna(0.93).values, 0.0)
     sigma_arr = np.maximum(df_firms.get('garch_volatility', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
 
-    # Clip nu to [2.1, 200] — below 2.1 variance is infinite, above 200 is indistinguishable from normal
+    # Clip nu to [2.1, 200], below 2.1 variance is infinite, above 200 is indistinguishable from normal
     nu_min, nu_max = 2.1, 200.0
     nu_arr = np.clip(df_firms.get('garch_nu', pd.Series([30.0]*num_firms)).fillna(30.0).values, nu_min, nu_max)
 
-    # Smart omega floor: prevent variance collapse when persistence is below 1
+    # Omega floor, prevent variance collapse when persistence is below 1
     min_variance = 1e-6
     for idx in range(num_firms):
         persistence = alpha_arr[idx] + beta_arr[idx]
@@ -246,14 +240,13 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
             v0_arr[firm_idx] = v0
             liability_arr[firm_idx] = liability
             
-            # Scale rf_rate if needed
             if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
                 rf_rate = rf_rate / 100.0
             if not np.isnan(rf_rate):
                 rf_rate = max(rf_rate, MIN_RISK_FREE_RATE)
             rf_arr[firm_idx] = rf_rate
     
-    # Maturity-aware horizons per firm-date; default to 5Y if not provided
+    # Maturity aware horizons per firm-date
     if 'cds_max_horizon_days' in df_firms.columns:
         required_horizons = pd.to_numeric(df_firms['cds_max_horizon_days'], errors='coerce').fillna(1260).astype(int).values
     else:
@@ -310,7 +303,7 @@ def _process_single_date_garch_mc(date_data, num_simulations, num_days, exclude_
     mc_debt_3y = debt_out[1, :]
     mc_debt_5y = debt_out[2, :]
     
-    # Assemble results
+    # Collect results
     results_list = []
     for firm_idx, firm in enumerate(firms_list):
         results_list.append({
@@ -390,7 +383,6 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
                 df_m = merton_by_date[date]
                 firms_on_date = group['gvkey'].unique()
                 df_m_relevant = df_m[df_m['gvkey'].isin(firms_on_date)]
-                # Vectorized construction: subset columns, drop duplicates (keep='last'), convert to dict
                 df_m_subset = df_m_relevant[['gvkey', 'asset_value', 'liabilities_total', 'risk_free_rate']]
                 df_m_subset = df_m_subset.drop_duplicates(subset='gvkey', keep='last')
                 merton_date_dict = df_m_subset.set_index('gvkey').to_dict('index')
@@ -400,9 +392,6 @@ def monte_carlo_garch_1year_parallel(garch_file, merton_file, gvkey_selected=Non
         date_groups = [(pd.Timestamp.now().date(), df, {})]
     
     print(f"\nProcessing {len(date_groups)} dates in parallel...")
-    
-    # OPTIMIZATION: Avoid Joblib overhead for single date / Numba interaction
-    use_joblib = True
 
     # Parallel processing across dates
     print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")

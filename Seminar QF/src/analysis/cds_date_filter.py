@@ -1,10 +1,7 @@
 import pandas as pd
 from typing import Union
 
-# cds_date_filter.py
-# Utility functions for filtering simulation dates to match CDS data availability.
-# Supports several input formats: date-only, firm-date pairs, and firm-window files.
-
+# Functions for filtering the data according to cds availability
 
 def _normalize_gvkey_key(value) -> str:
     # Normalize gvkey values to consistent string keys across int/float/string inputs
@@ -23,7 +20,7 @@ def _normalize_gvkey_key(value) -> str:
 
 
 def _maturity_to_horizon_days(value):
-    # Map maturity labels (1Y/3Y/5Y) to trading-day horizons (252/756/1260)
+    # Map maturity labels to trading-day horizons
     if pd.isna(value):
         return None
     text = str(value).strip().upper()
@@ -37,8 +34,7 @@ def _maturity_to_horizon_days(value):
 
 
 def load_allowed_cds_dates(cds_filter_file: str, use_column: str = 'Use_For_Model') -> Union[pd.DatetimeIndex, pd.DataFrame]:
-    # Load allowed simulation dates from a CDS quality-screen file.
-    # Supports multiple formats: date-level, firm-date, firm-window, and firm-window-by-maturity.
+    # Load allowed simulation dates from a CDS screening file
     df = pd.read_csv(cds_filter_file)
 
     if {'gvkey', 'maturity', 'start_date', 'end_date'}.issubset(df.columns):

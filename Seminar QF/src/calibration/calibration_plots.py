@@ -1,19 +1,11 @@
-"""
-Plotting utilities for the affine calibration module.
-
-Completely self-contained – does not import from the main src.utils or src.analysis.
-"""
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from typing import Dict, Optional, List
 
+# Plotting for the affine calibration module
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  1.  Time-series: raw vs calibrated vs market
-# ──────────────────────────────────────────────────────────────────────────────
 
 def plot_timeseries(
     cal_df: pd.DataFrame,
@@ -22,9 +14,7 @@ def plot_timeseries(
     figsize: tuple = (14, 5),
     save_path: Optional[str] = None,
 ):
-    """
-    Plot market, raw-model, and calibrated spreads over time for one firm.
-    """
+    # Time-series for market, raw-model, and calibrated spreads for one firm
     firm = cal_df[cal_df['gvkey'] == gvkey].sort_values('date').copy()
     if firm.empty:
         print(f"No data for gvkey {gvkey}")
@@ -48,10 +38,6 @@ def plot_timeseries(
     plt.show()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  2.  Scatter: model vs market (raw & calibrated side by side)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_scatter_comparison(
     cal_df: pd.DataFrame,
     model_name: str = '',
@@ -60,11 +46,7 @@ def plot_scatter_comparison(
     axis_limit: Optional[float] = None,
     save_path: Optional[str] = None,
 ):
-    """
-    Two scatter plots side by side:
-        left  – raw model vs market
-        right – calibrated model vs market
-    """
+    # Scatter plots for raw model vs market and calibrated vs market
     fig, axes = plt.subplots(1, 2, figsize=figsize)
 
     for ax, col, label in zip(
@@ -101,10 +83,6 @@ def plot_scatter_comparison(
     plt.show()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  3.  Rolling β₀ and β₁ over time
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_rolling_betas(
     cal_df: pd.DataFrame,
     model_name: str = '',
@@ -112,10 +90,7 @@ def plot_rolling_betas(
     figsize: tuple = (14, 7),
     save_path: Optional[str] = None,
 ):
-    """
-    Plot the cross-sectional median β₀(t) and β₁(t) over time,
-    with 25th–75th percentile bands.
-    """
+    # Line plots of cross-sectional median betas over time with IQR bands
     valid = cal_df.dropna(subset=['beta0', 'beta1'])
     if valid.empty:
         print("No calibration parameters to plot.")
@@ -160,24 +135,12 @@ def plot_rolling_betas(
     plt.show()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  4.  Bar chart: RMSE comparison across models (raw vs calibrated)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_rmse_comparison(
     metrics_dict: Dict[str, Dict[str, Dict[str, float]]],
     figsize: tuple = (12, 5),
     save_path: Optional[str] = None,
 ):
-    """
-    Grouped bar chart comparing RMSE (raw vs calibrated) for each model × maturity.
-
-    Parameters
-    ----------
-    metrics_dict : dict
-        Nested dict:  {model_name: {maturity_key: {metric_name: value}}}
-        e.g.  {'GARCH': {'5y': {'rmse_raw': 120, 'rmse_calibrated': 45}}}
-    """
+    # Grouped bar chart for RMSE raw vs callibrated for each model and maturity
     rows = []
     for model, mats in metrics_dict.items():
         for mat, m in mats.items():
@@ -216,16 +179,10 @@ def plot_rmse_comparison(
     plt.show()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  5.  Summary metrics table
-# ──────────────────────────────────────────────────────────────────────────────
-
 def metrics_summary_table(
     metrics_dict: Dict[str, Dict[str, Dict[str, float]]],
 ) -> pd.DataFrame:
-    """
-    Build a tidy DataFrame of all evaluation metrics.
-    """
+    # Build dataset of all evaluation metrics
     rows = []
     for model, mats in metrics_dict.items():
         for mat, m in mats.items():
@@ -235,10 +192,6 @@ def metrics_summary_table(
     return pd.DataFrame(rows)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  6.  Mean / Median calibrated vs market over time
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_mean_median_vs_market(
     cal_df: pd.DataFrame,
     model_name: str = '',
@@ -246,11 +199,7 @@ def plot_mean_median_vs_market(
     figsize: tuple = (15, 10),
     save_path: Optional[str] = None,
 ):
-    """
-    Two-panel time-series plot:
-        top    – cross-sectional MEAN of calibrated, raw-model, and market spreads
-        bottom – cross-sectional MEDIAN of the same
-    """
+    # Time series cross-sectional mean and median of calibrated, raw and market spreads
     valid = cal_df.dropna(subset=['calibrated', 'market']).copy()
     if valid.empty:
         print("No valid calibrated data to plot.")
@@ -300,21 +249,13 @@ def plot_mean_median_vs_market(
     plt.show()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  7.  Mean / Median calibrated vs market by leverage group
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _assign_leverage_groups(
     cal_df: pd.DataFrame,
     merton_file,
     leverage_metric: str = 'debt_to_equity',
     n_groups: int = 3,
 ) -> tuple:
-    """
-    Attach a ``leverage_group`` column to *cal_df* using the Merton file.
-
-    Returns (cal_df_with_group, leverage_label, group_names).
-    """
+    # Attach a leverage_group column to cal_df using firm-level leverage from the Merton file
     lev_df = pd.read_csv(merton_file, parse_dates=['date'])
     required = ['gvkey', 'date', 'liabilities_total', 'mkt_cap', 'asset_value']
     lev_df = lev_df[[c for c in required if c in lev_df.columns]].copy()
@@ -360,10 +301,7 @@ def plot_mean_median_by_leverage(
     figsize_per_group: tuple = (15, 4.2),
     save_path: Optional[str] = None,
 ):
-    """
-    One subplot per leverage group showing aggregated (mean or median)
-    calibrated-model vs market CDS spreads over time.
-    """
+    # One subplot per leverage group for aggregated calibrated-model vs market spreads over time
     merged, leverage_label, group_names = _assign_leverage_groups(
         cal_df, merton_file, leverage_metric, n_groups,
     )
@@ -424,7 +362,7 @@ def plot_mean_median_by_leverage(
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
-    # Print leverage group membership
+    # Print leverage group
     firm_info = merged[['gvkey', 'company', 'leverage_group', 'leverage_value']].drop_duplicates('gvkey')
     firm_info = firm_info.sort_values(['leverage_group', 'leverage_value'])
     print(f"\nFirm membership ({leverage_label}):")

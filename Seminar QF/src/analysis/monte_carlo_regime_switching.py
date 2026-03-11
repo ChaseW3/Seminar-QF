@@ -1,27 +1,20 @@
-
-# monte_carlo_regime_switching.py
-# Monte Carlo simulation under a regime-switching model with t-distributed innovations.
-# Each regime has constant volatility; transitions follow a Markov chain.
-# Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
-
 import pandas as pd
 import numpy as np
-import os
 from datetime import timedelta
 import numba
 from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
+# Monte Carlo simulation under a regime-switching model with t-distributed innovations, computes default probabilities and CDS-implied spreads
 
 MIN_RISK_FREE_RATE = 0.02  # Floor for risk-free rate
 
-# Daily variance cap: prevents variance from compounding destructively over multi-year horizons.
-# (5%)² = 0.0025, roughly 79% annualized vol — preserves real extreme events like COVID
+# Daily variance cap: prevents variance from compounding destructively over multi-year horizons
 SIGMA2_MAX_DAILY = 0.0025
 
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
-    # Build the vector of horizon checkpoints (252d=1Y, 756d=3Y, 1260d=5Y)
+    # Build the vector of horizon checkpoints 
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
     if max_days <= 756:
@@ -37,8 +30,7 @@ def simulate_regime_switching_vectorized(
     use_antithetic=False,
     spread_cap=0.5,
 ):
-    # JIT-compiled regime-switching Monte Carlo: simulates asset paths with
-    # constant per-regime volatility and t-distributed innovations
+    # Simulates asset paths with constant per-regime volatility and t-distributed innovations
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
@@ -59,7 +51,7 @@ def simulate_regime_switching_vectorized(
             is_horizon[day_idx] = 1
             horizon_map[day_idx] = h
     
-    # Process each firm sequentially (parallelism is across dates via Joblib)
+    # Process each firm sequentially
     for f in range(num_firms):
         # Firm-level parameters
         s0, s1 = sigma_0[f], sigma_1[f]
@@ -114,7 +106,7 @@ def simulate_regime_switching_vectorized(
         default_counts = np.zeros(n_horizons)
         payoff_sums = np.zeros(n_horizons)
         
-        # T-distribution scaling factors per regime
+        # T-dist parameters
         check_normal_0 = (n0 >= 100)
         check_normal_1 = (n1 >= 100)
         
@@ -131,7 +123,7 @@ def simulate_regime_switching_vectorized(
             t_factor_1 = np.sqrt((safe_n1 - 2) / safe_n1)
 
         for day in range(max_days):
-            # Markov regime transitions and counters
+            # Markov regime transitions
             regime_0_cnt += (~regime_1_mask)
             regime_1_cnt += regime_1_mask
             
@@ -143,7 +135,7 @@ def simulate_regime_switching_vectorized(
             # Select volatility based on current regime
             sigma = np.where(regime_1_mask, s1, s0)
             
-            # Draw random innovations (antithetic variates for variance reduction)
+            # Draw random innovations
             if use_antithetic and num_simulations > 1:
                 half = num_simulations // 2
                 z_half = np.random.standard_normal(half)
@@ -199,7 +191,7 @@ def simulate_regime_switching_vectorized(
             drift = rf_daily - 0.5 * sigma * sigma
             log_asset += drift + r_curr
             
-            # Check if today is a horizon date (1Y/3Y/5Y)
+            # Check if today is a horizon date
             if is_horizon[day]:
                 h = horizon_map[day]
                 log_liability_T = log_liability_horizon[h]
@@ -216,10 +208,8 @@ def simulate_regime_switching_vectorized(
         
         # Compute PD and implied CDS spreads for each horizon
         for h in range(n_horizons):
-            # Probability of default
             pd_out[h, f] = default_counts[h] / num_simulations
             
-            # Average discounted payoff → debt value → yield-to-maturity → spread
             expected_payoff = payoff_sums[h] / num_simulations
             
             # Spread requires a valid risk-free rate
@@ -241,10 +231,10 @@ def simulate_regime_switching_vectorized(
     return pd_out, spread_out, debt_out, regime_fractions
 
 
-# Run regime-switching MC simulation for all firms on a single date
+
 def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_firms_without_estimated_params=True, use_antithetic=False, spread_cap=0.5):
     date, df_date, merton_data_dict = date_data
-    
+    # Run regime-switching MC simulation for all firms on a single date
     if df_date.empty:
         return []
     
@@ -262,11 +252,10 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     else:
         has_estimated_model_params = np.zeros(num_firms, dtype=bool)
 
-    # Vectorized parameter extraction with defaults and floors
+    # Parameter extraction with defaults and floors
     sigma_0_arr = np.maximum(df_firms.get('regime_0_vol', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     sigma_1_arr = np.maximum(df_firms.get('regime_1_vol', pd.Series([0.02]*num_firms)).fillna(0.02).values, 1e-4)
     
-    # Validation: check if daily vols are in a plausible range (0.1%–15%)
     median_vol_0 = np.median(sigma_0_arr[sigma_0_arr > 0])
     median_vol_1 = np.median(sigma_1_arr[sigma_1_arr > 0])
     
@@ -307,7 +296,6 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
             v0_arr[firm_idx] = v0
             liability_arr[firm_idx] = liability
             
-            # Scale percentage-format rates to decimals
             if not np.isnan(rf_rate) and abs(rf_rate) > 0.5:
                 rf_rate = rf_rate / 100.0
             if not np.isnan(rf_rate):
@@ -317,7 +305,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     # Initial regime probabilities
     initial_regime_probs = np.full(num_firms, 0.5)
     
-    # Maturity-aware horizons per firm; default to 5Y (1260 days) if not provided
+    # Maturity aware horizons per firm
     if 'cds_max_horizon_days' in df_firms.columns:
         required_horizons = pd.to_numeric(df_firms['cds_max_horizon_days'], errors='coerce').fillna(1260).astype(int).values
     else:
@@ -366,7 +354,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
             debt_out[:, invalid_mask] = np.nan
             regime_fractions[:, invalid_mask] = np.nan
     
-    # Extract results by horizon and assemble output rows
+    # Extract results by horizon
     pd_1y = pd_out[0, :]
     pd_3y = pd_out[1, :]
     pd_5y = pd_out[2, :]
@@ -411,15 +399,16 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
     return results_list
 
 
-# Main entry point: parallel regime-switching MC across all dates
+
 def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False, spread_cap=0.5, cds_filter_file=None):
     print(f"Loading Regime-Switching data from {regime_params_file}...")
+    # Parallel regime-switching MC across all dates
     df = pd.read_csv(regime_params_file)
     
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'])
     
-    # Filter firms if specified
+    # Filter firms
     if gvkey_selected is not None:
         df = df[df['gvkey'].isin(gvkey_selected)]
 
@@ -438,7 +427,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
         'transition_prob_00', 'transition_prob_01', 'transition_prob_10', 'transition_prob_11'
     ]
 
-    # Filter to firms with valid estimated RS params — start from each firm's first valid date
+    # Filter to firms with valid estimated RS params
     if exclude_firms_without_estimated_params:
         if all(col in df.columns for col in required_rs_cols):
             has_complete_rs_params = df[required_rs_cols].notna().all(axis=1)
@@ -474,7 +463,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     
     start_time = pd.Timestamp.now()
     
-    # Prepare date groups for parallel processing — load Merton data for PD calculation
+    # Prepare date groups for parallel processing
     
     merton_by_date = {}
     df_merton = pd.read_csv(merton_file)
@@ -493,7 +482,6 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
                 df_m = merton_by_date[date]
                 firms_on_date = group['gvkey'].unique()
                 df_m_relevant = df_m[df_m['gvkey'].isin(firms_on_date)]
-                # Vectorized: subset, deduplicate, convert to dict of dicts
                 df_m_subset = df_m_relevant[['gvkey', 'asset_value', 'liabilities_total', 'risk_free_rate']]
                 df_m_subset = df_m_subset.drop_duplicates(subset='gvkey', keep='last')
                 merton_date_dict = df_m_subset.set_index('gvkey').to_dict('index')
@@ -503,9 +491,6 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
         date_groups = [(pd.Timestamp.now().date(), df, {})]
     
     print(f"\nProcessing {len(date_groups)} dates in parallel...")
-    
-    # OPTIMIZATION: Avoid Joblib overhead for single date
-    use_joblib = True
 
     # Dispatch MC simulations across dates in parallel
     print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
@@ -521,7 +506,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
         for date_data in date_groups
     )
     
-    # Flatten nested results into a single DataFrame
+    # Flatten results
     results_list = []
     for date_results in results_nested:
         results_list.extend(date_results)

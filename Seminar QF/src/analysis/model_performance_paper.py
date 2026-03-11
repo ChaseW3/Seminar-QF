@@ -692,6 +692,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
     # Firm-level RMSE distribution
     perf_firm = compute_performance_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=60)
     if not perf_firm.empty:
+        # Box plot firm-level RMSE distribution by model
         plt.figure(figsize=(12, 6))
         sns.boxplot(
             data=perf_firm,
@@ -722,6 +723,7 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
             var_name="corr_type",
             value_name="correlation",
         )
+        # Bar chart model vs market correlation by maturity
         plt.figure(figsize=(10, 5))
         sns.barplot(
             data=corr_long,

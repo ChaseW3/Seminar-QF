@@ -1,12 +1,10 @@
-# volatility_diagnostics.py
-# Identify firms with extreme volatility estimates that cause unrealistic CDS spreads.
-# Runs per-firm diagnostics on GARCH parameters, return distributions, and MC outputs.
-# Produces diagnostic CSV reports and a text summary.
-
 import pandas as pd
 import numpy as np
 import os
 from datetime import datetime
+
+# Identify firms with extreme volatility estimates that cause unrealistic CDS spreads
+# Runs per-firm diagnostics on GARCH parameters, return distributions, and MC outputs
 
 # Thresholds for flagging problematic firms
 VOLATILITY_THRESHOLDS = {
@@ -18,15 +16,14 @@ VOLATILITY_THRESHOLDS = {
 }
 
 
-# Run comprehensive volatility diagnostics and save reports to output_dir
 def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./diagnostics/'):
+    # Run comprehensive volatility diagnostics
     os.makedirs(output_dir, exist_ok=True)
     
     print("\n" + "="*80)
     print("VOLATILITY DIAGNOSTICS: IDENTIFYING PROBLEMATIC FIRMS")
     print("="*80 + "\n")
     
-    # Load GARCH data
     df_garch = pd.read_csv(garch_file)
     df_garch['date'] = pd.to_datetime(df_garch['date'])
     
@@ -34,17 +31,13 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     
     firms = df_garch['gvkey'].unique()
     print(f"✓ Number of firms: {len(firms)}")
-    
-    # =========================================================================
-    # PART 1: GARCH parameter and return distribution analysis per firm
-    # =========================================================================
+
+    # GARCH parameter and return distribution analysis per firm
     
     firm_stats = []
     
     for gvkey in firms:
         df_firm = df_garch[df_garch['gvkey'] == gvkey].copy()
-        
-        # Basic statistics
         n_obs = len(df_firm)
         
         # Return statistics
@@ -59,11 +52,11 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         return_skew = returns.skew()
         return_kurt = returns.kurtosis()
         
-        # Count extreme returns (outliers)
+        # Count extreme returns
         n_extreme_returns = (np.abs(returns) > VOLATILITY_THRESHOLDS['return_outlier_threshold']).sum()
         pct_extreme_returns = 100 * n_extreme_returns / len(returns)
         
-        # GARCH parameters — take median across dates (should be constant per firm)
+        # GARCH parameters, take median across dates 
         garch_omega = df_firm['garch_omega'].median()
         garch_alpha = df_firm['garch_alpha'].median()
         garch_beta = df_firm['garch_beta'].median()
@@ -78,7 +71,7 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
             garch_vol_max = garch_vol.max()
             garch_vol_median = garch_vol.median()
             
-            # Annualize daily volatility — σ_annual = σ_daily × √252
+            # Annualize daily volatility
             annualized_vol_mean = garch_vol_mean * np.sqrt(252)
             annualized_vol_max = garch_vol_max * np.sqrt(252)
         else:
@@ -95,11 +88,11 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         if annualized_vol_mean < VOLATILITY_THRESHOLDS['annualized_vol_min']:
             issues.append(f"LOW_VOL (mean {annualized_vol_mean*100:.1f}%)")
         
-        # Near unit root (persistence close to 1)
+        # Near unit root
         if pd.notna(garch_persistence) and garch_persistence > VOLATILITY_THRESHOLDS['garch_alpha_beta_sum_max']:
             issues.append(f"NEAR_IGARCH (α+β={garch_persistence:.4f})")
         
-        # Extreme daily returns (>1% of observations beyond 20%)
+        # Extreme daily returns
         if pct_extreme_returns > 1.0:  # More than 1% extreme returns
             issues.append(f"EXTREME_RETURNS ({n_extreme_returns} obs, {pct_extreme_returns:.2f}%)")
         
@@ -138,9 +131,7 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     
     df_firm_stats = pd.DataFrame(firm_stats)
     
-    # =========================================================================
-    # PART 2: Monte Carlo volatility diagnostics (if MC results available)
-    # =========================================================================
+    # Monte Carlo volatility diagnostics
     if mc_garch_file and os.path.exists(mc_garch_file):
         print("\n" + "-"*60)
         print("PART 2: MONTE CARLO VOLATILITY ANALYSIS")
@@ -151,7 +142,6 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         
         print(f"✓ Loaded MC data: {len(df_mc):,} observations")
         
-        # Determine which volatility column is present in the MC results
         target_col = None
         is_variance = False
         is_daily_mean = False
@@ -182,15 +172,15 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
                                'mc_raw_min', 'mc_raw_max', 'mc_raw_median']
             
             if is_variance:
-                # Annualized from integrated variance: σ_annual = √IV
+                # Annualized from integrated variance
                 mc_stats['mc_annualized_vol_mean'] = np.sqrt(mc_stats['mc_raw_mean'])
                 mc_stats['mc_annualized_vol_max'] = np.sqrt(mc_stats['mc_raw_max'])
             elif is_daily_mean:
-                 # Annualized from mean daily vol: σ_annual = σ_daily × √252
+                 # Annualized from mean daily vol
                  mc_stats['mc_annualized_vol_mean'] = mc_stats['mc_raw_mean'] * np.sqrt(252)
                  mc_stats['mc_annualized_vol_max'] = mc_stats['mc_raw_max'] * np.sqrt(252)
             else:
-                # Annualized from cumulative: σ_annual = cumulative / √252
+                # Annualized from cumulative
                 mc_stats['mc_annualized_vol_mean'] = mc_stats['mc_raw_mean'] / np.sqrt(252)
                 mc_stats['mc_annualized_vol_max'] = mc_stats['mc_raw_max'] / np.sqrt(252)
         
@@ -208,14 +198,13 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
                 df_firm_stats.at[idx, 'n_issues'] = row['n_issues'] + 1
                 df_firm_stats.at[idx, 'is_problematic'] = True
     
-    # =========================================================================
-    # PART 3: Summary report
-    # =========================================================================
+    # Summary
+
     print("\n" + "-"*60)
     print("PART 3: DIAGNOSTIC SUMMARY")
     print("-"*60 + "\n")
     
-    # Separate problematic vs clean firms
+    # Separate problematic from clean firms
     problematic_firms = df_firm_stats[df_firm_stats['is_problematic']]['gvkey'].tolist()
     clean_firms = df_firm_stats[~df_firm_stats['is_problematic']]['gvkey'].tolist()
     
@@ -251,37 +240,32 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     for issues_str in df_firm_stats['issues']:
         if issues_str != 'NONE':
             for issue in issues_str.split('; '):
-                # Extract issue type (before the parenthesis detail)
                 issue_type = issue.split(' (')[0]
                 issue_counts[issue_type] = issue_counts.get(issue_type, 0) + 1
     
     for issue_type, count in sorted(issue_counts.items(), key=lambda x: -x[1]):
         print(f"  {issue_type}: {count} firms")
     
-    # =========================================================================
-    # PART 4: Save diagnostic reports to disk
-    # =========================================================================
+    # Save diagnostics
+    
     print("\n" + "-"*60)
     print("PART 4: SAVING DIAGNOSTIC REPORTS")
     print("-"*60 + "\n")
     
-    # Save full diagnostics
     diagnostics_file = os.path.join(output_dir, 'firm_volatility_diagnostics.csv')
     df_firm_stats.to_csv(diagnostics_file, index=False)
     print(f"✓ Saved: {diagnostics_file}")
     
-    # Save problematic firms list
     problematic_file = os.path.join(output_dir, 'problematic_firms.csv')
     df_problematic.to_csv(problematic_file, index=False)
     print(f"✓ Saved: {problematic_file}")
     
-    # Save clean firms list (for filtering)
     clean_firms_df = df_firm_stats[~df_firm_stats['is_problematic']][['gvkey']].copy()
     clean_file = os.path.join(output_dir, 'clean_firms.csv')
     clean_firms_df.to_csv(clean_file, index=False)
     print(f"✓ Saved: {clean_file}")
     
-    # Save summary report
+    # Save summary 
     summary_file = os.path.join(output_dir, 'diagnostics_summary.txt')
     with open(summary_file, 'w') as f:
         f.write("VOLATILITY DIAGNOSTICS SUMMARY\n")
@@ -309,9 +293,8 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         'n_clean': len(clean_firms)
     }
 
-
-# Remove problematic firms from a DataFrame based on a gvkey blacklist
 def filter_problematic_firms(df, problematic_firms, gvkey_column='gvkey'):
+    # Remove problematic firms based on a gvkey blacklist
     initial_rows = len(df)
     initial_firms = df[gvkey_column].nunique()
     
@@ -323,22 +306,6 @@ def filter_problematic_firms(df, problematic_firms, gvkey_column='gvkey'):
     print(f"Filtered problematic firms: {initial_firms} → {final_firms} firms ({initial_rows:,} → {final_rows:,} rows)")
     
     return df_filtered
-
-
-# Quick check: find firms whose annualized MC volatility exceeds a threshold
-def get_problematic_firms_from_mc(mc_file, vol_threshold=1.0):
-    df_mc = pd.read_csv(mc_file)
-    
-    # Annualized volatility = cumulative / √252
-    df_mc['annualized_vol'] = df_mc['mc_garch_cumulative_volatility'] / np.sqrt(252)
-    
-    # Find firms with ANY observation exceeding threshold
-    problematic = df_mc[df_mc['annualized_vol'] > vol_threshold]['gvkey'].unique().tolist()
-    
-    print(f"Firms with annualized volatility > {vol_threshold*100:.0f}%: {len(problematic)}")
-    
-    return problematic
-
 
 if __name__ == "__main__":
     # Run diagnostics standalone

@@ -48,6 +48,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
         for col in pd_cols:
             model_suffix = col.replace('merton_pd_', '').upper()
             
+            # Plot average PD over time per model
             plt.figure(figsize=(10, 6))
             
             # Group by date and calculate mean
@@ -72,6 +73,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
 
     elif 'model' in df.columns:
         for model_name in df['model'].unique():
+            # Plot average PD over time per model
             plt.figure(figsize=(10, 6))
             subset = df[df['model'] == model_name]
             avg_pd_over_time = subset.groupby('month_year')['merton_pd'].mean()
@@ -88,6 +90,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
             
     elif 'merton_pd' in df.columns:
         avg_pd_over_time = df.groupby('month_year')['merton_pd'].mean()
+        # Plot average PD over time
         plt.figure(figsize=(10, 6))
         plt.plot(avg_pd_over_time.index, avg_pd_over_time.values, label='Average Merton PD', color='blue')
         plt.title('Average Merton Probability of Default Over Time')
@@ -103,6 +106,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
     if 'msgarch_prob_0' in df.columns:
         avg_prob0_over_time = df.groupby('month_year')['msgarch_prob_0'].mean()
         
+        # Plot average steady-state probability of regime 0 over time
         plt.figure(figsize=(10, 6))
         plt.plot(avg_prob0_over_time.index, avg_prob0_over_time.values, label='Avg Prob State 0 (Stable)', color='green')
         plt.title('Average MS-GARCH Regime Probability (State 0) Over Time')
@@ -128,6 +132,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
          y_col = None
 
     if y_col and 'risk_free_rate' in df.columns:
+        # Scatter plot asset volatility vs risk-free rate
         plt.figure(figsize=(10, 6))
         plt.scatter(df['risk_free_rate'], df[y_col], alpha=0.5, s=10)
         plt.title(f'{y_label} vs Risk Free Rate')
