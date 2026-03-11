@@ -1,16 +1,4 @@
-"""
-OPTIMIZED MS-GARCH(1,1) Model Implementation with Student's t Distribution
-============================================================================
-
-Optimizations implemented:
-1. GARCH(1,1) warm start - Uses arch package for initial parameter estimates
-2. Vectorized Hamilton filter - Numba JIT compiled for speed
-3. Caching intermediate results - Pre-computed constants and arrays
-4. Better optimizer settings - L-BFGS-B with optimized tolerances
-5. Improved numerical stability - Log-space calculations
-
-Expected speedup: 5-15x faster than original implementation
-"""
+# MS-GARCH(1,1) with Student-t innovations, fitted via MLE with JIT-compiled Hamilton filter
 
 import numpy as np
 import pandas as pd
@@ -79,17 +67,9 @@ except ImportError:
     print("Warning: arch package not installed. GARCH warm start disabled.")
 
 
-# =============================================================================
-# NUMBA JIT-COMPILED HELPER FUNCTIONS
-# =============================================================================
-
 @njit(cache=True)
 def _numba_gammaln(x):
-    """
-    Numba-compatible log-gamma function using Lanczos approximation.
-    Accurate to ~15 decimal places.
-    """
-    # Lanczos coefficients
+    # Lanczos approximation — needed because scipy.special is not available inside numba JIT
     g = 7
     c = np.array([
         0.99999999999980993,
@@ -104,7 +84,7 @@ def _numba_gammaln(x):
     ])
     
     if x < 0.5:
-        # Reflection formula
+        # reflection formula for x < 0.5
         return np.log(np.pi / np.sin(np.pi * x)) - _numba_gammaln(1 - x)
     
     x = x - 1
@@ -116,28 +96,9 @@ def _numba_gammaln(x):
     return 0.5 * np.log(2 * np.pi) + (x + 0.5) * np.log(t) - t + np.log(a)
 
 
-# =============================================================================
-# NUMBA JIT-COMPILED HAMILTON FILTER (MAJOR SPEEDUP)
-# =============================================================================
-
 @njit(cache=True)
 def _t_log_likelihood(x, nu, sigma2):
-    """
-    Compute log-likelihood of t-distribution (Numba JIT compiled).
-    
-    Parameters:
-    -----------
-    x : float
-        Standardized residual
-    nu : float
-        Degrees of freedom
-    sigma2 : float
-        Variance
-        
-    Returns:
-    --------
-    float : Log-likelihood value
-    """
+    # Log-likelihood of one observation under t(nu, 0, sigma2)
     if sigma2 <= 0 or nu <= 2.1:
         return -1e10
     
@@ -152,39 +113,8 @@ def _t_log_likelihood(x, nu, sigma2):
 @njit(cache=True)
 def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, beta_1,
                         mu_0, mu_1, p00, p11, nu_0, nu_1):
-    """
-    Numba JIT-compiled Hamilton filter for MS-GARCH with t-distribution.
-    
-    Uses the Gray (1996) / Klaassen (2002) approach:
-    - Regime-specific demeaned residuals: eps_i = r - mu_i
-    - Probability-weighted "collapsed" variance for each regime to avoid
-      path-dependence explosion (2^T paths).
-    - This gives much sharper regime identification because each regime's
-      GARCH process sees shocks relative to its OWN mean, and the variance
-      paths are weighted by the filtered regime probabilities.
-    
-    Parameters:
-    -----------
-    returns : np.ndarray
-        Return series
-    omega_0, alpha_0, beta_0 : float
-        GARCH parameters for regime 0
-    omega_1, alpha_1, beta_1 : float
-        GARCH parameters for regime 1
-    mu_0, mu_1 : float
-        Mean returns for each regime
-    p00, p11 : float
-        Transition probabilities (staying in same regime)
-    nu_0, nu_1 : float
-        Degrees of freedom for t-distribution in each regime
-        
-    Returns:
-    --------
-    float : Log-likelihood value
-    np.ndarray : Filtered probabilities
-    np.ndarray : Conditional variances
-    np.ndarray : Predicted probabilities (for Kim smoother)
-    """
+    # Hamilton filter for MS-GARCH
+    # Regime-specific residuals + probability-weighted collapsed variances prevent 2^T path explosion
     T = len(returns)
     
     # Pre-allocate arrays (caching optimization)
@@ -221,9 +151,7 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
     for t in range(T):
         r = returns[t]
         
-        # ==================================================================
         # GARCH variance update using Gray (1996) / Klaassen (2002) collapse
-        # ==================================================================
         if t == 0:
             curr_sigma2_0 = sigma2_0_uncond
             curr_sigma2_1 = sigma2_1_uncond
@@ -252,7 +180,7 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
         ll_0 = _t_log_likelihood(eps_0, nu_0, curr_sigma2_0)
         ll_1 = _t_log_likelihood(eps_1, nu_1, curr_sigma2_1)
         
-        # Convert to likelihoods using log-sum-exp trick for numerical stability
+        # Convert to likelihoods
         max_ll = max(ll_0, ll_1)
         if max_ll < -500:
             lik_0 = 1e-200
@@ -261,11 +189,10 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
             lik_0 = np.exp(ll_0 - max_ll)
             lik_1 = np.exp(ll_1 - max_ll)
         
-        # Predicted probabilities (Hamilton filter prediction step)
+        # Hamilton filter predicition step
         pred_prob = P.T @ prev_filtered
         predicted_prob[t, :] = pred_prob
         
-        # Joint probability
         joint_0 = lik_0 * pred_prob[0]
         joint_1 = lik_1 * pred_prob[1]
         
@@ -282,20 +209,10 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
         # Accumulate log-likelihood (add back max_ll for correct scaling)
         log_likelihood += np.log(marginal) + max_ll
         
-        # ==================================================================
-        # Klaassen (2002) variance collapse: weight the regime variances by
-        # the filtered probability of BEING in that regime, conditional on
-        # transitioning to regime j. This prevents the 2^T path explosion.
-        # 
-        # h_collapsed_{j,t} = sum_i P(S_{t}=i | S_{t+1}=j, Y_t) * 
-        #                      [h_{i,t} + (mu_i - mu_j)^2]
-        # where the conditional weights come from Bayes' rule.
-        # ==================================================================
         filt_0 = filtered_prob[t, 0]
         filt_1 = filtered_prob[t, 1]
         
-        # P(S_t=i | S_{t+1}=j, Y_t) = P(S_{t+1}=j | S_t=i) * P(S_t=i | Y_t) / P(S_{t+1}=j | Y_t)
-        # Predicted prob for next step (for collapse weights)
+        # Predicted prob for next step
         pred_next_0 = P[0, 0] * filt_0 + P[1, 0] * filt_1  # P(S_{t+1}=0 | Y_t)
         pred_next_1 = P[0, 1] * filt_0 + P[1, 1] * filt_1  # P(S_{t+1}=1 | Y_t)
         
@@ -316,7 +233,7 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
             w_11 = 0.5
         
         # Collapsed variance for regime 0: weighted average of current variances
-        # + adjustment for mean difference (Jensen's inequality correction)
+        # + adjustment for mean difference
         prev_h_0 = (w_00 * (curr_sigma2_0 + (mu_0 - mu_0)**2) +
                      w_10 * (curr_sigma2_1 + (mu_1 - mu_0)**2))
         
@@ -336,11 +253,7 @@ def hamilton_filter_jit(returns, omega_0, alpha_0, beta_0, omega_1, alpha_1, bet
 
 @njit(cache=True)
 def kim_smoother_jit(filtered_prob, predicted_prob, p00, p11):
-    """
-    Kim Smoother (backward pass) for MS-GARCH.
-    Produces smoothed probabilities P(S_t = i | Y_T) that are much sharper
-    than filtered probabilities, especially for identifying regime changes.
-    """
+    # Kim smoother backward pass, gives P(S_t = i | all data), sharper than filtered probs
     T = filtered_prob.shape[0]
     smoothed_prob = np.zeros((T, 2))
     
@@ -363,26 +276,8 @@ def kim_smoother_jit(filtered_prob, predicted_prob, p00, p11):
     return smoothed_prob
 
 
-# =============================================================================
-# GARCH WARM START (FAST INITIAL PARAMETER ESTIMATION)
-# =============================================================================
-
 def get_garch_warm_start(returns):
-    """
-    Get initial parameter estimates from standard GARCH(1,1) with t-distribution.
-    
-    This provides much better starting values for the MS-GARCH optimizer,
-    reducing convergence time by 30-50%.
-    
-    Parameters:
-    -----------
-    returns : np.ndarray
-        Return series
-        
-    Returns:
-    --------
-    dict : Initial parameter estimates
-    """
+    # Fit a single-regime GARCH(1,1)-t to get starting values for MS-GARCH; falls back to heuristics if arch unavailable
     if not HAS_ARCH:
         # Fallback to simple estimates
         var_ret = np.var(returns)
@@ -542,70 +437,10 @@ def _blend_params(primary, fallback, blend_weight):
             p[f'beta_{sfx}'] = max(PERSISTENCE_LOWER - a, BETA_LOWER)
 
     return p
-    
-    try:
-        # Scale returns for better numerical stability
-        scale = np.std(returns) * 100
-        returns_scaled = returns / scale * 100
-        
-        # Fit GARCH(1,1) with t-distribution
-        model = arch_model(returns_scaled, vol='Garch', p=1, q=1, dist='t', mean='Constant')
-        result = model.fit(disp='off', show_warning=False)
-        
-        # Extract and rescale parameters
-        omega = result.params['omega'] / (100**2) * (scale**2)
-        alpha = result.params['alpha[1]']
-        beta = result.params['beta[1]']
-        mu = result.params['mu'] / 100 * scale
-        nu = result.params.get('nu', 8.0)
-        
-        # Bound parameters
-        omega = max(omega, 1e-10)
-        alpha = min(max(alpha, ALPHA_LOWER), ALPHA_UPPER)
-        beta = min(max(beta, BETA_LOWER), BETA_UPPER)
-        # Enforce minimum persistence
-        if alpha + beta < PERSISTENCE_LOWER:
-            beta = max(PERSISTENCE_LOWER - alpha, BETA_LOWER)
-        # Enforce maximum persistence
-        if alpha + beta >= PERSISTENCE_UPPER:
-            beta = max(PERSISTENCE_UPPER - alpha, BETA_LOWER)
-        nu = min(max(nu, NU_LOWER_BOUND), NU_WARM_START_UPPER_BOUND)
-        
-        return {
-            'omega': omega,
-            'alpha': alpha,
-            'beta': beta,
-            'nu': nu,
-            'mu': mu
-        }
-        
-    except Exception:
-        # Fallback
-        var_ret = np.var(returns)
-        return {
-            'omega': var_ret * 0.05,
-            'alpha': 0.08,
-            'beta': 0.85,
-            'nu': 8.0,
-            'mu': np.mean(returns)
-        }
 
-
-# =============================================================================
-# OPTIMIZED MS-GARCH CLASS
-# =============================================================================
 
 class MSGARCHOptimized:
-    """
-    Optimized Markov-Switching GARCH(1,1) model with t-distributed innovations.
-    
-    Optimizations:
-    - GARCH(1,1) warm start for initial parameters
-    - Numba JIT-compiled Hamilton filter
-    - Cached intermediate results
-    - Better optimizer settings
-    - Improved numerical stability
-    """
+    # Two-regime MS-GARCH(1,1)-t with JIT Hamilton filter, warm-start MLE, and regime-labeling convention (0=low-vol, 1=high-vol)
     
     def __init__(self, n_regimes=2):
         self.n_regimes = n_regimes
@@ -620,22 +455,7 @@ class MSGARCHOptimized:
         self.window_regime_state = "Intermediate Vol"
         
     def fit(self, returns, verbose=True, init_params=None):
-        """
-        Fit the MS-GARCH model using optimized MLE.
-        
-        Parameters:
-        -----------
-        returns : np.ndarray
-            Array of returns
-        verbose : bool
-            Whether to print fitting progress
-        init_params : dict, optional
-            Parameters from previous estimation to use as starting values (warm start)
-            
-        Returns:
-        --------
-        dict : Estimated parameters
-        """
+        # Fit the model; init_params optionally warm-starts from a previous window
         self.returns = np.asarray(returns).flatten()
         self.init_params = init_params
         
@@ -652,9 +472,7 @@ class MSGARCHOptimized:
         return self._fit_mle_optimized(verbose)
     
     def _fit_mle_optimized(self, verbose=True):
-        """
-        Optimized MLE fitting with all speedup techniques.
-        """
+        # Multi-start L-BFGS-B with rolling warm start, regime-differentiation penalties, and 3-phase refinement
         returns = self.returns
         T = len(returns)
         var_ret = np.var(returns)
@@ -667,9 +485,9 @@ class MSGARCHOptimized:
         # =====================================================================
         
         x0 = None
-        x0_perturbed = None  # Will be set if warm start is used
-        
-        # 1A. ROLLING WARM START (Fastest) — with perturbation to avoid stickiness
+        x0_perturbed = None  # will be set if rolling warm start succeeds
+
+        # Rolling warm start: reuse previous window's params (perturbed to avoid stickiness)
         if self.init_params is not None:
             if verbose:
                 print("    → Using parameters from previous window (Rolling Warm Start + perturbation)...")
@@ -692,10 +510,7 @@ class MSGARCHOptimized:
                     self._nu_to_unconstrained(p['nu_1'])
                 ])
                 
-                # CRITICAL FIX: Add random perturbation to break out of sticky optima
-                # Without this, L-BFGS-B converges immediately at the warm-start point
-                # because ~92% of data overlaps between consecutive 252-day windows,
-                # making the gradient at the old optimum nearly zero.
+                # Perturb in unconstrained space; ~92% data overlap means gradient at old optimum is near zero
                 rng = np.random.RandomState(hash(str(returns[:5])) % (2**31))
                 perturbation = rng.normal(0, WARM_START_PERTURBATION_SCALE, size=len(x0))
                 # Don't perturb mu (indices 6,7) as strongly — it's in return-scale
@@ -709,7 +524,7 @@ class MSGARCHOptimized:
                 x0 = None
                 x0_perturbed = None
 
-        # 1B. GARCH WARM START (Fallback or First Run)
+        # GARCH warm start for first window or when rolling warm start failed
         if x0 is None:
             if verbose:
                 print("    → Getting GARCH(1,1) warm start parameters...")
@@ -768,12 +583,8 @@ class MSGARCHOptimized:
                 print(f"    → Initial degrees of freedom: ν₀={nu_0_init:.1f} (low-vol), "
                       f"ν₁={nu_1_init:.1f} (high-vol)")
         
-        # =====================================================================
-        # OPTIMIZATION 3: Cached negative log-likelihood function
-        # =====================================================================
-        
-        # Pre-compute constants (caching)
-        returns_array = np.ascontiguousarray(returns)  # Ensure memory layout
+        # Pre-compute constants; set regime-state-dependent penalty floors
+        returns_array = np.ascontiguousarray(returns)
         window_state = getattr(self, "window_regime_state", "Intermediate Vol")
         if window_state == "High Vol":
             crisis_p11_floor = 0.80
@@ -786,7 +597,7 @@ class MSGARCHOptimized:
             crisis_tail_weight = 28.0
         
         def neg_log_likelihood(params):
-            """Optimized negative log-likelihood with JIT Hamilton filter."""
+            # NLL wrapper that calls the JIT filter and adds soft economic penalties
             try:
                 # Transform parameters back to constrained space
                 omega_0 = self._unconstrained_to_omega(params[0])
@@ -934,10 +745,7 @@ class MSGARCHOptimized:
             except Exception:
                 return 1e10
         
-        # =====================================================================
-        # OPTIMIZATION 4: IMPROVED Multi-Start with Better Convergence
-        # =====================================================================
-        
+        # Multi-start phase 1 (coarse), phase 2 (refine), phase 3 (TNC fallback)
         if verbose:
             print("    → Running IMPROVED optimization with multi-start and adaptive refinement...")
         
@@ -1286,9 +1094,6 @@ class MSGARCHOptimized:
         self.aic = 2 * n_params - 2 * self.log_likelihood
         self.bic = np.log(T) * n_params - 2 * self.log_likelihood
         
-        # =====================================================================
-        # COMPREHENSIVE DIAGNOSTIC OUTPUT
-        # =====================================================================
         if verbose:
             print(f"\n  {'='*70}")
             print(f"  MS-GARCH ESTIMATION COMPLETE")
@@ -1398,90 +1203,72 @@ class MSGARCHOptimized:
         
         return self.params
     
-    # =========================================================================
-    # Parameter transformation functions (for unconstrained optimization)
-    # Uses BOUNDED sigmoid: maps unconstrained R to [lower, upper]
-    # f(x) = lower + (upper - lower) * sigmoid(x)
-    # This prevents pathological values (e.g., alpha = 1e-86)
-    # =========================================================================
-    
+    # Parameter transforms: bounded sigmoid maps unconstrained R → [lower, upper]
+    # so the optimizer never sees pathological values (e.g. alpha = 1e-86)
+
     def _alpha_to_unconstrained(self, alpha):
-        """Transform alpha to unconstrained space using bounded sigmoid."""
+        # inverse bounded sigmoid
         alpha = min(max(alpha, ALPHA_LOWER + 1e-6), ALPHA_UPPER - 1e-6)
         # Inverse bounded sigmoid: x = logit((alpha - lower) / (upper - lower))
         t = (alpha - ALPHA_LOWER) / (ALPHA_UPPER - ALPHA_LOWER)
         return np.log(t / (1 - t))
     
     def _unconstrained_to_alpha(self, x):
-        """Transform back to alpha bounded in [ALPHA_LOWER, ALPHA_UPPER]."""
         return ALPHA_LOWER + (ALPHA_UPPER - ALPHA_LOWER) * expit(x)
     
     def _beta_to_unconstrained(self, beta):
-        """Transform beta to unconstrained space using bounded sigmoid."""
+        # inverse bounded sigmoid
         beta = min(max(beta, BETA_LOWER + 1e-6), BETA_UPPER - 1e-6)
         t = (beta - BETA_LOWER) / (BETA_UPPER - BETA_LOWER)
         return np.log(t / (1 - t))
     
     def _unconstrained_to_beta(self, x):
-        """Transform back to beta bounded in [BETA_LOWER, BETA_UPPER]."""
         return BETA_LOWER + (BETA_UPPER - BETA_LOWER) * expit(x)
     
     def _p_to_unconstrained(self, p):
-        """Transform transition probability to unconstrained space using bounded sigmoid."""
+        # inverse bounded sigmoid
         p = min(max(p, P_LOWER + 1e-6), P_UPPER - 1e-6)
         t = (p - P_LOWER) / (P_UPPER - P_LOWER)
         return np.log(t / (1 - t))
     
     def _unconstrained_to_p(self, x):
-        """Transform back to transition probability bounded in [P_LOWER, P_UPPER]."""
         return P_LOWER + (P_UPPER - P_LOWER) * expit(x)
     
     def _nu_to_unconstrained(self, nu):
-        """Transform nu to unconstrained space."""
+        # log(nu - 2) maps nu ∈ [2.1, NU_OPTIMIZER_UPPER_BOUND] to unconstrained space
         nu = min(max(nu, NU_LOWER_BOUND), NU_OPTIMIZER_UPPER_BOUND)
         return np.log(nu - 2)
     
     def _unconstrained_to_nu(self, x):
-        """Transform back to nu (bounded [2.1, NU_OPTIMIZER_UPPER_BOUND])."""
         return min(2 + np.exp(x), NU_OPTIMIZER_UPPER_BOUND)
     
     # --- mu transforms (bounded sigmoid → [MU_LOWER, MU_UPPER]) ---
     def _mu_to_unconstrained(self, mu):
-        """Transform mu to unconstrained space."""
+        # inverse bounded sigmoid
         mu = min(max(mu, MU_LOWER + 1e-6), MU_UPPER - 1e-6)
         t = (mu - MU_LOWER) / (MU_UPPER - MU_LOWER)
         return np.log(t / (1 - t))
     
     def _unconstrained_to_mu(self, x):
-        """Transform back to mu bounded in [MU_LOWER, MU_UPPER]."""
         return MU_LOWER + (MU_UPPER - MU_LOWER) * expit(x)
     
     # --- omega transforms (clamped exp → [OMEGA_FLOOR, OMEGA_CEIL]) ---
     def _omega_to_unconstrained(self, omega):
-        """Transform omega to unconstrained space (log with clamp)."""
+        # log with clamp
         omega = min(max(omega, OMEGA_FLOOR), OMEGA_CEIL)
         return np.log(omega)
     
     def _unconstrained_to_omega(self, x):
-        """Transform back to omega, clamped to [OMEGA_FLOOR, OMEGA_CEIL]."""
         return min(max(np.exp(x), OMEGA_FLOOR), OMEGA_CEIL)
     
-    # =========================================================================
-    # Accessor methods
-    # =========================================================================
+    # Accessors
     
     def get_volatility_series(self):
-        """Get conditional volatility series."""
         return self.conditional_vol
     
     def get_regime_probabilities(self):
-        """Get filtered regime probabilities."""
         return self.filtered_probs
 
-
-# =============================================================================
-# MAIN ESTIMATION FUNCTION (OPTIMIZED)
-# =============================================================================
 
 def run_ms_garch_estimation_optimized(data_df, 
                                       gvkey_selected=None, 
@@ -1489,35 +1276,7 @@ def run_ms_garch_estimation_optimized(data_df,
                                       gvkey_column='gvkey',
                                       output_file='ms_garch_parameters.csv',
                                       verbose=True):
-    """
-    Run OPTIMIZED MS-GARCH estimation for multiple firms.
-    
-    Uses all optimizations:
-    - GARCH warm start
-    - JIT-compiled Hamilton filter
-    - Cached computations
-    - Better optimizer settings
-    
-    Parameters:
-    -----------
-    data_df : pd.DataFrame
-        DataFrame with returns data
-    gvkey_selected : list or None
-        List of gvkeys to process, or None for all firms
-    return_column : str
-        Column name containing returns
-    gvkey_column : str
-        Column name containing firm identifiers
-    output_file : str
-        File to save MS-GARCH parameters
-    verbose : bool
-        Print progress messages
-        
-    Returns:
-    --------
-    pd.DataFrame
-        Data with MS-GARCH volatility and regime probabilities
-    """
+    # Rolling MS-GARCH estimation for multiple firms; saves month-end params and forward-fills to daily
     if verbose:
         print("\n" + "="*80)
         print("OPTIMIZED MS-GARCH ESTIMATION")
@@ -1855,10 +1614,6 @@ def run_ms_garch_estimation_optimized(data_df,
     return data_with_vol
 
 
-# =============================================================================
-# ALIAS FOR BACKWARD COMPATIBILITY
-# =============================================================================
-
-# Use the optimized class as default
+# Aliases for backward compatibility
 MSGARCH = MSGARCHOptimized
 run_ms_garch_estimation = run_ms_garch_estimation_optimized

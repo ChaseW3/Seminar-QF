@@ -7,7 +7,7 @@ from scipy.optimize import minimize
 from scipy.special import expit
 from numba import njit
 import sys
-# Parallel imports removed for performance optimization (overhead > benefit for this model)
+# Parallel imports removed — overhead exceeds benefit for this model size
 # from joblib import Parallel, delayed
 # import multiprocessing
 
@@ -18,13 +18,10 @@ try:
 except ImportError:
     OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output"
 
-# =============================================================================
-# NUMBA JIT-COMPILED HELPER FUNCTIONS
-# =============================================================================
 
 @njit(cache=True)
 def _numba_gammaln(x):
-    """Numba-compatible log-gamma function."""
+    # Lanczos approximation — needed because scipy.special is not available inside numba JIT
     g = 7
     c = np.array([
         0.99999999999980993, 676.5203681218851, -1259.1392167224028,
@@ -40,18 +37,17 @@ def _numba_gammaln(x):
 
 @njit(cache=True)
 def _t_log_likelihood(x, nu, sigma2):
-    """Compute log-likelihood of t-distribution (Numba JIT compiled)."""
-    if sigma2 <= 0 or nu <= 2.1: return -1e10 # Strict check (consistent across all models)
+    # Log-likelihood of a single obs under t-distribution with given variance
+    # nu <= 2.1 is rejected because the variance would be infinite
+    if sigma2 <= 0 or nu <= 2.1: return -1e10  # consistent bound used across all three models
     const = _numba_gammaln((nu + 1) / 2) - _numba_gammaln(nu / 2) - 0.5 * np.log((nu - 2) * np.pi * sigma2)
     kernel = -((nu + 1) / 2) * np.log(1 + x**2 / ((nu - 2) * sigma2))
     return const + kernel
 
 @njit(cache=True)
 def hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
-    """
-    Hamilton filter for Regime Switching with t-distribution.
-    Returns likelihood, filtered probabilities, AND predicted probabilities (needed for smoothing).
-    """
+    # Hamilton filter forward pass — returns LL, filtered probs, and predicted probs.
+    # Predicted probs are kept because the Kim smoother needs them for the backward pass.
     T = len(returns)
     filtered_prob = np.zeros((T, 2))
     predicted_prob = np.zeros((T, 2))
@@ -108,16 +104,14 @@ def hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, 
 
 @njit(cache=True)
 def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
-    """Wrapper for backward compatibility if needed, returns just LL and filtered."""
+    # Thin wrapper that drops the predicted probs — kept for any callers that only need LL + filtered
     ll, filt, _ = hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1)
     return ll, filt
 
 @njit(cache=True)
 def kim_smoother_t_jit(filtered_prob, predicted_prob, p00, p11):
-    """
-    Kim Smoother (Backward pass) for Regime Switching.
-    Calculates P(S_t = i | Y_T) (smoothed probabilities).
-    """
+    # Kim smoother backward pass — gives P(S_t = i | all data), which is sharper
+    # than filtered probs because it uses future information
     T = filtered_prob.shape[0]
     smoothed_prob = np.zeros((T, 2))
     
@@ -145,11 +139,8 @@ def kim_smoother_t_jit(filtered_prob, predicted_prob, p00, p11):
 
 @njit(cache=True)
 def calculate_expected_transitions_jit(smoothed_prob, filtered_prob, predicted_prob, p00, p11):
-    """
-    Calculate expected transitions (soft counts) for M-Step update of Transition Matrix.
-    xi_{t}(i,j) = P(S_t=i, S_{t+1}=j | Y)
-    Returns numerator accumulators for p00 and p11.
-    """
+    # Computes the soft transition counts xi_{t}(i,j) = P(S_t=i, S_{t+1}=j | all data)
+    # These are the sufficient statistics for the M-step update of p00 and p11
     T = smoothed_prob.shape[0]
     P = np.array([[p00, 1 - p00], [1 - p11, p11]])
     
@@ -183,12 +174,9 @@ def calculate_expected_transitions_jit(smoothed_prob, filtered_prob, predicted_p
 
 @njit(cache=True)
 def _t_log_likelihood_sum(params_arr, returns, weights):
-    """
-    Weighted Negative Log-Likelihood for a Single Regime (t-distribution).
-    params_arr: [mu, log_sigma2, log(nu-2)]
-    """
+    # Weighted negative log-likelihood for one regime's emission distribution.
+    # params_arr = [mu, log_sigma2, log(nu-2)] — log-parameterised so optimizer is unconstrained
     mu = params_arr[0]
-    # Bound checks hard-coded or handled by optimizer bounds, but here for safety in JIT
     sigma2 = np.exp(params_arr[1])
     nu = 2.0 + np.exp(params_arr[2])
     
@@ -205,22 +193,22 @@ def _t_log_likelihood_sum(params_arr, returns, weights):
 # =============================================================================
 
 class MarkovSwitchingTDist:
-    """Custom Estimator for Markov Switching Model with t-distribution using EM Algorithm."""
+    # Two-regime Hamilton filter with t-distributed emissions, fitted by EM.
+    # Regime 0 is low-vol, regime 1 is high-vol — enforced by a label-swap at the end.
     
     def __init__(self):
         self.params = {}
         self.probs = None
         
     def fit(self, returns, max_iter=500, tol=1e-5, n_init=1, init_params=None):
-        """
-        Fits the model using Expectation Maximization (EM).
-        """
+        # EM loop: alternates between Hamilton filter + Kim smoother (E-step)
+        # and weighted MLE for emission params + soft transition counts (M-step)
         returns_arr = np.ascontiguousarray(returns)
         var = np.var(returns_arr)
         mean = np.mean(returns_arr)
         std = np.std(returns_arr)
         
-        # 1. Initialization
+        # Seed sigma2 from rolling vol percentiles to give the two regimes a head start
         if init_params is not None:
              current_params = init_params.copy()
         else:
@@ -236,8 +224,7 @@ class MarkovSwitchingTDist:
                 sigma2_0_init = var * 0.5
                 sigma2_1_init = var * 2.0
                 
-            # Initial guess
-            # Perturb means slightly to distinguish regimes during EM and improve convergence
+            # Small mean perturbation to break symmetry and help EM distinguish regimes
             current_params = {
                 'mu_0': mean - 0.2 * std, 
                 'mu_1': mean + 0.2 * std,
@@ -251,11 +238,7 @@ class MarkovSwitchingTDist:
         prev_ll = -np.inf
         
         for iteration in range(max_iter):
-            # ==================
-            # E-STEP
-            # ==================
-            
-            # 1. Run Filter
+            # E-step: run filter and smoother to get regime probabilities
             ll_curr, filt_prob, pred_prob = hamilton_filter_t_details_jit(
                 returns_arr,
                 current_params['mu_0'], current_params['mu_1'],
@@ -281,11 +264,7 @@ class MarkovSwitchingTDist:
                 current_params['p00'], current_params['p11']
             )
             
-            # ==================
-            # M-STEP
-            # ==================
-            
-            # 1. Update Transition Probabilities
+            # M-step: update transition probs and emission params
             sum_xi_00, sum_xi_0_all, sum_xi_11, sum_xi_1_all = calculate_expected_transitions_jit(
                 smoothed_prob, filt_prob, pred_prob,
                 current_params['p00'], current_params['p11']
@@ -298,24 +277,20 @@ class MarkovSwitchingTDist:
             current_params['p00'] = min(max(new_p00, 0.01), 0.999)
             current_params['p11'] = min(max(new_p11, 0.01), 0.999)
             
-            # 2. Update Emission Parameters (Weighted MLE for t-dist)
-            # Optimization method needed to wrap JIT
+            # Update emission params for each regime via weighted MLE
             def optimize_regime(weights, current_mu, current_sigma2, current_nu):
-                # Initial guess for this regime
+                # Starting point in unconstrained space
                 x0_regime = np.array([
                     current_mu, 
                     np.log(current_sigma2), 
                     np.log(max(current_nu - 2.0, 1e-4))
                 ])
                 
-                # Bounds with reasonable limits on volatility
-                # For scaled returns (×100):
-                # Max sigma2 = exp(3) ≈ 20.1, so max sigma ≈ 4.5 (4.5% daily unscaled, very high but possible)
-                # Min sigma2 = exp(-15) ≈ 3e-7 (very small but positive)
+                # log_sigma2 capped at 3 ≈ exp(3) ≈ daily vol of ~4.5% unscaled; nu kept in [~2.1, 200]
                 b_regime = [
                     (None, None), # mu
-                    (-15, 3),     # log_sigma2 (max daily vol of ~5% in scaled terms = 5% daily unscaled)
-                    (-10, np.log(198.0))  # log(nu-2): nu in [~2.1, 200], consistent with GARCH & MS-GARCH
+                    (-15, 3),     # log_sigma2
+                    (-10, np.log(198.0))  # log(nu-2)
                 ]
                 
                 # Wrapper for JIT objective
@@ -359,10 +334,7 @@ class MarkovSwitchingTDist:
         return self.params, self.probs
 
 def _process_single_firm(gvkey, firm_df):
-    """
-    Helper function to process a single firm for regime switching estimation.
-    Designed for parallel execution.
-    """
+    # Fit rolling regime switching windows for one firm; used in sequential loop
     # Work on a copy to avoid Shared Memory issues
     firm_df = firm_df.copy()
     
@@ -418,17 +390,14 @@ def _process_single_firm(gvkey, firm_df):
         # Use the last actual trading date
         last_trading_date = window_df['date'].max()
         
-        # Scale for calculation - always scale returns by 100 for numerical stability
-        # CRITICAL: Regardless of input scale, always unscale by 100 when saving parameters
-        # This ensures all saved parameters are in RAW return scale (matching Monte Carlo expectations)
+        # Scale returns by 100 for numerical stability; params are unscaled before saving
         if scaled_available:
-            # Data is already scaled by 100, no need to scale again
-            # But we STILL need to unscale by 100 when saving (params are estimated on scaled data)
-            calc_scale_factor = 100.0  # Will unscale later to match raw return scale
+            # already scaled — just remember to unscale when storing
+            calc_scale_factor = 100.0
         else:
-            # Data is in raw scale, scale it by 100 for numerical stability
+            # raw scale — scale up now, unscale when storing
             returns = returns * 100.0
-            calc_scale_factor = 100.0  # Will unscale later to match raw return scale
+            calc_scale_factor = 100.0
         
         try:
             model = MarkovSwitchingTDist()
@@ -443,12 +412,7 @@ def _process_single_firm(gvkey, firm_df):
                  params['mu_0'], params['mu_1'] = params['mu_1'], params['mu_0']
                  params['nu_0'], params['nu_1'] = params['nu_1'], params['nu_0']
                  params['p00'], params['p11'] = params['p11'], params['p00']
-                 # Swap probabilities
                  probs[:, [0, 1]] = probs[:, [1, 0]]
-            
-            # REMOVED: Volatility capping (now only using 5-sigma truncation in Monte Carlo)
-            # No longer cap estimated volatilities here - let the model estimate them freely
-            # The 5-sigma truncation in Monte Carlo simulations handles extreme values
             
             last_params = params
 
@@ -504,9 +468,7 @@ def _process_single_firm(gvkey, firm_df):
     return firm_df, params_list
 
 def run_regime_switching_estimation(daily_returns_df):
-    """
-    Estimates a 2-regime Hamilton filter on DAILY asset returns using Custom T-Dist, Parallelized.
-    """
+    # Fits a rolling 2-regime Hamilton filter (t-dist) on daily asset returns, firm by firm
     print("Estimating Regime Switching Model (2-Regime Markov T-Dist) on DAILY Returns...")
     
     if daily_returns_df.empty:

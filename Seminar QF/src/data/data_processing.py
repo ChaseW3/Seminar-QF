@@ -1,5 +1,3 @@
-# data_processing.py (OPTIMIZED VERSION)
-
 import pandas as pd
 import numpy as np
 from scipy.special import ndtr
@@ -11,9 +9,6 @@ try:
 except ImportError:
     from src.utils import config
 
-# -------------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------------
 FILENAME_EQUITY_DATA = config.EQUITY_DATA_FILE
 FILENAME_INTEREST_RATES = config.INTEREST_RATES_FILE
 SHEET_EQUITY = 0
@@ -24,27 +19,26 @@ TRADING_DAYS_PER_YEAR = 252.0
 
 
 def load_interest_rates():
-    """
-    Load monthly interest rates from ECB data.
-    Returns a dataframe with month_year and risk_free_rate columns.
-    """
+    # Function to load interest rate data
     rates_df = pd.read_csv(FILENAME_INTEREST_RATES)
     
+    # Pick whichever column in the ECB file contains EURIBOR
     rate_cols = [col for col in rates_df.columns if 'EURIBOR' in col.upper()]
     
     rates_df['DATE'] = pd.to_datetime(rates_df['DATE'])
     rates_df['month_year'] = rates_df['DATE'].dt.strftime('%Y-%m')
-    rates_df['risk_free_rate'] = pd.to_numeric(rates_df[rate_cols[0]], errors='coerce') / 100
+    rates_df['risk_free_rate'] = pd.to_numeric(rates_df[rate_cols[0]], errors='coerce') / 100  # ECB file stores rates as percentages
     
+    # One rate per month is enough, drop duplicate daily entries
     return rates_df[['month_year', 'risk_free_rate']].drop_duplicates()
 
 
 def load_and_preprocess_data():
-    """Reads Excel data, cleanses it, merges equity and liabilities."""
+    # Function to load and preprocess equity and liability data
     print("Loading equity data...")
     df = pd.read_excel(FILENAME_EQUITY_DATA, sheet_name=SHEET_EQUITY)
     
-    # RENAME COLUMNS FIRST so that 'gvkey' exists
+    # Rename columns
     df = df.rename(columns={
         "(fic) Current ISO Country Code - Incorporation": "country",
         "(isin) International Security Identification Number": "isin",
@@ -56,19 +50,11 @@ def load_and_preprocess_data():
         "Market Capitalization (# Shares * Close Price)": "mkt_cap",
     })
     
-    # NOW REMOVE FLAGGED COMPANIES (after column renaming)
-    # Original flags (data issues, non-Euro stocks, etc.)
+    # Companies to remove
     gvkeys_to_remove = [
         101248, 25466, 203053, 245663, 340153, 243774, 17828, 333645,
         101305, 61214, 15181, 14140, 100312, 101276, 100737, 214881
     ]
-    # NOTE: 340153 = SIEMENS ENERGY AG (excluded, spun off 2020, different from parent)
-    #       19349 = SIEMENS AG (included, parent company with market CDS data)
-    
-    # NOTE: Financial institutions (banks/insurance) are now INCLUDED in the analysis
-    # Previously excluded: UniCredit, BNP, ING, Intesa, AXA (gvkeys: 15549, 15532, 15617, 16348, 63120)
-    # note that Merton model may have limitations
-    # for highly leveraged financial institutions during crisis periods.
     
     initial_firms = df['gvkey'].nunique()
     df = df[~df['gvkey'].isin(gvkeys_to_remove)]
@@ -79,8 +65,7 @@ def load_and_preprocess_data():
     
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     
-    # Filter out 2025 data - liabilities only available until 2024
-    # so we exclude 2025 equity data to avoid using stale liability values
+    # Filter out 2025 data, liabilities only available until 2024
     initial_rows = len(df)
     df = df[df["date"].dt.year <= 2024]
     removed_rows = initial_rows - len(df)
@@ -88,7 +73,7 @@ def load_and_preprocess_data():
     
     df = df.sort_values(["isin", "date"])
     
-    # Fill missing prices/shares
+    # Fill missing prices and shares
     df[["shares_out", "close"]] = (
         df.groupby("isin")[["shares_out", "close"]]
           .ffill()
@@ -107,41 +92,36 @@ def load_and_preprocess_data():
         "(datadate) Data Date": "datadate" 
     })
     
-    # Preprocess Liabilities: Use fdate for Point-In-Time updates
+    # Preprocess Liabilities
     df2["fdate"] = pd.to_datetime(df2["fdate"], errors="coerce")
-    df2 = df2.dropna(subset=["fdate"]) # Drop rows without availability date
+    df2 = df2.dropna(subset=["fdate"]) # Drop rows without availability date, should be zero
     
-    # CRITICAL: Liabilities in the data are in MILLIONS - convert to actual currency units
-    # to match asset values (which are in full units from market cap * shares)
+    # Liablilities are in millions therefore calculate
     df2["liabilities_total"] = df2["liabilities_total"] * 1_000_000
     print(f"Scaled liabilities from millions to actual currency units (×1,000,000)")
     
-    # Sort for merge_asof (must be sorted by key)
     df = df.sort_values("date")
     df2 = df2.sort_values("fdate")
     
-    # Merge strategy: Point-in-Time (PIT) using fdate
-    # CRITICAL FIX: fdate represents when liability data becomes AVAILABLE
-    # The liability value should apply to the period BEFORE that fdate
-    # direction='backward' means: use the PREVIOUS available fdate's liability value
-    # This ensures liability from fdate 2011-12-31 applies to dates BEFORE 2011-12-31
+    # Merging of datasets
     print("Merging liabilities using Point-in-Time (fdate) logic (backward-looking)...")
     
+    # merge_asof matches each equity date to the most recent fdate that has already passed,
+    # so we never accidentally use liability data that wasn't public yet on that date
     df = pd.merge_asof(
         df, 
         df2[["gvkey", "fdate", "liabilities_total"]], 
         left_on="date", 
         right_on="fdate", 
         by="gvkey", 
-        direction="backward"  # Use NEXT fdate (so liability applies to period before fdate)
+        direction="backward"
     )
     
-    # Sort back by firm and date
     df = df.sort_values(["gvkey", "date"])
 
     print("Loaded liability data")
 
-    # --- MERGE INTEREST RATES ---
+    # Merge the interest rates
     print("Merging interest rates from ECB data...")
     try:
         rates_df = load_interest_rates()
@@ -160,7 +140,7 @@ def load_and_preprocess_data():
         print(f"Successfully merged interest rates. Range: {df['risk_free_rate'].min():.4f} to {df['risk_free_rate'].max():.4f}")
     except Exception as e:
         print(f"⚠ Error merging interest rates: {e}")
-        # Ensure column exists even if merge failed to prevent downstream errors
+        # Ensure column exists even if merge failed to prevent errors later on
         if 'risk_free_rate' not in df.columns:
             df['risk_free_rate'] = 0.03
     
@@ -176,32 +156,10 @@ def merton_newton_raphson_vectorized(
     max_iter=1000,
     tol=1e-4,
 ):
-    """
-    Vectorized Newton-Raphson solver for Merton model (EXACT - NO APPROXIMATION).
+    # Iterative Merton solver: alternates between updating asset values (Newton-Raphson)
+    # and re-estimating asset volatility from the implied asset return series
     
-    Uses scipy.special.ndtr for EXACT normal CDF (not approximation).
-    NO Numba JIT - uses pure NumPy for vectorization.
-    
-    Parameters:
-    -----------
-    equity_value_series : array, Equity values over rolling window
-    debt_value_series : array, Debt values over rolling window (HISTORICAL TIME SERIES)
-    sigma_A_daily_initial : float, Initial DAILY asset volatility
-    risk_free_rate_annual : float, Annual risk-free rate
-    time_to_maturity_years : float, Time to maturity in years (typically 1.0)
-    max_iter : int, Max iterations for Newton-Raphson
-    tol : float, Convergence tolerance
-    
-    Returns:
-    --------
-    V_A_vec : array, Final asset values
-    sigma_A_daily_current : float, Final DAILY asset volatility
-    """
-    
-    # Better initial guess for V_A: Equity + Present Value of Debt (Risk-free proxy)
-    # This is closer to the true asset value than E + B (which overestimates)
-    # V_A ~ E + B * exp(-rT)
-    # FIXED: Now uses historical debt series instead of single value
+    # Seed asset value as equity + PV of debt
     debt_value_series = debt_value_series.astype(np.float64)
     asset_value_series = (
         equity_value_series.astype(np.float64)
@@ -210,11 +168,11 @@ def merton_newton_raphson_vectorized(
     
     sigma_A_daily_current = np.float64(sigma_A_daily_initial)
     
+    # Outer loop: iterate until sigma_A converges
     for k in range(max_iter):
         sigma_A_daily_old = sigma_A_daily_current
         
-        # Inner Loop: Newton-Raphson for V_A (vectorized)
-        # Increased iterations for stability
+        # Inner loop: Newton-Raphson to back out asset values given current sigma_A
         for _ in range(20):
             asset_value_series = np.maximum(asset_value_series, 1e-4)
             sigma_A_annual_current = sigma_A_daily_current * np.sqrt(TRADING_DAYS_PER_YEAR)
@@ -222,29 +180,28 @@ def merton_newton_raphson_vectorized(
             sig2_half = 0.5 * sigma_A_annual_current ** 2
 
             if sig_sqrt_T < 1e-10:
-                sig_sqrt_T = 1e-10
+                sig_sqrt_T = 1e-10  # avoid division by zero for near-zero vol
             
-            # FIXED: Use historical debt series (not single value)
+            # Standard BSM d1 and d2
             d1 = (
                 np.log(asset_value_series / debt_value_series)
                 + (risk_free_rate_annual + sig2_half) * time_to_maturity_years
             ) / sig_sqrt_T
             d2 = d1 - sig_sqrt_T
             
-            # EXACT: Use ndtr (scipy's C-optimized normal CDF)
             Nd1_arr = ndtr(d1)
             Nd2_arr = ndtr(d2)
             
-            # Black-Scholes formula for equity value
-            # FIXED: Use historical debt series (not single value)
+            # Residual: BSM equity formula minus observed equity
             f_val = (
                 asset_value_series * Nd1_arr
                 - debt_value_series * np.exp(-risk_free_rate_annual * time_to_maturity_years) * Nd2_arr
                 - equity_value_series
             )
-            f_prime = Nd1_arr  # N(d1)
+            f_prime = Nd1_arr  # derivative of BSM equity w.r.t. asset value
             
-            # Newton-Raphson step (vectorized, safe division)
+            # Only step where the derivative is large enough to be safe
+            # (skips entries where N(d1) ≈ 0, i.e. deep out-of-the-money)
             step = np.zeros_like(asset_value_series)
             safe_mask = f_prime > 1e-5
             step[safe_mask] = f_val[safe_mask] / f_prime[safe_mask]
@@ -253,16 +210,15 @@ def merton_newton_raphson_vectorized(
         
         asset_value_series = np.maximum(asset_value_series, 1e-4)
         
-        # Outer Update: sigma_A from asset returns (daily)
+        # Re-estimate sigma_A from the implied asset return series
         log_asset_values = np.log(asset_value_series)
         asset_returns_daily = np.diff(log_asset_values)
         
-        # Filter valid returns
         valid_mask = np.isfinite(asset_returns_daily)
         if np.sum(valid_mask) >= 10:
             sigma_A_daily_new = np.std(asset_returns_daily[valid_mask])
             
-            # Check convergence
+            # Stop if sigma_A stopped moving
             if abs(sigma_A_daily_new - sigma_A_daily_old) < tol:
                 sigma_A_daily_current = sigma_A_daily_new
                 break
@@ -273,11 +229,8 @@ def merton_newton_raphson_vectorized(
 
 
 def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
-    """
-    Process single firm's Merton estimation (for parallelization).
-    
-    Returns list of daily results for this firm.
-    """
+    # Runs the rolling Merton estimation for a single firm.
+    # Called in parallel for each firm by run_merton_estimation.
     gvkey = firm_data["gvkey"].iloc[0]
     firm_data = firm_data.sort_values("date").reset_index(drop=True)
     all_dates = firm_data["date"].unique()
@@ -285,16 +238,15 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
     results = []
     
     for date_idx, date_t in enumerate(all_dates):
-        # 252-observation rolling window (1 year of trading days)
+        # Rolling 252-day window ending at the current date
         window_start_idx = max(0, date_idx - MIN_OBSERVATIONS + 1)
         window_df = firm_data.iloc[window_start_idx:date_idx + 1]
         
         if len(window_df) < MIN_OBSERVATIONS:
             continue
         
-        # Get interest rate
+        # Prefer the rate already merged into the DataFrame, fall back to the dict
         if 'risk_free_rate' in window_df.columns:
-            # Use the rate from the DataFrame (Point-In-Time) for the valuation date
             r_vals = window_df.loc[window_df['date'] == date_t, 'risk_free_rate'].values
             if len(r_vals) > 0:
                 r_annual = float(r_vals[0])
@@ -305,29 +257,24 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
             month_str = pd.Timestamp(date_t).strftime('%Y-%m')
             r_annual = interest_rates_dict.get(month_str, 0.05)
         
-        # Inputs
-        # Equity: daily time series over rolling window
+        # Equity time series over the window
         equity_value_series = window_df["mkt_cap"].values.astype(np.float64)
 
-        # Debt: HISTORICAL TIME SERIES over rolling window (FIXED)
-        # CRITICAL FIX: Use the actual historical debt values for each date in the window
-        # This ensures that when equity drops during COVID, we use the corresponding historical debt,
-        # not just today's debt value. This allows asset values to properly reflect equity changes.
+        # Use the actual historical debt for each day in the window
         debt_value_series = window_df["liabilities_total"].values.astype(np.float64)
         
-        # Skip if ANY debt values in the window are NaN or invalid
-        # (This happens before liabilities data starts, e.g., pre-Feb 2011)
+        # Skip windows that pre-date the first liability observation
         if np.any(np.isnan(debt_value_series)) or np.any(debt_value_series <= 0):
             continue
         
-        # Check validity
+        # Basic sanity check, need positive equity values to run BSM
         if (
             len(equity_value_series) < 10
             or np.any(equity_value_series <= 0)
         ):
             continue
         
-        # Initial sigma_E (daily)
+        # Compute initial equity volatility from log-returns over the window
         equity_values_safe = np.maximum(equity_value_series, 1e-4)
         equity_returns_daily = np.diff(np.log(equity_values_safe))
         equity_returns_daily = equity_returns_daily[np.isfinite(equity_returns_daily)]
@@ -337,15 +284,13 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
         
         sigma_E_daily = np.std(equity_returns_daily)
         if sigma_E_daily < 1e-6:
-            sigma_E_daily = 0.4 / np.sqrt(252)  # Daily equivalent fallback
+            sigma_E_daily = 0.4 / np.sqrt(252)  # fallback for near-zero vol
         
-        # CALL VECTORIZED FUNCTION 
-        # Use T = 1.0 year
         time_to_maturity_years = 1.0
         try:
             asset_value_series, sigma_A_daily = merton_newton_raphson_vectorized(
                 equity_value_series,
-                debt_value_series,  # FIXED: Now passes time series instead of scalar
+                debt_value_series,
                 sigma_E_daily,
                 r_annual,
                 time_to_maturity_years,
@@ -356,7 +301,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
             print(f"    ⚠ Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
             continue
         
-        # Save result
+        # Only keep the last point in the window as the estimate for today
         asset_value_final = asset_value_series[-1]
         
         results.append({
@@ -366,7 +311,6 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
             "asset_volatility": sigma_A_daily,
         })
         
-        # Progress
         if (date_idx + 1) % 100 == 0:
             print(f"  Firm {firm_idx+1}/{total_firms} (gvkey={gvkey}): {date_idx+1}/{len(all_dates)} dates")
     
@@ -374,41 +318,14 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
 
 
 def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False):
-    """
-    Runs the rolling window iterative Merton model on DAILY data (OPTIMIZED).
-    
-    Uses:
-    - Vectorization with NumPy for speed
-    - Parallelization with joblib over firms
-    - EXACT scipy.special.ndtr (no approximation)
-    
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        Input data with equity and liability information
-    interest_rates_df : pd.DataFrame, optional
-        DataFrame with columns 'month_year' and 'risk_free_rate'
-    n_jobs : int
-        Number of parallel jobs. -1 = use all cores
-    use_cache : bool
-        Deprecated. Caching has been removed.
-    
-    Returns:
-    --------
-    df_merged : DataFrame with Merton results merged
-    daily_returns_df : DataFrame with daily returns and volatilities
-    """
-    
     overall_start = time.time()
     
     print(f"\n{'='*80}")
     print("MERTON MODEL ESTIMATION (Vectorized + Parallelized - EXACT ndtr)")
     print(f"{'='*80}\n")
     
-    # CRITICAL FIX: Only filter mkt_cap (equity) for rolling window computation.
-    # Do NOT filter liabilities_total here - that would drop 2010-early 2011 data.
-    # The Merton rolling window only needs EQUITY history for returns.
-    # Liabilities are only needed AT THE ESTIMATION DATE (checked inside process_firm_merton).
+    # Only drop rows with missing equity — liabilities can be NaN in early dates
+    # and are checked per-window inside process_firm_merton
     print("DEBUG: Date range BEFORE filtering:")
     print(f"  Full df: {df['date'].min()} to {df['date'].max()} ({len(df)} rows, {df['gvkey'].nunique()} firms)")
     
@@ -424,13 +341,12 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     firms = sorted(solver_df["gvkey"].unique())
     print(f"Processing {len(firms)} firms with {n_jobs} parallel jobs...\n")
     
-    # Convert interest rates to dict for faster lookup
+    # Dict lookup is much faster than DataFrame slicing inside the tight per-date loop
     if interest_rates_df is not None:
         interest_rates_dict = dict(zip(interest_rates_df['month_year'], interest_rates_df['risk_free_rate']))
     else:
         interest_rates_dict = {}
     
-    # PARALLELIZE over firms
     print(f"Starting parallel Merton estimation...")
     start_parallel = time.time()
     
@@ -444,7 +360,7 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
         for i, gvkey in enumerate(firms)
     )
     
-    # Flatten results
+    # Each element in results_list is a list of dicts, change into one list
     merton_results = pd.DataFrame([item for sublist in results_list for item in sublist])
     
     if merton_results.empty:
@@ -454,40 +370,35 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     parallel_time = time.time() - start_parallel
     print(f"\n✓ Parallel Merton complete in {timedelta(seconds=int(parallel_time))}\n")
     
-    # DEBUG: Check Merton results date range
     print("DEBUG: Merton results date range:")
     print(f"  merton_results: {merton_results['date'].min()} to {merton_results['date'].max()} ({len(merton_results)} rows)")
     
-    # Merge back to main DF (LEFT join to preserve all original dates)
+    # Left join to keep all original rows even where Merton couldn't produce an estimate
     df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
     
     print("DEBUG: After merging Merton back to original df:")
     print(f"  df_merged: {df_merged['date'].min()} to {df_merged['date'].max()} ({len(df_merged)} rows)")
     
-    # Check when Merton columns start to populate
     first_merton_date = df_merged.dropna(subset=['asset_value'])['date'].min()
     print(f"  First non-null Merton result: {first_merton_date}")
     
-    # Check when liabilities start
     first_liab_date = df_merged.dropna(subset=['liabilities_total'])['date'].min()
     print(f"  First non-null liabilities: {first_liab_date}")
     
-    # Compute Daily Log Returns DataFrame
+    # Compute log-returns across consecutive trading days per firm
     daily_returns_df = merton_results.copy().sort_values(["gvkey", "date"])
     daily_returns_df["asset_return_daily"] = daily_returns_df.groupby("gvkey")["asset_value"].transform(
         lambda x: np.log(x / x.shift(1))
     )
 
-    # --- DIAGNOSTICS FOR EXTREME RETURNS ---
+    # Flag any suspiciously large single-day moves for review
     print("\n" + "="*60)
     print("EXTREME ASSET RETURN DIAGNOSTICS")
     print("="*60)
     
-    # Check absolute returns > 30%, 40%, 50%
     diag_df = daily_returns_df.dropna(subset=['asset_return_daily'])
     
     for threshold in [0.30, 0.40, 0.50]:
-        # Using ABSOLUTE return to catch both crashes and surges
         extreme_rows = diag_df[diag_df['asset_return_daily'].abs() > threshold]
         
         print(f"\n[Threshold: Absolute Return > {threshold*100:.0f}%]")
@@ -495,7 +406,6 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
             print("  No extreme returns found at this level.")
         else:
             print(f"  Found {len(extreme_rows)} instances:")
-            # Group by firm for organized output
             for gvkey, group in extreme_rows.groupby('gvkey'):
                 print(f"  • Firm {gvkey}:")
                 for _, row in group.iterrows():
@@ -504,10 +414,8 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
                     print(f"      {date_str}: {ret_val*100:+.2f}%")
     
     print("="*60 + "\n")
-    # ---------------------------------------
 
-    # ADD SCALE RETURNS (Multiply by 100) for numerical stability in optimization
-    # This centralized scaling ensures all models work on the same scaled data
+    # Scale returns by 100 for numerical stability in downstream optimizers
     daily_returns_df["asset_return_daily_scaled"] = daily_returns_df["asset_return_daily"] * 100.0
     
     daily_returns_df = daily_returns_df[[
@@ -516,30 +424,27 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     
     overall_time = time.time() - overall_start
     
-    # ========== SANITY CHECKS FOR DATE RANGES ==========
     print(f"\n{'='*80}")
     print("DATE RANGE SANITY CHECKS")
     print(f"{'='*80}")
     
-    # 1. df_merged should start at the earliest equity date (2010)
     equity_min = df['date'].min()
     merged_min = df_merged['date'].min()
     print(f"✓ Original equity data starts: {equity_min}")
     print(f"✓ Merged data (equity + Merton) starts: {merged_min}")
     assert equity_min == merged_min, f"ERROR: Lost early dates! Equity starts {equity_min}, merged starts {merged_min}"
     
-    # 2. First non-null Merton result should be ~1 year after start (after 252-day window from 2010 data)
+    # Merton needs a full 252-day window, so first result is roughly 1 year after data start
     first_merton = df_merged.dropna(subset=['asset_value'])['date'].min()
     expected_merton_start = equity_min + pd.DateOffset(days=252)
     print(f"✓ First non-null Merton result: {first_merton}")
     print(f"  (Expected around {expected_merton_start.strftime('%Y-%m-%d')} after 252-day (1-year) window)")
     
-    # 3. Liabilities should start around Feb 2011 (this is expected and correct)
+    # Liabilities start later than equity data — this is expected
     first_liab = df_merged.dropna(subset=['liabilities_total'])['date'].min()
     print(f"✓ First non-null liabilities: {first_liab}")
     print(f"  (This is expected - liabilities data starts later than equity)")
     
-    # 4. Final dataset with BOTH Merton AND liabilities should start ~Feb 2011
     complete_data = df_merged.dropna(subset=['asset_value', 'liabilities_total'])
     if not complete_data.empty:
         complete_min = complete_data['date'].min()
@@ -549,7 +454,6 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
         print(f"⚠ No rows with both Merton and liability data!")
     
     print(f"{'='*80}\n")
-    # ====================================================
     
     print(f"{'='*80}")
     print(f"Merton Estimation Complete")

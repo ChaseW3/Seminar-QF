@@ -388,6 +388,228 @@ def plot_regime_probabilities_ts(ms_garch_df: pd.DataFrame, figsize=(14, 5)):
 
 
 # ===================================================================
+# C) Per-company alpha/beta summary statistics over time
+# ===================================================================
+
+_MATURITY_MAP = {'1Y': '1Y', '3Y': '3Y', '5Y': '5Y',
+                 1: '1Y', 3: '3Y', 5: '5Y',
+                 '1': '1Y', '3': '3Y', '5': '5Y'}
+
+
+def compute_param_summary_by_company(
+    df: pd.DataFrame,
+    windows_df: pd.DataFrame,
+    maturity: str | int,
+    save_path: str | None = None,
+) -> pd.DataFrame:
+    """
+    Compute summary statistics of the alpha and beta parameters **over the
+    actual simulation window** for each company (gvkey), for a given CDS
+    maturity.
+
+    Only firms that have a window defined for the requested maturity are
+    included — firms without a window (e.g. those excluded from the CDS
+    comparison for that maturity) are silently dropped.
+
+    The statistics are computed exclusively over the date range
+    [start_date, end_date] from ``gvkey_maturity_simulation_windows.csv``,
+    matching the window actually used in the Monte Carlo and CDS comparison.
+    Two extra columns — ``window_start`` and ``window_end`` — are added to
+    the output so the window is always visible alongside the statistics.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame loaded from ``daily_asset_returns_with_msgarch.csv``.
+        Must contain columns: gvkey, date, alpha_0, beta_0, alpha_1, beta_1.
+    windows_df : pd.DataFrame
+        DataFrame loaded from ``gvkey_maturity_simulation_windows.csv``.
+        Must contain columns: gvkey, maturity, start_date, end_date.
+    maturity : str or int
+        CDS maturity to filter on.  Accepts ``'1Y'``, ``'3Y'``, ``'5Y'``
+        or the integer equivalents ``1``, ``3``, ``5``.
+    save_path : str | None
+        If provided, the long-form result is saved as a CSV to this path.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form DataFrame with one row per (gvkey, regime, parameter).
+        Columns: gvkey, window_start, window_end, regime, param,
+        count, mean, median, std, min, Q1, Q3, max, range, IQR, n_outliers.
+
+    Statistics computed per (gvkey, regime, parameter)
+    ---------------------------------------------------
+        count       – number of non-null observations inside the window
+        mean        – arithmetic mean
+        median      – 50th percentile
+        std         – standard deviation (volatility of the parameter)
+        min / max   – extremes
+        Q1 / Q3     – 25th / 75th percentile
+        range       – max − min
+        IQR         – interquartile range (Q3 − Q1)
+        n_outliers  – values beyond 1.5 × IQR from the hinges (Tukey fences)
+
+    Examples
+    --------
+    >>> summary = compute_param_summary_by_company(df_msgarch, windows_df, maturity='5Y')
+    >>> summary = compute_param_summary_by_company(df_msgarch, windows_df, maturity=1,
+    ...                                            save_path='summary_1y.csv')
+    """
+    # -- Validate maturity --
+    mat_key = _MATURITY_MAP.get(maturity)
+    if mat_key is None:
+        raise ValueError(
+            f"maturity must be one of {list(_MATURITY_MAP.keys())}, got {maturity!r}"
+        )
+
+    required_df = ['gvkey', 'date', 'alpha_0', 'beta_0', 'alpha_1', 'beta_1']
+    missing_df = [c for c in required_df if c not in df.columns]
+    if missing_df:
+        raise ValueError(f"df is missing required columns: {missing_df}")
+
+    required_w = ['gvkey', 'maturity', 'start_date', 'end_date']
+    missing_w = [c for c in required_w if c not in windows_df.columns]
+    if missing_w:
+        raise ValueError(f"windows_df is missing required columns: {missing_w}")
+
+    # -- Filter windows to the requested maturity --
+    win = windows_df[windows_df['maturity'] == mat_key].copy()
+    win['gvkey']      = win['gvkey'].astype(int)
+    win['start_date'] = pd.to_datetime(win['start_date'])
+    win['end_date']   = pd.to_datetime(win['end_date'])
+
+    if len(win) == 0:
+        raise ValueError(f"No windows found for maturity '{mat_key}'.")
+
+    # -- Prepare msgarch DataFrame --
+    df_work = df.copy()
+    df_work['gvkey'] = df_work['gvkey'].astype(int)
+    df_work['date']  = pd.to_datetime(df_work['date'])
+
+    # -- Helper: per-series statistics --
+    def _stats(s: pd.Series) -> dict:
+        s = s.dropna()
+        if len(s) == 0:
+            return {k: np.nan for k in
+                    ['count', 'mean', 'median', 'std', 'min',
+                     'Q1', 'Q3', 'max', 'range', 'IQR', 'n_outliers']}
+        q1, q3 = s.quantile(0.25), s.quantile(0.75)
+        iqr    = q3 - q1
+        fence_lo = q1 - 1.5 * iqr
+        fence_hi = q3 + 1.5 * iqr
+        return {
+            'count':      int(len(s)),
+            'mean':       s.mean(),
+            'median':     s.median(),
+            'std':        s.std(),
+            'min':        s.min(),
+            'Q1':         q1,
+            'Q3':         q3,
+            'max':        s.max(),
+            'range':      s.max() - s.min(),
+            'IQR':        iqr,
+            'n_outliers': int(((s < fence_lo) | (s > fence_hi)).sum()),
+        }
+
+    records = []
+    skipped = []
+
+    for _, wrow in win.iterrows():
+        gvkey      = int(wrow['gvkey'])
+        start_date = wrow['start_date']
+        end_date   = wrow['end_date']
+
+        # Slice msgarch to this firm's window
+        firm_df = df_work[
+            (df_work['gvkey'] == gvkey) &
+            (df_work['date']  >= start_date) &
+            (df_work['date']  <= end_date)
+        ]
+
+        param_cols = ['alpha_0', 'beta_0', 'alpha_1', 'beta_1']
+        firm_valid = firm_df.dropna(subset=param_cols, how='all')
+
+        if len(firm_valid) == 0:
+            skipped.append(gvkey)
+            continue
+
+        for regime in (0, 1):
+            for param in ('alpha', 'beta'):
+                col = f'{param}_{regime}'
+                if col not in firm_valid.columns:
+                    continue
+                stats_dict = _stats(firm_valid[col])
+                records.append({
+                    'gvkey':        gvkey,
+                    'window_start': start_date.date(),
+                    'window_end':   end_date.date(),
+                    'regime':       (f'Regime {regime} '
+                                     f'({_REGIME_LABELS[regime].split("(")[1].rstrip(")")})'),
+                    'param':        param,
+                    **stats_dict,
+                })
+
+    if skipped:
+        warnings.warn(
+            f"The following gvkeys had no valid parameter rows inside the "
+            f"{mat_key} window and were skipped: {skipped}"
+        )
+
+    summary = pd.DataFrame(records)
+
+    n_firms = summary['gvkey'].nunique() if len(summary) > 0 else 0
+    print(f"Maturity {mat_key}: {n_firms} firms included "
+          f"(window file had {len(win)} entries).")
+
+    if save_path is not None:
+        summary.to_csv(save_path, index=False)
+        print(f"Summary saved to: {save_path}")
+
+    return summary
+
+
+def display_param_summary(summary: pd.DataFrame):
+    """
+    Pretty-print the per-company alpha/beta summary table produced by
+    :func:`compute_param_summary_by_company`.
+
+    Pivots the tidy long-form table into a wide format:
+    rows = gvkey (with window_start / window_end), columns = (regime, param, statistic).
+    """
+    try:
+        from IPython.display import display as ipy_display
+        _display = ipy_display
+    except ImportError:
+        _display = print
+
+    stat_cols = ['count', 'mean', 'median', 'std', 'min', 'Q1', 'Q3',
+                 'max', 'range', 'IQR', 'n_outliers']
+
+    # Attach window columns to the index so they show up in the output
+    summary_idx = summary.set_index(['gvkey', 'window_start', 'window_end'])
+
+    # Build a pivot: index=(gvkey, window_start, window_end), columns=(regime, param, stat)
+    pivot = summary_idx.pivot_table(
+        index=['gvkey', 'window_start', 'window_end'],
+        columns=['regime', 'param'],
+        values=stat_cols,
+        aggfunc='first',
+    )
+    # Reorder levels so it reads (regime, param, stat)
+    pivot = pivot.reorder_levels([1, 2, 0], axis=1).sort_index(axis=1)
+
+    with pd.option_context(
+        'display.float_format', '{:.6f}'.format,
+        'display.max_columns', None,
+        'display.width', None,
+    ):
+        _display(pivot)
+
+    return pivot
+
+
+# ===================================================================
 # Convenience wrapper
 # ===================================================================
 
