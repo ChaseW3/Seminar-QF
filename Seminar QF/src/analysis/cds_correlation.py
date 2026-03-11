@@ -1,16 +1,7 @@
 # cds_correlation.py
-"""
-Compare model-implied CDS spreads with actual market CDS data.
-
-Following Malone et al. (2009) methodology:
-1. RMSE of spread prediction errors: e_{i,t}(τ) = S^CDS_{i,t}(τ) - s^{(m)}_{i,t}(τ)
-2. Correlation of spread CHANGES (innovations): ρ^{(m)}(τ) = Corr(ΔS^CDS, Δs^{(m)})
-
-References:
-- Malone et al. (2009)
-- Byström (2006)
-- van de Ven et al. (2018)
-"""
+# Compare model-implied CDS spreads against market CDS data.
+# Metrics follow Malone et al. (2009): RMSE of spread errors and
+# correlation of spread changes (Byström, 2006).
 
 import pandas as pd
 import numpy as np
@@ -23,8 +14,8 @@ except ImportError:
     from src.utils import config
 
 
-# Company name mapping between model and CDS data
-# NOTE: Financial institutions are now INCLUDED in the analysis
+# Company name mapping between model output and CDS market data
+# Financial institutions are included in the analysis
 COMPANY_MAPPING = {
     # Model company name -> CDS data company name
     'ADIDAS AG': 'ADIDAS AG',
@@ -66,21 +57,7 @@ COMPANY_MAPPING = {
 
 
 def load_cds_market_data(filepath, maturity):
-    """
-    Load CDS market data from Excel file.
-    
-    Parameters
-    ----------
-    filepath : str or Path
-        Path to the CDS Excel file
-    maturity : int
-        Maturity in years (1, 3, or 5)
-    
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: date, company_cds, cds_market_{maturity}y_bps
-    """
+    # Load CDS market data from an Excel file for a given maturity (1, 3, or 5 years)
     df = pd.read_excel(filepath, header=None)
     
     # Row 3 has company names, row 4 has tickers, data starts at row 5
@@ -115,19 +92,7 @@ def load_cds_market_data(filepath, maturity):
 
 
 def load_all_market_cds_data(input_dir=None):
-    """
-    Load all CDS market data (1Y, 3Y, 5Y) and merge.
-    
-    Parameters
-    ----------
-    input_dir : Path, optional
-        Directory containing CDS Excel files. Defaults to config.INPUT_DIR
-    
-    Returns
-    -------
-    pd.DataFrame
-        Combined market CDS data
-    """
+    # Load and merge all CDS market data (1Y, 3Y, 5Y maturities)
     if input_dir is None:
         input_dir = config.INPUT_DIR
     
@@ -140,7 +105,7 @@ def load_all_market_cds_data(input_dir=None):
     
     print(f"  Loaded CDS data: 1Y={len(cds_1y)}, 3Y={len(cds_3y)}, 5Y={len(cds_5y)} rows")
     
-    # Merge all maturities
+    # Merge all maturities into one DataFrame
     cds_market = cds_1y.merge(cds_3y, on=['date', 'company_cds'], how='outer')
     cds_market = cds_market.merge(cds_5y, on=['date', 'company_cds'], how='outer')
     
@@ -157,43 +122,14 @@ def calculate_cds_correlations(
     col_prefix='cds_spread_garch_mc',
     min_observations=30
 ):
-    """
-    Merge model CDS with market CDS and calculate metrics following Malone et al. (2009).
-    
-    Metrics computed:
-    1. RMSE: Root Mean Squared Error of spread prediction errors
-       e_{i,t}(τ) = S^CDS_{i,t}(τ) - s^{(m)}_{i,t}(τ)
-    
-    2. Correlation of CHANGES (innovations):
-       ρ^{(m)}(τ) = Corr(ΔS^CDS_{i,t}(τ), Δs^{(m)}_{i,t}(τ))
-       where ΔS = S_t - S_{t-1}
-    
-    Parameters
-    ----------
-    model_cds_file : str, Path, or pd.DataFrame
-        Path to model CDS spreads CSV or DataFrame with model CDS data
-    merton_file : str or Path
-        Path to Merton results CSV (for company name mapping)
-    cds_market_df : pd.DataFrame
-        Market CDS data from load_all_market_cds_data()
-    model_name : str
-        Name of the model (for display)
-    col_prefix : str
-        Column prefix for CDS spread columns in model file
-    min_observations : int
-        Minimum observations required for per-firm metrics
-    
-    Returns
-    -------
-    tuple
-        (merged_df, metrics_dict, firm_metrics_df)
-    """
+    # Merge model CDS with market CDS and compute comparison metrics:
+    # RMSE of spread prediction errors and correlation of spread changes
     # Load company mapping
     merton_df = pd.read_csv(merton_file)
     gvkey_to_company = merton_df[['gvkey', 'company']].drop_duplicates()
     gvkey_to_company = gvkey_to_company.set_index('gvkey')['company'].to_dict()
     
-    # Load model CDS (accept either file path or DataFrame)
+    # Load model CDS spreads (accept file path or DataFrame)
     if isinstance(model_cds_file, pd.DataFrame):
         model_df = model_cds_file.copy()
     else:
@@ -202,7 +138,7 @@ def calculate_cds_correlations(
     model_df['company_cds'] = model_df['company'].map(COMPANY_MAPPING)
     model_df['date'] = pd.to_datetime(model_df['date'])
     
-    # Rename model columns
+    # Rename model columns to a common format for merging
     cols_to_use = ['gvkey', 'date', 'company', 'company_cds']
     rename_map = {}
     for mat in [1, 3, 5]:
@@ -223,18 +159,18 @@ def calculate_cds_correlations(
     print(f"  Matched observations: {len(merged)}")
     print(f"  Matched companies: {merged['company'].nunique()}")
     
-    # Calculate spread changes (innovations) for each firm
+    # Spread changes (first differences) for correlation-of-innovations metric
     for mat in [1, 3, 5]:
         model_col = f'cds_model_{mat}y_bps'
         market_col = f'cds_market_{mat}y_bps'
         if model_col in merged.columns and market_col in merged.columns:
-            # Calculate first differences (changes) per firm
+            # First differences per firm
             merged[f'delta_model_{mat}y'] = merged.groupby('gvkey')[model_col].diff()
             merged[f'delta_market_{mat}y'] = merged.groupby('gvkey')[market_col].diff()
-            # Calculate prediction error (market - model)
+            # Prediction error: market minus model
             merged[f'error_{mat}y'] = merged[market_col] - merged[model_col]
     
-    # Calculate overall metrics
+    # Calculate overall comparison metrics
     metrics = {'rmse': {}, 'corr_levels': {}, 'corr_changes': {}}
     
     print(f"\n  RMSE (Market - Model, in bps):")
@@ -269,7 +205,7 @@ def calculate_cds_correlations(
                 metrics['corr_changes'][f'{mat}Y'] = corr
                 print(f"    {mat}Y: {corr:.4f} (n={len(valid)})")
     
-    # Calculate per-firm metrics
+    # Calculate per-firm metrics for detailed comparison
     firm_metrics = []
     for company in merged['company'].unique():
         firm_data = merged[merged['company'] == company].sort_values('date')
@@ -314,21 +250,7 @@ def calculate_cds_correlations(
 
 
 def run_cds_correlation_analysis(output_dir=None, input_dir=None):
-    """
-    Run full CDS correlation analysis for all models.
-    
-    Parameters
-    ----------
-    output_dir : Path, optional
-        Directory containing model output files. Defaults to config.OUTPUT_DIR
-    input_dir : Path, optional
-        Directory containing CDS market data. Defaults to config.INPUT_DIR
-    
-    Returns
-    -------
-    dict
-        Dictionary with results for each model
-    """
+    # Run the full CDS correlation analysis for all available models
     if output_dir is None:
         output_dir = config.OUTPUT_DIR
     if input_dir is None:
@@ -344,7 +266,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     results = {}
     
-    # Helper function to transform Monte Carlo results to CDS spread format
+    # Helper: read MC file and rename spread columns to common format
     def prepare_mc_file(mc_file, spread_col_prefix, output_col_prefix):
         """Read Monte Carlo file and rename spread columns, converting to basis points."""
         try:
@@ -359,8 +281,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 print(f"   Available columns: {df.columns.tolist()}")
                 return None
             
-            # Spreads in MC results are already in basis points - just rename columns
-            # and add _bps suffix for clarity
+            # Spreads are already in basis points — just rename columns
             for mat in ['1y', '3y', '5y']:
                 source_col = f'{spread_col_prefix}_{mat}'
                 target_col = f'{output_col_prefix}_{mat}_bps'
@@ -444,11 +365,11 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         print("⚠ Error: No models were successfully loaded!")
         return None
     
-    # Build summary DataFrame with all metrics from first available model
+    # Build summary DataFrame across all models
     first_model = list(results.keys())[0]
     summary_df = results[first_model][2][['company', 'gvkey', 'n_obs']].copy()
     
-    # Include all available models
+    # Include all available models in the summary
     model_list = []
     for model_key in ['Merton_MC', 'GARCH', 'RS', 'MSGARCH']:
         if model_key in results:
@@ -539,21 +460,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
 
 
 def plot_cds_correlations(results, output_dir=None, maturity=5, axis_limit=None):
-    """
-    Create scatter plots of model vs market CDS spreads.
-    
-    Parameters
-    ----------
-    results : dict
-        Results from run_cds_correlation_analysis()
-    output_dir : Path, optional
-        Directory to save plot. Defaults to config.OUTPUT_DIR
-    maturity : int
-        Maturity to plot (1, 3, or 5)
-    axis_limit : float, optional
-        Maximum value for both axes (to zoom in and exclude extreme outliers).
-        If None, uses data maximum. Recommended: 500-1000 for better visualization.
-    """
+    # Scatter plots of model-implied vs market CDS spreads for each model
     if output_dir is None:
         output_dir = config.OUTPUT_DIR
     output_dir = Path(output_dir)

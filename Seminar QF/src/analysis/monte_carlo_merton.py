@@ -1,4 +1,6 @@
 # monte_carlo_merton.py
+# Monte Carlo simulation of asset paths under the classic Merton model (constant volatility).
+# Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
 
 import pandas as pd
 import numpy as np
@@ -8,10 +10,11 @@ from joblib import Parallel, delayed
 from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 
-MIN_RISK_FREE_RATE = 0.02
+MIN_RISK_FREE_RATE = 0.02  # Floor for risk-free rate
 
 
 def _horizon_vector_from_max_days(max_days: int) -> np.ndarray:
+    # Build the vector of horizon checkpoints (252d=1Y, 756d=3Y, 1260d=5Y)
     if max_days <= 252:
         return np.array([252], dtype=np.int32)
     if max_days <= 756:
@@ -24,11 +27,8 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
                                     num_simulations, num_firms,
                                     horizon_days, v0_arr, liability_arr, rf_arr,
                                     spread_cap=0.5):
-    """
-    Optimized Monte Carlo Merton simulation with constant volatility.
-    Uses log-asset evolution to minimize exp() calls.
-    Returns only per-firm, per-horizon aggregates (no per-simulation arrays).
-    """
+    # JIT-compiled Merton Monte Carlo: simulates asset paths with constant
+    # volatility and normal innovations, returns PD and spreads per horizon
     max_days = np.max(horizon_days)
     n_horizons = len(horizon_days)
     
@@ -37,7 +37,7 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
     spread_out = np.full((n_horizons, num_firms), np.nan)
     debt_out = np.full((n_horizons, num_firms), np.nan)
     
-    # Pre-compute horizon mask
+    # Pre-compute which days correspond to output horizons
     is_horizon = np.zeros(max_days, dtype=np.int32)
     horizon_map = np.full(max_days, -1, dtype=np.int32)
     for h in range(n_horizons):
@@ -46,29 +46,29 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
             is_horizon[day_idx] = 1
             horizon_map[day_idx] = h
     
-    # Process firms sequentially (Joblib handles parallel dates)
+    # Process each firm sequentially (parallelism is across dates via Joblib)
     for f in range(num_firms):
-        # Constants
+        # Firm-level parameters
         sigma = sigma_daily_arr[f]
         v0 = v0_arr[f]
         liability = liability_arr[f]
         rf_rate = rf_arr[f]
         
-        # Check validity of Merton inputs
+        # Skip firms with missing or invalid Merton inputs
         valid_merton = (not np.isnan(v0)) and (not np.isnan(liability)) and (v0 > 0) and (liability > 0)
         valid_rf = (not np.isnan(rf_rate))
         if valid_rf:
             rf_rate = max(rf_rate, MIN_RISK_FREE_RATE)
         
         if not valid_merton:
-            # Skip this firm - outputs remain NaN
             continue
         
-        # Initialize log-space
+        # Work in log-space for numerical stability
         log_v0 = np.log(v0)
         liability_horizon = np.full(n_horizons, liability)
         log_liability_horizon = np.full(n_horizons, np.log(liability))
         if valid_rf:
+            # Grow the default barrier at the risk-free rate for each horizon
             rf_compound = max(rf_rate, 0.0)
             for h in range(n_horizons):
                 T_years = horizon_days[h] / 252.0
@@ -76,10 +76,10 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
                 liability_horizon[h] = liability_T
                 log_liability_horizon[h] = np.log(liability_T)
         
-        # State Vectors (Size: num_simulations)
+        # Initialize log-asset paths for all simulations
         log_asset = np.full(num_simulations, log_v0)
         
-        # Risk-neutral drift: daily risk-free rate and variance drag (constant vol for Merton)
+        # Daily risk-neutral drift: constant for Merton (r/252 − 0.5σ²)
         if valid_rf:
             rf_daily = rf_rate / 252.0
         else:
@@ -91,42 +91,40 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
         payoff_sums = np.zeros(n_horizons)
         
         for day in range(max_days):
-            # 1. Vectorized Random Generation (standard normal for Merton)
+            # Draw standard normal innovations
             z = np.random.standard_normal(num_simulations)
             
-            # TRUNCATION: Cap errors at 5 standard deviations (as per paper page 12)
+            # Truncate at ±5σ to prevent extreme tail draws
             z = np.clip(z, -5.0, 5.0)
             
-            # 2. Vectorized Updates with constant volatility
+            # Update asset paths: constant volatility version
             eps = sigma * z
             
-            # Update log-asset with risk-neutral drift: (r/252 - 0.5*sigma²) + sigma*Z
+            # Risk-neutral dynamics: log(V_t+1) = log(V_t) + drift + σ·Z
             log_asset += drift_daily + eps
             
-            # 3. Horizon Check
+            # Check if today is a horizon date — record defaults and payoffs
             if is_horizon[day]:
                 h = horizon_map[day]
                 log_liability_T = log_liability_horizon[h]
                 liability_T = liability_horizon[h]
                 
-                # Default detection in log-space (Terminal PD only for Merton)
+                # Default if asset falls below liability (terminal PD for Merton)
                 defaults = (log_asset < log_liability_T).astype(np.float64)
                 default_counts[h] = np.sum(defaults)
                 
-                # Compute asset values at horizon (exp only here)
+                # Compute recovery values
                 asset_T = np.exp(log_asset)
                 payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)
         
-        # Compute PD and spreads for each horizon
+        # Convert simulation counts to PD and implied spreads
         for h in range(n_horizons):
-            # PD
             pd_out[h, f] = default_counts[h] / num_simulations
             
-            # Expected payoff and debt value
             expected_payoff = payoff_sums[h] / num_simulations
             
-            # Compute spreads only if rf_rate is valid
+            # CDS spread = yield-to-maturity minus risk-free rate
             if valid_rf:
                 T_years = horizon_days[h] / 252.0
                 liability_T = liability_horizon[h]
@@ -144,22 +142,7 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
 
 
 def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_cap=0.5):
-    """
-    Process Monte Carlo Merton simulation for a single date (for parallelization).
-    
-    Parameters:
-    -----------
-    date_data : tuple
-        (date, df_date) where df_date contains firms data for that date
-    num_simulations : int
-        Number of Monte Carlo paths
-    num_days : int
-        Forecast horizon in days (should be max of horizons, e.g., 1260 for 5y)
-        
-    Returns:
-    --------
-    list : Results for all firms on this date
-    """
+    # Process all firms for a single date — called in parallel by Joblib
     date, df_date = date_data
     
     if df_date.empty:
@@ -171,8 +154,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
     num_firms = len(firms_list)
     
     # Vectorized parameter extraction with defaults and floors
-    # NOTE: asset_volatility from Merton estimation is ALREADY DAILY (not annual)
-    # Default to 0.2/sqrt(252) ≈ 0.0126 daily = 20% annual if missing
+    # asset_volatility from Merton estimation is already daily, not annual
     sigma_daily_arr = np.maximum(df_firms.get('asset_volatility', pd.Series([0.2/np.sqrt(252)]*num_firms)).fillna(0.2/np.sqrt(252)).values, 1e-4)
     
     # Prepare Merton arrays
@@ -180,7 +162,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
     liability_arr = df_firms.get('liabilities_total', pd.Series([np.nan]*num_firms)).fillna(np.nan).values
     rf_arr = df_firms.get('risk_free_rate', pd.Series([np.nan]*num_firms)).fillna(np.nan).values
     
-    # Scale rf_rate if needed (convert from percentage)
+    # Scale rf_rate from percentage if needed, enforce floor
     for i in range(num_firms):
         if not np.isnan(rf_arr[i]) and abs(rf_arr[i]) > 0.5:
             rf_arr[i] = rf_arr[i] / 100.0
