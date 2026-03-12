@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import statsmodels.api as sm
 from scipy import stats
 
 try:
@@ -60,6 +61,13 @@ MODEL_COLORS = {
     "Regime-Switching Calibrated": "#C44E52",
 }
 MSGARCH_MODEL_LABEL = MODEL_SPECS["msgarch"]["label"]
+NESTED_MODEL_PAIRS = [
+    ("merton_mc", "garch"),
+    ("merton_mc", "rs"),
+    ("garch", "msgarch"),
+    ("rs", "msgarch"),
+    ("merton_mc", "msgarch"),
+]
 
 
 @dataclass
@@ -461,19 +469,58 @@ def _write_rank_summary_by_maturity(
             )
 
 
-# Diebold-Mariano test for predictive accuracy
-def _dm_test(loss_a: pd.Series, loss_b: pd.Series) -> tuple[float, float]:
-    diff = (loss_a - loss_b).dropna()
-    n = len(diff)
-    if n < 30:
-        return np.nan, np.nan
-    mean_d = diff.mean()
-    std_d = diff.std(ddof=1)
-    if std_d == 0 or np.isnan(std_d):
-        return np.nan, np.nan
-    stat = mean_d / (std_d / np.sqrt(n))
-    pval = 2 * (1 - stats.norm.cdf(abs(stat)))
-    return float(stat), float(pval)
+def _resolve_hac_lags(n_obs: int, maxlags: int | None = None) -> int:
+    if n_obs <= 1:
+        return 0
+    if maxlags is not None:
+        return max(0, min(int(maxlags), n_obs - 1))
+    # Common Newey-West automatic lag rule.
+    return max(1, min(int(np.floor(4 * (n_obs / 100) ** (2 / 9))), n_obs - 1))
+
+
+def cw_test_nested(
+    benchmark_spread: np.ndarray | pd.Series,
+    extended_spread: np.ndarray | pd.Series,
+    observed_spread: np.ndarray | pd.Series,
+    maxlags: int | None = None,
+) -> tuple[float, float, int]:
+    """Clark-West test for nested model comparison using HAC/Newey-West variance.
+
+    The null is one-sided: benchmark performs at least as well as extended,
+    i.e., E[f_t] <= 0 where
+    f_t = e_b^2 - [e_e^2 - (s_b - s_e)^2].
+    """
+    bench = pd.to_numeric(pd.Series(benchmark_spread), errors="coerce")
+    ext = pd.to_numeric(pd.Series(extended_spread), errors="coerce")
+    obs = pd.to_numeric(pd.Series(observed_spread), errors="coerce")
+
+    valid = ~(bench.isna() | ext.isna() | obs.isna())
+    bench = bench[valid]
+    ext = ext[valid]
+    obs = obs[valid]
+
+    n_obs = int(len(obs))
+    if n_obs < 30:
+        return np.nan, np.nan, n_obs
+
+    e_b = obs - bench
+    e_e = obs - ext
+    f_t = (e_b ** 2) - ((e_e ** 2) - ((bench - ext) ** 2))
+    f_t = pd.to_numeric(f_t, errors="coerce").dropna()
+
+    n_eff = int(len(f_t))
+    if n_eff < 30:
+        return np.nan, np.nan, n_eff
+
+    lags = _resolve_hac_lags(n_eff, maxlags=maxlags)
+    X = np.ones((n_eff, 1))
+    model = sm.OLS(f_t.to_numpy(), X)
+    fit = model.fit(cov_type="HAC", cov_kwds={"maxlags": lags})
+
+    stat = float(fit.tvalues[0])
+    # One-sided p-value for H1: E[f_t] > 0 (extended model improves forecast).
+    pval_one_sided = float(1 - stats.norm.cdf(stat))
+    return stat, pval_one_sided, n_eff
 
 
 # Hotelling-Williams test for comparing two dependent correlations with market
@@ -524,11 +571,11 @@ def _sig_stars(p: float) -> str:
     return ""
 
 
-# Run DM and Hotelling-Williams tests for all model pairs within each segment
+# Run Clark-West and Hotelling-Williams tests for nested model pairs within each segment
 def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    dm_rows = []
+    cw_rows = []
     hw_rows = []
-    model_pairs = list(combinations(MODEL_SPECS.keys(), 2))
+    model_pairs = list(NESTED_MODEL_PAIRS)
 
     grouped = panel.groupby(group_cols, dropna=False) if group_cols else [((), panel)]
     for keys, grp in grouped:
@@ -536,39 +583,51 @@ def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.D
             keys = (keys,)
         segment = {k: v for k, v in zip(group_cols, keys)}
 
-        wide = grp.pivot_table(
+        spread_wide = grp.pivot_table(
             index=["gvkey", "date", "maturity"],
             columns="model",
-            values="sq_error_bps",
+            values="model_spread_bps",
             aggfunc="first",
+        )
+        market = (
+            grp[["gvkey", "date", "maturity", "market_spread_bps"]]
+            .drop_duplicates(subset=["gvkey", "date", "maturity"])
+            .set_index(["gvkey", "date", "maturity"])
         )
 
         for model_a, model_b in model_pairs:
             for maturity in grp["maturity"].dropna().unique():
                 idx = grp.loc[grp["maturity"] == maturity, ["gvkey", "date", "maturity"]].drop_duplicates()
-                sub = wide.loc[wide.index.isin(pd.MultiIndex.from_frame(idx))]
+                sub = spread_wide.loc[spread_wide.index.isin(pd.MultiIndex.from_frame(idx))]
                 if model_a not in sub.columns or model_b not in sub.columns:
                     continue
 
-                loss_a = sub[model_a]
-                loss_b = sub[model_b]
-                stat, pval = _dm_test(loss_a, loss_b)
+                sub_joined = sub[[model_a, model_b]].join(market, how="inner").dropna()
+                if sub_joined.empty:
+                    continue
+
+                stat, pval, n_obs = cw_test_nested(
+                    benchmark_spread=sub_joined[model_a].to_numpy(),
+                    extended_spread=sub_joined[model_b].to_numpy(),
+                    observed_spread=sub_joined["market_spread_bps"].to_numpy(),
+                )
                 if pd.isna(stat):
                     continue
 
-                mean_a = loss_a.mean()
-                mean_b = loss_b.mean()
-                dm_rows.append(
+                cw_rows.append(
                     {
                         **segment,
                         "maturity": maturity,
-                        "model1": model_a,
-                        "model2": model_b,
-                        "n_obs": int(sub[[model_a, model_b]].dropna().shape[0]),
-                        "DM_stat": stat,
+                        "benchmark_model": model_a,
+                        "extended_model": model_b,
+                        "benchmark_label": MODEL_SPECS[model_a]["label"],
+                        "extended_label": MODEL_SPECS[model_b]["label"],
+                        "model_pair": f"{MODEL_SPECS[model_a]['label']} vs {MODEL_SPECS[model_b]['label']}",
+                        "n_obs": int(n_obs),
+                        "CW_stat": stat,
                         "p_value": pval,
                         "significance": _sig_stars(pval),
-                        "result": "Model 1 (lower RMSE)" if mean_a < mean_b else "Model 2 (lower RMSE)",
+                        "result": "Reject H0 (extended better)" if pval < 0.05 else "Fail to reject H0",
                     }
                 )
 
@@ -596,7 +655,7 @@ def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.D
                 }
             )
 
-    return pd.DataFrame(dm_rows), pd.DataFrame(hw_rows)
+    return pd.DataFrame(cw_rows), pd.DataFrame(hw_rows)
 
 
 # For each observation, pick the model with lowest absolute error
@@ -1055,19 +1114,19 @@ def run_model_performance_paper(
     msgarch_best.to_csv(out_dir / "msgarch_best_segments.csv", index=False)
 
     print("Running pairwise forecast and correlation tests...")
-    dm_overall, hw_overall = run_pairwise_tests(panel, group_cols=[])
-    dm_lev, hw_lev = run_pairwise_tests(panel, group_cols=["leverage_group"])
-    dm_year, hw_year = run_pairwise_tests(panel, group_cols=["year"])
-    dm_period, hw_period = run_pairwise_tests(panel, group_cols=["period"])
-    dm_vol, hw_vol = run_pairwise_tests(panel, group_cols=["vol_regime"])
-    dm_period_vol, hw_period_vol = run_pairwise_tests(panel, group_cols=["period", "vol_regime"])
+    cw_overall, hw_overall = run_pairwise_tests(panel, group_cols=[])
+    cw_lev, hw_lev = run_pairwise_tests(panel, group_cols=["leverage_group"])
+    cw_year, hw_year = run_pairwise_tests(panel, group_cols=["year"])
+    cw_period, hw_period = run_pairwise_tests(panel, group_cols=["period"])
+    cw_vol, hw_vol = run_pairwise_tests(panel, group_cols=["vol_regime"])
+    cw_period_vol, hw_period_vol = run_pairwise_tests(panel, group_cols=["period", "vol_regime"])
 
-    dm_overall.to_csv(out_dir / "dm_tests_overall.csv", index=False)
-    dm_lev.to_csv(out_dir / "dm_tests_by_leverage.csv", index=False)
-    dm_year.to_csv(out_dir / "dm_tests_by_year.csv", index=False)
-    dm_period.to_csv(out_dir / "dm_tests_by_period.csv", index=False)
-    dm_vol.to_csv(out_dir / "dm_tests_by_volatility.csv", index=False)
-    dm_period_vol.to_csv(out_dir / "dm_tests_by_period_volatility.csv", index=False)
+    cw_overall.to_csv(out_dir / "cw_tests_overall.csv", index=False)
+    cw_lev.to_csv(out_dir / "cw_tests_by_leverage.csv", index=False)
+    cw_year.to_csv(out_dir / "cw_tests_by_year.csv", index=False)
+    cw_period.to_csv(out_dir / "cw_tests_by_period.csv", index=False)
+    cw_vol.to_csv(out_dir / "cw_tests_by_volatility.csv", index=False)
+    cw_period_vol.to_csv(out_dir / "cw_tests_by_period_volatility.csv", index=False)
 
     hw_overall.to_csv(out_dir / "hw_tests_overall.csv", index=False)
     hw_lev.to_csv(out_dir / "hw_tests_by_leverage.csv", index=False)
@@ -1160,6 +1219,7 @@ def run_model_performance_paper(
         "rank_corr_changes_overall": out_dir / "rank_corr_changes_overall.csv",
         "rank_rmse_share_by_period": out_dir / "rank_rmse_bps_by_period_share.csv",
         "rank_rmse_share_by_leverage": out_dir / "rank_rmse_bps_by_leverage_share.csv",
+        "cw_overall": out_dir / "cw_tests_overall.csv",
         "filters": out_dir / "filter_metadata.csv",
         "summary": out_dir / "analysis_summary.txt",
         "figures": out_dir / "figures",
