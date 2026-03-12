@@ -202,7 +202,7 @@ def calibrate_model(
     spread_prefix = cfg['spread_prefix']
 
     # Load model output
-    print(f"Loading model data from {mc_file.name} ...")
+    print(f"Loading model data from {mc_file.name}")
     mc_df = pd.read_csv(mc_file)
     mc_df['date'] = pd.to_datetime(mc_df['date'])
 
@@ -213,7 +213,7 @@ def calibrate_model(
             mc_df[col] = mc_df[col] * 10_000
 
     # Load market CDS
-    print("Loading market CDS data ...")
+    print("Loading market CDS data")
     market_cds = load_market_cds(input_dir)
 
     # CDS company name mapping

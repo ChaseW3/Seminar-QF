@@ -1,5 +1,4 @@
-# probability_of_default.py
-# Calculate Probability of Default using Merton Model with GARCH, Regime Switching and MS-GARCH Volatility
+# Merton probability of default using GARCH, Regime Switching, and MS-GARCH volatility
 
 import pandas as pd
 import numpy as np
@@ -9,21 +8,9 @@ warnings.filterwarnings('ignore')
 
 
 def _add_regime_weighted_volatility(df):
-    """
-    Add regime-weighted volatility column for Regime Switching model.
-    
-    Loads regime parameters (regime_0_vol, regime_1_vol) from saved file
-    and computes: sigma_t = P(regime=0) * sigma_0 + P(regime=1) * sigma_1
-    
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        DataFrame with regime_probability_0, regime_probability_1 columns
-    
-    Returns:
-    --------
-    pd.DataFrame with 'regime_volatility' column added
-    """
+    # Add regime-weighted volatility column for Regime Switching model.
+    # Loads regime parameters (regime_0_vol, regime_1_vol) from saved file
+    # and computes: sigma_t = P(regime=0) * sigma_0 + P(regime=1) * sigma_1
     try:
         from src.utils import config
         params_file = config.OUTPUT_DIR / 'regime_switching_parameters.csv'
@@ -34,13 +21,11 @@ def _add_regime_weighted_volatility(df):
     # Load regime parameters
     try:
         params_df = pd.read_csv(params_file)
-        print(f"    ✓ Loaded regime parameters from {params_file.name}")
     except FileNotFoundError:
-        print(f"    ✗ Regime parameters file not found: {params_file}")
+        print(f"Regime parameters file not found: {params_file}")
         # Fallback: use asset_volatility if available
         if 'asset_volatility' in df.columns:
             df['regime_volatility'] = df['asset_volatility']
-            print("    ⚠ Using asset_volatility as fallback")
         return df
     
     # Create a mapping of gvkey -> (sigma_0, sigma_1)
@@ -66,17 +51,12 @@ def _add_regime_weighted_volatility(df):
     df['regime_volatility'] = df.apply(compute_regime_vol, axis=1)
     
     valid_count = df['regime_volatility'].notna().sum()
-    print(f"    ✓ Computed regime-weighted volatility for {valid_count:,} observations")
     
     return df
 
 
 def load_auxiliary_data():
-    """
-    Load liabilities and interest rates from source files.
-    Works with daily data.
-    """
-    print("Loading auxiliary data (liabilities and interest rates)...")
+    # Load liabilities (from Excel) and interest rates (from ECB CSV) for daily PD calculation
     
     try:
         from src.utils import config
@@ -84,7 +64,6 @@ def load_auxiliary_data():
         from src.utils import config
 
     # 1. Load Liabilities from Excel
-    print("  Loading liabilities...")
     try:
         liab_df = pd.read_excel(config.EQUITY_DATA_FILE, sheet_name=1)
         liab_df = liab_df.rename(columns={
@@ -97,13 +76,10 @@ def load_auxiliary_data():
         # CRITICAL: Liabilities in the data are in MILLIONS - convert to actual currency units
         # to match asset values (which are in full units from market cap * shares)
         liab_df["liabilities_total"] = liab_df["liabilities_total"] * 1_000_000
-        print(f"    ✓ Loaded {len(liab_df)} liability records (scaled from millions to full units)")
     except Exception as e:
-        print(f"    ✗ Error loading liabilities: {e}")
         return None, None
 
     # 2. Load Interest Rates from ECB data
-    print("  Loading interest rates...")
     try:
         rates_df = pd.read_csv(config.INTEREST_RATES_FILE)
         rate_cols = [col for col in rates_df.columns if 'EURIBOR' in col.upper()]
@@ -111,25 +87,18 @@ def load_auxiliary_data():
         rates_df['month_year'] = rates_df['DATE'].dt.strftime('%Y-%m')
         rates_df['risk_free_rate'] = pd.to_numeric(rates_df[rate_cols[0]], errors='coerce') / 100
         rates_df = rates_df[['month_year', 'risk_free_rate']].drop_duplicates()
-        print(f"    ✓ Loaded {len(rates_df)} months of interest rate data")
     except Exception as e:
-        print(f"    ✗ Error loading rates: {e}")
         return liab_df, None
     
     return liab_df, rates_df
 
 
 def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
-    """
-    Calculate Probability of Default for a given volatility model (GARCH, Regime Switching, MS-GARCH).
-    Works with DAILY data.
-    """
-    print(f"\n  Processing {model_name}...")
+    # Calculate Merton PD for one volatility model (GARCH, Regime Switching, or MS-GARCH) using daily data
     
     try:
         df = pd.read_csv(file_path)
     except FileNotFoundError:
-        print(f"    ✗ File {file_path} not found. Skipping {model_name}.")
         return None
     
     df['date'] = pd.to_datetime(df['date'])
@@ -167,8 +136,6 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     
     # Check if volatility column exists
     if vol_col not in df_merged.columns:
-        print(f"    ✗ Volatility column '{vol_col}' not found in {file_path}.")
-        print(f"       Available columns: {list(df_merged.columns)}")
         return None
     
     # Create PD column name (replace spaces and hyphens with underscores)
@@ -184,7 +151,7 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     )
     
     if not mask_valid.any():
-        print(f"    ✗ No valid data for {model_name} PD calculation.")
+        print(f"    No valid data for {model_name} PD calculation")
         print(f"       vol_col notna: {df_merged[vol_col].notna().sum()}")
         print(f"       asset_value > 0: {(df_merged['asset_value'] > 0).sum()}")
         print(f"       liabilities notna: {df_merged['liabilities_total'].notna().sum()}")
@@ -212,36 +179,25 @@ def calculate_pd_for_model(model_name, file_path, liabilities_df, rates_df):
     
     df_merged.loc[mask_valid, col_name] = pd_values
     
-    print(f"    ✓ {model_name}: Calculated PD for {mask_valid.sum():,} observations")
-    print(f"       PD column name: '{col_name}'")
     
     return df_merged
 
 
 def run_pd_pipeline(data_garch, data_regime, data_msgarch):
-    """
-    Complete pipeline: load all 3 model results, calculate PD for each, and combine.
-    Works with daily data.
-    """
+    # Complete pipeline: calculate PD for all three models and combine into a single daily DataFrame
     
-    print("\n" + "="*80)
-    print("PROBABILITY OF DEFAULT CALCULATION (Multi-Model, Daily Data)")
-    print("="*80)
-    
-    # 1. Load Auxiliary Data
+    print("\nProbability of default")
+
     liabilities_df, rates_df = load_auxiliary_data()
     
     if liabilities_df is None or rates_df is None:
-        print("✗ Critical Error: Could not load auxiliary data. Aborting.")
         return pd.DataFrame()
     
-    # 2. Process Each Model
-    print("\nCalculating PD for each model...")
+    print("\nCalculating PD for each model")
     
-    # GARCH (Base DataFrame)
+    # GARCH
     df_garch = calculate_pd_for_model('GARCH', data_garch, liabilities_df, rates_df)
     if df_garch is None:
-        print("✗ Critical Error: GARCH model processing failed. Aborting.")
         return pd.DataFrame()
     
     # Select only necessary columns from GARCH
@@ -260,11 +216,11 @@ def run_pd_pipeline(data_garch, data_regime, data_msgarch):
         if pd_col_name in df_regime.columns:
             cols_to_merge = df_regime[['gvkey', 'date', pd_col_name]].copy()
             final_df = pd.merge(final_df, cols_to_merge, on=['gvkey', 'date'], how='left')
-            print(f"    ✓ Merged Regime Switching results")
+            print(f"Merged Regime Switching results")
         else:
-            print(f"    ⚠ PD column '{pd_col_name}' not found in Regime Switching results")
+            print(f"PD column '{pd_col_name}' not found in Regime Switching results")
     else:
-        print("    ⚠ Regime Switching model skipped")
+        print("Regime Switching model skipped")
     
     # MS-GARCH
     df_msgarch = calculate_pd_for_model('MS-GARCH', data_msgarch, liabilities_df, rates_df)
@@ -274,32 +230,26 @@ def run_pd_pipeline(data_garch, data_regime, data_msgarch):
         if pd_col_name in df_msgarch.columns:
             cols_to_merge = df_msgarch[['gvkey', 'date', pd_col_name]].copy()
             final_df = pd.merge(final_df, cols_to_merge, on=['gvkey', 'date'], how='left')
-            print(f"    ✓ Merged MS-GARCH results")
+            print(f"Merged MS-GARCH results")
         else:
             # Debug: print available columns
             available_cols = [col for col in df_msgarch.columns if 'pd_' in col]
-            print(f"    ⚠ PD column '{pd_col_name}' not found. Available PD columns: {available_cols}")
     else:
-        print("    ⚠ MS-GARCH model skipped")
+        print("MS-GARCH model skipped")
     
-    # 3. Summary and Return
-    print("\n" + "="*80)
-    print(f"✓ PD Pipeline Complete")
+    # Summary and Return
+    print(f"\nPD pipeline complete")
     print(f"  Total records: {len(final_df):,}")
     print(f"  Firms: {final_df['gvkey'].nunique()}")
     if len(final_df) > 0:
         print(f"  Date range: {final_df['date'].min().strftime('%Y-%m-%d')} to {final_df['date'].max().strftime('%Y-%m-%d')}")
-    print("="*80 + "\n")
     
     return final_df
 
 
 def calculate_merton_pd_normal(daily_returns_file):
-    """
-    Calculate Merton PD using asset volatility from normal returns (no GARCH).
-    Benchmark model for comparison with daily data.
-    """
-    print("\nCalculating Merton PD (Normal Returns - Benchmark, Daily Data)...")
+    # Calculate Merton PD using rolling asset volatility (no GARCH); benchmark model
+    print("\nCalculating Merton PD")
     
     # Load data
     df = pd.read_csv(daily_returns_file)
@@ -309,7 +259,6 @@ def calculate_merton_pd_normal(daily_returns_file):
     liabilities_df, rates_df = load_auxiliary_data()
     
     if liabilities_df is None or rates_df is None:
-        print("✗ Could not load auxiliary data.")
         return pd.DataFrame()
     
     # Merge with liabilities and rates
@@ -340,23 +289,18 @@ def calculate_merton_pd_normal(daily_returns_file):
         df_clean['pd_merton_normal'] = norm.cdf(-d2)
         df_clean['pd_merton_normal'] = df_clean['pd_merton_normal'].clip(0, 1)
     
-    print(f"✓ Merton PD (Normal): Calculated for {len(df_clean):,} observations")
     
     return df_clean[['gvkey', 'date', 'asset_value', 'liabilities_total', 
                       'asset_volatility', 'pd_merton_normal']]
 
 
-# For regime switching, we need to calculate volatility from regime-specific parameters
+# Compute regime-weighted volatility from regime state and transition probabilities
 # The file has: regime_state, regime_probability_0, regime_probability_1
-# But no direct volatility column - we need to compute it from the regime states
+# but no direct volatility column; must be computed from per-regime parameters
 
 def get_regime_volatility(df_regime):
-    """
-    Calculate volatility for regime-switching model.
-    
-    Uses the regime state to assign high/low volatility.
-    If regime parameters are available, use those. Otherwise estimate from data.
-    """
+    # Calculate regime-weighted volatility: σ = p0*σ0 + p1*σ1 using saved regime parameters;
+    # falls back to asset_volatility or a 30% default if no parameter file is found
     import os
     
     # Try to load regime parameters

@@ -469,10 +469,10 @@ def _process_single_firm(gvkey, firm_df):
 
 def run_regime_switching_estimation(daily_returns_df):
     # Fits a rolling 2-regime Hamilton filter (t-dist) on daily asset returns, firm by firm
-    print("Estimating Regime Switching Model (2-Regime Markov T-Dist) on DAILY Returns...")
+    print("Estimating Regime Switching model (2-regime Markov t-dist) on daily returns")
     
     if daily_returns_df.empty:
-        print("No daily returns provided.")
+        print("No daily returns provided")
         return daily_returns_df
     
     # Initialize Output Structure
@@ -484,14 +484,14 @@ def run_regime_switching_estimation(daily_returns_df):
     firms = df_out["gvkey"].unique()
     # n_cores = multiprocessing.cpu_count()
     # print(f"Processing Regime Switching for {len(firms)} firms using {n_cores} cores...\\n")
-    print(f"Processing Regime Switching for {len(firms)} firms (Sequential execution)...\\n")
+    print(f"Processing Regime Switching for {len(firms)} firms (sequential execution)\n")
     
     # Run Sequential Execution
     processed_dfs = []
     all_params = []
     
     for i, gvkey in enumerate(firms):
-        print(f"Processing firm {gvkey} ({i+1}/{len(firms)})...")
+        print(f"Processing firm {gvkey} ({i+1}/{len(firms)})")
         try:
             res_df, res_params = _process_single_firm(gvkey, df_out[df_out["gvkey"] == gvkey])
             processed_dfs.append(res_df)
@@ -504,14 +504,14 @@ def run_regime_switching_estimation(daily_returns_df):
     if processed_dfs:
         df_out = pd.concat(processed_dfs).sort_index()
     else:
-        print("Warning: No firms processed successfully.")
+        print("Warning: no firms processed successfully")
 
     # Save Parameters and Merge (matching GARCH approach)
     if all_params:
         params_df = pd.DataFrame(all_params)
         output_path = OUTPUT_DIR / 'regime_switching_parameters.csv'
         params_df.to_csv(output_path, index=False)
-        print(f"\n✓ Saved Regime Switching parameters (month-ends) to '{output_path}'")
+        print(f"\nSaved Regime Switching parameters (month-ends) to '{output_path}'")
         
         # Merge rolling parameters back into daily dataframe
         # Ensure date type
@@ -533,7 +533,7 @@ def run_regime_switching_estimation(daily_returns_df):
         df_out = df_out.sort_values(['gvkey', 'date'])
         df_out[merge_cols] = df_out.groupby('gvkey')[merge_cols].ffill()
         
-        print(f"✓ Merged rolling RS parameters into daily returns data (Forward Filled)")
-        print(f"✓ Output contains {len(df_out)} rows with forward-filled parameters")
+        print(f"Merged rolling RS parameters into daily returns data (forward filled)")
+        print(f"Output contains {len(df_out)} rows with forward-filled parameters")
     
     return df_out

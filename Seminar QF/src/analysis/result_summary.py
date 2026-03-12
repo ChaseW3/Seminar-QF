@@ -10,7 +10,7 @@ def generate_results_summary(results_file="monthly_pd_results.csv"):
         print(f"Error: {results_file} not found.")
         return
 
-    print(f"Generating summary from {results_file}...")
+    print(f"Generating summary from {results_file}")
     
     df = pd.read_csv(results_file)
     

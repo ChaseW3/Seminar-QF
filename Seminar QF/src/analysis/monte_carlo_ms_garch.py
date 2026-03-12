@@ -419,7 +419,7 @@ def _process_single_date_ms_garch_mc(date_data, num_simulations, num_days, exclu
 
 
 def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False, spread_cap=0.5, cds_filter_file=None):
-    print(f"Loading MS-GARCH data from {ms_garch_file}...")
+    print(f"Loading MS-GARCH data from {ms_garch_file}")
     df = pd.read_csv(ms_garch_file)
     
     if 'date' in df.columns:
@@ -436,8 +436,7 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
         df = filter_df_to_allowed_dates(df, allowed_dates, date_col='date')
         after_rows = len(df)
         after_dates = df['date'].nunique() if 'date' in df.columns else 1
-        print(f"✓ Applied CDS clean-date filter from {cds_filter_file}")
-        print(f"  Rows: {before_rows:,} -> {after_rows:,}; Dates: {before_dates} -> {after_dates}")
+        print(f"Applied CDS date filter: rows {before_rows:,} -> {after_rows:,}, dates {before_dates} -> {after_dates}")
 
     ms_garch_required_candidates = {
         'omega_0': ['ms_garch_omega_0', 'omega_0'],
@@ -484,16 +483,10 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
         else:
             df = df.loc[has_complete_ms_garch_params].copy()
     
-    print(f"Running PARALLELIZED Monte Carlo MS-GARCH simulation:")
-    print(f"  Firms: {df['gvkey'].nunique()}")
-    print(f"  Dates: {df['date'].nunique() if 'date' in df.columns else 1}")
-    print(f"  Simulations per firm: {num_simulations:,}")
-    print(f"  Forecast horizon: {num_days} days")
-    print(f"  Parallel jobs: {n_jobs}")
-    print(f"  Innovation distribution: Student's t per regime")
-    print(f"  Antithetic variates: {use_antithetic}")
-    print(f"  CDS spread cap: {spread_cap:.4f} ({spread_cap*10000:.0f} bps)")
-    print(f"  Exclude rows without estimated MS-GARCH params: {exclude_firms_without_estimated_params}")
+    print(f"Running MC MS-GARCH simulation: {df['gvkey'].nunique()} firms, "
+          f"{df['date'].nunique() if 'date' in df.columns else 1} dates, "
+          f"{num_simulations:,} sims, horizon {num_days}d, "
+          f"antithetic={use_antithetic}, spread cap={spread_cap*10000:.0f} bps")
     
     start_time = pd.Timestamp.now()
     
@@ -506,7 +499,7 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     if cds_filter_file:
         df_merton = filter_df_to_allowed_dates(df_merton, allowed_dates, date_col='date')
     merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-    print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows) from {merton_file}")
+    print(f"Loaded Merton data ({len(df_merton):,} rows) from {merton_file}")
 
     date_groups = []
     if 'date' in df.columns:
@@ -526,10 +519,10 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
         # Single date case
         date_groups = [(pd.Timestamp.now().date(), df, {})]
     
-    print(f"\nProcessing {len(date_groups)} dates in parallel...")
+    print(f"Processing {len(date_groups)} dates in parallel")
 
     # Parallel processing across dates
-    print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
+    print(f"Deferring to Joblib workers (dates={len(date_groups)})")
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(_process_single_date_ms_garch_mc)(
             date_data,
@@ -551,13 +544,10 @@ def monte_carlo_ms_garch_1year_parallel(ms_garch_file, merton_file, gvkey_select
     
     total_time = (pd.Timestamp.now() - start_time).total_seconds()
     
-    print(f"\n{'='*80}")
-    print(f"PARALLELIZED MONTE CARLO MS-GARCH COMPLETE")
-    print(f"Total time: {timedelta(seconds=int(total_time))}")
+    print(f"\nMC MS-GARCH complete in {timedelta(seconds=int(total_time))}")
     if not results_df.empty and 'used_default_ms_garch_inputs' in results_df.columns:
         excluded_share = results_df['used_default_ms_garch_inputs'].mean()
-        print(f"Rows without estimated MS-GARCH params (excluded from spreads): {excluded_share:.2%}")
-    print(f"{'='*80}\n")
+        print(f"Rows without estimated MS-GARCH params: {excluded_share:.2%}")
     
     return results_df
 

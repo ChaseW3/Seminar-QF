@@ -89,7 +89,7 @@ def load_all_market_cds_data(input_dir=None):
     
     input_dir = Path(input_dir)
     
-    print("Loading real CDS market data...")
+    print("Loading market CDS data")
     cds_1y = load_cds_market_data(input_dir / 'CDS_1y_mat_data.xlsx', 1)
     cds_3y = load_cds_market_data(input_dir / 'CDS_3y_mat_data.xlsx', 3)
     cds_5y = load_cds_market_data(input_dir / 'CDS_5y_mat_data.xlsx', 5)
@@ -145,7 +145,7 @@ def calculate_cds_correlations(
     merged = df_model.merge(cds_market_df, on=['date', 'company_cds'], how='inner')
     merged = merged.sort_values(['gvkey', 'date'])
     
-    print(f"\n=== {model_name} Model vs Market CDS ===")
+    print(f"\n{model_name} vs market CDS")
     print(f"  Matched observations: {len(merged)}")
     print(f"  Matched companies: {merged['company'].nunique()}")
     
@@ -267,7 +267,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
             required_cols = [f'{spread_col_prefix}_1y', f'{spread_col_prefix}_3y', f'{spread_col_prefix}_5y']
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
-                print(f"⚠ Warning: Missing columns in {mc_file}: {missing_cols}")
+                print(f"Warning: Missing columns in {mc_file}: {missing_cols}")
                 print(f"   Available columns: {df.columns.tolist()}")
                 return None
             
@@ -280,7 +280,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
             required_cols = ['date', 'gvkey'] + [f'{output_col_prefix}_1y_bps', f'{output_col_prefix}_3y_bps', f'{output_col_prefix}_5y_bps']
             return df[required_cols]
         except Exception as e:
-            print(f"⚠ Error preparing {mc_file}: {e}")
+            print(f"Error preparing {mc_file}: {e}")
             return None
     
     # Merton Monte Carlo
@@ -296,7 +296,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 col_prefix='cds_spread_merton_mc'
             )
     else:
-        print(f"⚠ Warning: {merton_mc_file} not found. Run Merton MC simulation first.")
+        print(f"Warning: {merton_mc_file} not found. Run Merton MC simulation first.")
     
     # GARCH
     garch_mc_file = output_dir / 'daily_monte_carlo_garch_results.csv'
@@ -311,7 +311,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 col_prefix='cds_spread_garch_mc'
             )
     else:
-        print(f"⚠ Warning: {garch_mc_file} not found.")
+        print(f"Warning: {garch_mc_file} not found.")
     
     # Regime Switching
     rs_mc_file = output_dir / 'daily_monte_carlo_regime_switching_results.csv'
@@ -326,7 +326,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 col_prefix='cds_spread_regime_switching_mc'
             )
     else:
-        print(f"⚠ Warning: {rs_mc_file} not found.")
+        print(f"Warning: {rs_mc_file} not found.")
     
     # MS-GARCH
     msgarch_mc_file = output_dir / 'daily_monte_carlo_ms_garch_results.csv'
@@ -341,16 +341,14 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
                 col_prefix='cds_spread_msgarch_mc'
             )
     else:
-        print(f"⚠ Warning: {msgarch_mc_file} not found.")
+        print(f"Warning: {msgarch_mc_file} not found.")
     
     # Summary table
-    print("\n" + "="*80)
-    print("MODEL COMPARISON SUMMARY (5-Year Maturity)")
-    print("="*80)
+    print(f"\nModel comparison summary (5Y maturity)")
     
     # Check if we have any results
     if not results:
-        print("⚠ Error: No models were successfully loaded!")
+        print("Error: No models were successfully loaded!")
         return None
     
     first_model = list(results.keys())[0]
@@ -370,7 +368,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         required_cols = ['company', 'rmse_5y', 'corr_levels_5y', 'corr_changes_5y']
         missing_cols = [col for col in required_cols if col not in firm_df.columns]
         if missing_cols:
-            print(f"⚠️  Warning: Skipping {model_key} - missing columns: {missing_cols}")
+            print(f"Warning: Skipping {model_key} - missing columns: {missing_cols}")
             continue
         
         summary_df = summary_df.merge(
@@ -389,9 +387,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     print(summary_df.to_string(index=False))
     
     # Overall summary statistics
-    print("\n" + "="*80)
-    print("OVERALL SUMMARY STATISTICS (5-Year Maturity)")
-    print("="*80)
+    print(f"\nOverall summary statistics (5Y maturity)")
     
     model_display_list = [('GARCH', 'GARCH'), ('RS', 'Regime-Switching'), ('MSGARCH', 'MS-GARCH')]
     if 'Merton_MC' in results:

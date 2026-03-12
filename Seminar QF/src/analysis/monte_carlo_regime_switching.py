@@ -401,7 +401,7 @@ def _process_single_date_rs_mc(date_data, num_simulations, num_days, exclude_fir
 
 
 def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, exclude_firms_without_estimated_params=True, use_antithetic=False, spread_cap=0.5, cds_filter_file=None):
-    print(f"Loading Regime-Switching data from {regime_params_file}...")
+    print(f"Loading regime-switching data from {regime_params_file}")
     # Parallel regime-switching MC across all dates
     df = pd.read_csv(regime_params_file)
     
@@ -419,8 +419,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
         df = filter_df_to_allowed_dates(df, allowed_dates, date_col='date')
         after_rows = len(df)
         after_dates = df['date'].nunique() if 'date' in df.columns else 1
-        print(f"✓ Applied CDS clean-date filter from {cds_filter_file}")
-        print(f"  Rows: {before_rows:,} -> {after_rows:,}; Dates: {before_dates} -> {after_dates}")
+        print(f"Applied CDS date filter: rows {before_rows:,} -> {after_rows:,}, dates {before_dates} -> {after_dates}")
 
     required_rs_cols = [
         'regime_0_vol', 'regime_1_vol', 'regime_0_nu', 'regime_1_nu',
@@ -450,16 +449,10 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
         else:
             df = df.loc[has_complete_rs_params].copy()
     
-    print(f"Running PARALLELIZED Monte Carlo Regime-Switching simulation:")
-    print(f"  Firms: {df['gvkey'].nunique()}")
-    print(f"  Dates: {df['date'].nunique() if 'date' in df.columns else 1}")
-    print(f"  Simulations per firm: {num_simulations:,}")
-    print(f"  Forecast horizon: {num_days} days")
-    print(f"  Parallel jobs: {n_jobs}")
-    print(f"  Innovation distribution: Student's t")
-    print(f"  Antithetic variates: {use_antithetic}")
-    print(f"  CDS spread cap: {spread_cap:.4f} ({spread_cap*10000:.0f} bps)")
-    print(f"  Exclude rows without estimated RS params: {exclude_firms_without_estimated_params}")
+    print(f"Running MC regime-switching simulation: {df['gvkey'].nunique()} firms, "
+          f"{df['date'].nunique() if 'date' in df.columns else 1} dates, "
+          f"{num_simulations:,} sims, horizon {num_days}d, "
+          f"antithetic={use_antithetic}, spread cap={spread_cap*10000:.0f} bps")
     
     start_time = pd.Timestamp.now()
     
@@ -471,7 +464,7 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     if cds_filter_file:
         df_merton = filter_df_to_allowed_dates(df_merton, allowed_dates, date_col='date')
     merton_by_date = {k: v for k, v in df_merton.groupby('date')}
-    print(f"✓ Loaded Merton data for PD calculation ({len(df_merton):,} rows) from {merton_file}")
+    print(f"Loaded Merton data ({len(df_merton):,} rows) from {merton_file}")
 
     date_groups = []
     if 'date' in df.columns:
@@ -490,10 +483,10 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
         # Single date case
         date_groups = [(pd.Timestamp.now().date(), df, {})]
     
-    print(f"\nProcessing {len(date_groups)} dates in parallel...")
+    print(f"Processing {len(date_groups)} dates in parallel")
 
     # Dispatch MC simulations across dates in parallel
-    print(f"Refuting Numba-parallelism to Joblib workers (dates={len(date_groups)})")
+    print(f"Deferring to Joblib workers (dates={len(date_groups)})")
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(_process_single_date_rs_mc)(
             date_data,
@@ -515,12 +508,9 @@ def monte_carlo_regime_switching_1year_parallel(regime_params_file, merton_file,
     
     total_time = (pd.Timestamp.now() - start_time).total_seconds()
     
-    print(f"\n{'='*80}")
-    print(f"PARALLELIZED MONTE CARLO REGIME-SWITCHING COMPLETE")
-    print(f"Total time: {timedelta(seconds=int(total_time))}")
+    print(f"\nMC regime-switching complete in {timedelta(seconds=int(total_time))}")
     if not results_df.empty and 'used_default_rs_inputs' in results_df.columns:
         excluded_share = results_df['used_default_rs_inputs'].mean()
-        print(f"Rows without estimated RS params (excluded from spreads): {excluded_share:.2%}")
-    print(f"{'='*80}\n")
+        print(f"Rows without estimated RS params: {excluded_share:.2%}")
     
     return results_df

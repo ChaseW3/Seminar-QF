@@ -238,7 +238,7 @@ def _process_single_date_merton_mc(date_data, num_simulations, num_days, spread_
 
 
 def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simulations=1000, num_days=1260, n_jobs=-1, spread_cap=0.5, cds_filter_file=None):
-    print(f"Loading Merton data from {merton_file}...")
+    print(f"Loading Merton data from {merton_file}")
     df = pd.read_csv(merton_file)
     
     if 'date' in df.columns:
@@ -255,17 +255,11 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simu
         df = filter_df_to_allowed_dates(df, allowed_dates, date_col='date')
         after_rows = len(df)
         after_dates = df['date'].nunique() if 'date' in df.columns else 1
-        print(f"✓ Applied CDS clean-date filter from {cds_filter_file}")
-        print(f"  Rows: {before_rows:,} -> {after_rows:,}; Dates: {before_dates} -> {after_dates}")
+        print(f"Applied CDS date filter: rows {before_rows:,} -> {after_rows:,}, dates {before_dates} -> {after_dates}")
     
-    print(f"Running PARALLELIZED Monte Carlo Merton simulation:")
-    print(f"  Firms: {df['gvkey'].nunique()}")
-    print(f"  Dates: {df['date'].nunique() if 'date' in df.columns else 1}")
-    print(f"  Simulations per firm: {num_simulations:,}")
-    print(f"  Forecast horizon: {num_days} days")
-    print(f"  Parallel jobs: {n_jobs}")
-    print(f"  Innovation distribution: Normal (constant volatility)")
-    print(f"  CDS spread cap: {spread_cap:.4f} ({spread_cap*10000:.0f} bps)")
+    print(f"Running MC Merton simulation: {df['gvkey'].nunique()} firms, "
+          f"{df['date'].nunique() if 'date' in df.columns else 1} dates, "
+          f"{num_simulations:,} sims, horizon {num_days}d, spread cap={spread_cap*10000:.0f} bps")
     
     start_time = pd.Timestamp.now()
     
@@ -278,7 +272,7 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simu
         # Single date case
         date_groups = [(pd.Timestamp.now().date(), df)]
     
-    print(f"\nProcessing {len(date_groups)} dates in parallel...")
+    print(f"Processing {len(date_groups)} dates in parallel")
     
     # Parallel processing across dates
     results_nested = Parallel(n_jobs=n_jobs, verbose=10)(
@@ -295,10 +289,7 @@ def monte_carlo_merton_1year_parallel(merton_file, gvkey_selected=None, num_simu
     
     total_time = (pd.Timestamp.now() - start_time).total_seconds()
     
-    print(f"\n{'='*80}")
-    print(f"PARALLELIZED MONTE CARLO MERTON COMPLETE")
-    print(f"Total time: {timedelta(seconds=int(total_time))}")
-    print(f"{'='*80}\n")
+    print(f"\nMC Merton complete in {timedelta(seconds=int(total_time))}")
     
     return results_df
 

@@ -88,7 +88,7 @@ def run_garch_estimation(daily_returns_df):
     # Fit a rolling GARCH(1,1)-t on daily asset returns, one 252-day window per month per firm.
     # Returns are scaled ×100 before fitting for numerical stability, then parameters are
     # rescaled back to decimal units before saving.
-    print("Estimating GARCH(1,1) with t-distribution on DAILY Asset Returns...")
+    print("Estimating GARCH(1,1)-t on daily asset returns")
     
     if daily_returns_df.empty:
         print("No daily returns provided for GARCH.")
@@ -97,7 +97,7 @@ def run_garch_estimation(daily_returns_df):
     df_out = daily_returns_df.copy()
     
     firms = df_out["gvkey"].unique()
-    print(f"Processing GARCH for {len(firms)} firms (Daily Data)...")
+    print(f"Processing GARCH for {len(firms)} firms")
     
     SCALE_FACTOR = 100.0  # Scale returns to percentage form
     
@@ -141,7 +141,7 @@ def run_garch_estimation(daily_returns_df):
             continue
             
         if (i+1) % 10 == 0:
-            print(f"[{i+1}/{len(firms)}] Processing {gvkey}...")
+            print(f"[{i+1}/{len(firms)}] Processing {gvkey}")
         
         last_params = None
         
@@ -246,23 +246,23 @@ def run_garch_estimation(daily_returns_df):
                 # print(f"Error estimating GARCH for {gvkey} on {date_point}: {e}")
                 continue
 
-    print("\nGARCH ESTIMATION DIAGNOSTICS:")
+    print("\nGARCH estimation diagnostics:")
     print(f"  Total Windows Attempted: {diag_total}")
     
     val_conv_rate = (diag_converged/diag_total) if diag_total > 0 else 0
-    print(f"  Converged:               {diag_converged} ({val_conv_rate:.1%} of total)")
+    print(f"  Converged:               {diag_converged} ({val_conv_rate:.1%})")
     print(f"  Rejected (Convergence):  {diag_rejected_convergence}")
     print(f"  Rejected (Logic/Other):  {diag_rejected_stationarity}")
     
     val_repaired_rate = (diag_repaired/diag_converged) if diag_converged > 0 else 0
-    print(f"  Repaired (Stationarity): {diag_repaired} ({val_repaired_rate:.1%} of converged)")
+    print(f"  Repaired (Stationarity): {diag_repaired} ({val_repaired_rate:.1%})")
     
     # Save parameters for Monte Carlo and reference
     if params_list:
         params_df = pd.DataFrame(params_list)
         output_path = OUTPUT_DIR / 'garch_parameters.csv'
         params_df.to_csv(output_path, index=False)
-        print(f"\n✓ Saved GARCH parameters to '{output_path}'")
+        print(f"\nSaved GARCH parameters to '{output_path}'")
         
         # Merge rolling parameters back into daily dataframe
         

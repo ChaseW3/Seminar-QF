@@ -35,7 +35,7 @@ def load_interest_rates():
 
 def load_and_preprocess_data():
     # Function to load and preprocess equity and liability data
-    print("Loading equity data...")
+    print("Loading equity data")
     df = pd.read_excel(FILENAME_EQUITY_DATA, sheet_name=SHEET_EQUITY)
     
     # Rename columns
@@ -81,7 +81,7 @@ def load_and_preprocess_data():
     )
     df["mkt_cap"] = df["shares_out"] * df["close"]
     
-    print("Loading liability data...")
+    print("Loading liability data")
     df2 = pd.read_excel(FILENAME_EQUITY_DATA, sheet_name=SHEET_LIABILITY)
     
     df2 = df2.rename(columns={
@@ -104,7 +104,7 @@ def load_and_preprocess_data():
     df2 = df2.sort_values("fdate")
     
     # Merging of datasets
-    print("Merging liabilities using Point-in-Time (fdate) logic (backward-looking)...")
+    print("Merging liabilities using point-in-time (fdate) logic (backward-looking)")
     
     # merge_asof matches each equity date to the most recent fdate that has already passed,
     # so we never accidentally use liability data that wasn't public yet on that date
@@ -122,7 +122,7 @@ def load_and_preprocess_data():
     print("Loaded liability data")
 
     # Merge the interest rates
-    print("Merging interest rates from ECB data...")
+    print("Merging interest rates from ECB data")
     try:
         rates_df = load_interest_rates()
         df['month_year'] = df['date'].dt.strftime('%Y-%m')
@@ -133,13 +133,13 @@ def load_and_preprocess_data():
         # Check for missing rates
         missing_count = df['risk_free_rate'].isna().sum()
         if missing_count > 0:
-            print(f"Warning: {missing_count} rows have missing interest rates. Filling with forward/backward fill...")
+            print(f"Warning: {missing_count} rows have missing interest rates, filling with forward/backward fill")
             df['risk_free_rate'] = df['risk_free_rate'].ffill().bfill().fillna(0.03) # Default 3% if all else fails
         
         df = df.drop(columns=['month_year'])
         print(f"Successfully merged interest rates. Range: {df['risk_free_rate'].min():.4f} to {df['risk_free_rate'].max():.4f}")
     except Exception as e:
-        print(f"⚠ Error merging interest rates: {e}")
+        print(f"Error merging interest rates: {e}")
         # Ensure column exists even if merge failed to prevent errors later on
         if 'risk_free_rate' not in df.columns:
             df['risk_free_rate'] = 0.03
@@ -298,7 +298,7 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
                 tol=1e-4,
             )
         except Exception as e:
-            print(f"    ⚠ Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
+            print(f"    Error in Merton for gvkey={gvkey}, date={date_t}: {e}")
             continue
         
         # Only keep the last point in the window as the estimate for today
@@ -320,26 +320,24 @@ def process_firm_merton(firm_data, interest_rates_dict, firm_idx, total_firms):
 def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False):
     overall_start = time.time()
     
-    print(f"\n{'='*80}")
-    print("MERTON MODEL ESTIMATION (Vectorized + Parallelized - EXACT ndtr)")
-    print(f"{'='*80}\n")
+    print("\nMerton model estimation (vectorized + parallelized, exact ndtr)")
     
     # Only drop rows with missing equity — liabilities can be NaN in early dates
     # and are checked per-window inside process_firm_merton
-    print("DEBUG: Date range BEFORE filtering:")
+    print("Date range before filtering:")
     print(f"  Full df: {df['date'].min()} to {df['date'].max()} ({len(df)} rows, {df['gvkey'].nunique()} firms)")
     
     solver_df = df.dropna(subset=["mkt_cap"]).copy()  # Only require equity data
     solver_df = solver_df.sort_values(["gvkey", "date"])
     
-    print("DEBUG: Date range AFTER filtering (equity only):")
+    print("Date range after filtering (equity only):")
     print(f"  solver_df: {solver_df['date'].min()} to {solver_df['date'].max()} ({len(solver_df)} rows, {solver_df['gvkey'].nunique()} firms)")
     
     if solver_df.empty:
         raise ValueError("No valid data found for Merton model estimation.")
     
     firms = sorted(solver_df["gvkey"].unique())
-    print(f"Processing {len(firms)} firms with {n_jobs} parallel jobs...\n")
+    print(f"Processing {len(firms)} firms with {n_jobs} parallel jobs\n")
     
     # Dict lookup is much faster than DataFrame slicing inside the tight per-date loop
     if interest_rates_df is not None:
@@ -347,7 +345,7 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     else:
         interest_rates_dict = {}
     
-    print(f"Starting parallel Merton estimation...")
+    print(f"Starting parallel Merton estimation")
     start_parallel = time.time()
     
     results_list = Parallel(n_jobs=n_jobs, verbose=10)(
@@ -364,19 +362,19 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     merton_results = pd.DataFrame([item for sublist in results_list for item in sublist])
     
     if merton_results.empty:
-        print("✗ No Merton results generated!")
+        print("No Merton results generated")
         return pd.DataFrame(), pd.DataFrame()
     
     parallel_time = time.time() - start_parallel
-    print(f"\n✓ Parallel Merton complete in {timedelta(seconds=int(parallel_time))}\n")
+    print(f"\nParallel Merton complete in {timedelta(seconds=int(parallel_time))}\n")
     
-    print("DEBUG: Merton results date range:")
+    print("Merton results date range:")
     print(f"  merton_results: {merton_results['date'].min()} to {merton_results['date'].max()} ({len(merton_results)} rows)")
     
     # Left join to keep all original rows even where Merton couldn't produce an estimate
     df_merged = pd.merge(df, merton_results, on=["gvkey", "date"], how="left", suffixes=("", "_merton"))
     
-    print("DEBUG: After merging Merton back to original df:")
+    print("After merging Merton back to original df:")
     print(f"  df_merged: {df_merged['date'].min()} to {df_merged['date'].max()} ({len(df_merged)} rows)")
     
     first_merton_date = df_merged.dropna(subset=['asset_value'])['date'].min()
@@ -392,9 +390,7 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     )
 
     # Flag any suspiciously large single-day moves for review
-    print("\n" + "="*60)
-    print("EXTREME ASSET RETURN DIAGNOSTICS")
-    print("="*60)
+    print("\nExtreme asset return diagnostics")
     
     diag_df = daily_returns_df.dropna(subset=['asset_return_daily'])
     
@@ -403,17 +399,16 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
         
         print(f"\n[Threshold: Absolute Return > {threshold*100:.0f}%]")
         if extreme_rows.empty:
-            print("  No extreme returns found at this level.")
+            print("  No extreme returns found at this level")
         else:
             print(f"  Found {len(extreme_rows)} instances:")
             for gvkey, group in extreme_rows.groupby('gvkey'):
-                print(f"  • Firm {gvkey}:")
+                print(f"  Firm {gvkey}:")
                 for _, row in group.iterrows():
                     ret_val = row['asset_return_daily']
                     date_str = pd.Timestamp(row['date']).strftime('%Y-%m-%d')
                     print(f"      {date_str}: {ret_val*100:+.2f}%")
     
-    print("="*60 + "\n")
 
     # Scale returns by 100 for numerical stability in downstream optimizers
     daily_returns_df["asset_return_daily_scaled"] = daily_returns_df["asset_return_daily"] * 100.0
@@ -424,44 +419,37 @@ def run_merton_estimation(df, interest_rates_df=None, n_jobs=-1, use_cache=False
     
     overall_time = time.time() - overall_start
     
-    print(f"\n{'='*80}")
-    print("DATE RANGE SANITY CHECKS")
-    print(f"{'='*80}")
+    print(f"\nDate range sanity checks")
     
     equity_min = df['date'].min()
     merged_min = df_merged['date'].min()
-    print(f"✓ Original equity data starts: {equity_min}")
-    print(f"✓ Merged data (equity + Merton) starts: {merged_min}")
+    print(f"Original equity data starts: {equity_min}")
+    print(f"Merged data (equity + Merton) starts: {merged_min}")
     assert equity_min == merged_min, f"ERROR: Lost early dates! Equity starts {equity_min}, merged starts {merged_min}"
     
     # Merton needs a full 252-day window, so first result is roughly 1 year after data start
     first_merton = df_merged.dropna(subset=['asset_value'])['date'].min()
     expected_merton_start = equity_min + pd.DateOffset(days=252)
-    print(f"✓ First non-null Merton result: {first_merton}")
+    print(f"First non-null Merton result: {first_merton}")
     print(f"  (Expected around {expected_merton_start.strftime('%Y-%m-%d')} after 252-day (1-year) window)")
     
     # Liabilities start later than equity data — this is expected
     first_liab = df_merged.dropna(subset=['liabilities_total'])['date'].min()
-    print(f"✓ First non-null liabilities: {first_liab}")
+    print(f"First non-null liabilities: {first_liab}")
     print(f"  (This is expected - liabilities data starts later than equity)")
     
     complete_data = df_merged.dropna(subset=['asset_value', 'liabilities_total'])
     if not complete_data.empty:
         complete_min = complete_data['date'].min()
-        print(f"✓ Complete data (Merton + liabilities): {complete_min}")
+        print(f"Complete data (Merton + liabilities): {complete_min}")
         print(f"  ({len(complete_data)} rows with both Merton and liability data)")
     else:
-        print(f"⚠ No rows with both Merton and liability data!")
+        print(f"No rows with both Merton and liability data")
     
-    print(f"{'='*80}\n")
-    
-    print(f"{'='*80}")
-    print(f"Merton Estimation Complete")
-    print(f"{'='*80}")
+    print(f"\nMerton estimation complete")
     print(f"Total time: {timedelta(seconds=int(overall_time))}")
     print(f"Firms processed: {len(firms)}")
     print(f"Daily results: {len(daily_returns_df):,}")
-    print(f"{'='*80}\n")
     
     return df_merged, daily_returns_df
 

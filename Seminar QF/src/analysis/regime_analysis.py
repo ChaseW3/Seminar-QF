@@ -470,9 +470,7 @@ def run_ms_garch_analysis(ms_garch_df: pd.DataFrame, verbose: bool = True):
     metrics = extract_regime_metrics(ms_garch_df)
 
     if verbose:
-        print('=' * 80)
-        print('MS-GARCH  —  DERIVED PER-REGIME METRICS')
-        print('=' * 80)
+        print('MS-GARCH per-regime metrics')
         display_cols = ['omega', 'alpha', 'beta', 'nu', 'persistence',
                         'stationary', 'uncond_vol', 'half_life',
                         'p_stay', 'steady_state', 'expected_duration']
