@@ -17,7 +17,7 @@ except ImportError:
     from cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
     from src.utils import config
 
-# Compare Merton, GARCH, Regime-Switching, and MS-GARCH implied spreads
+# Compare calibrated Merton, GARCH, Regime-Switching, and MS-GARCH implied spreads
 # against market CDS spreads
 
 MATURITIES = [1, 3, 5]
@@ -30,34 +30,36 @@ DEFAULT_PERIOD_RANGES = {
 }
 MODEL_SPECS = {
     "merton_mc": {
-        "file": "daily_monte_carlo_merton_results.csv",
-        "prefix": "merton_mc_implied_spread",
-        "label": "Merton",
+        "calibrated_file_prefix": "calibrated_spreads_merton",
+        "label": "Merton Calibrated",
     },
     "garch": {
-        "file": "daily_monte_carlo_garch_results.csv",
-        "prefix": "mc_garch_implied_spread",
-        "label": "GARCH",
+        "calibrated_file_prefix": "calibrated_spreads_garch",
+        "label": "GARCH Calibrated",
     },
     "rs": {
-        "file": "daily_monte_carlo_regime_switching_results.csv",
-        "prefix": "rs_implied_spread",
-        "label": "Regime-Switching",
+        "calibrated_file_prefix": "calibrated_spreads_regime_switching",
+        "label": "Regime-Switching Calibrated",
     },
     "msgarch": {
-        "file": "daily_monte_carlo_ms_garch_results.csv",
-        "prefix": "mc_ms_garch_implied_spread",
-        "label": "MS-GARCH",
+        "calibrated_file_prefix": "calibrated_spreads_ms_garch",
+        "label": "MS-GARCH Calibrated",
     },
 }
 
-MODEL_LABEL_ORDER = ["GARCH", "MS-GARCH", "Merton", "Regime-Switching"]
+MODEL_LABEL_ORDER = [
+    "GARCH Calibrated",
+    "MS-GARCH Calibrated",
+    "Merton Calibrated",
+    "Regime-Switching Calibrated",
+]
 MODEL_COLORS = {
-    "GARCH": "#4C72B0",
-    "MS-GARCH": "#DD8452",
-    "Merton": "#55A868",
-    "Regime-Switching": "#C44E52",
+    "GARCH Calibrated": "#4C72B0",
+    "MS-GARCH Calibrated": "#DD8452",
+    "Merton Calibrated": "#55A868",
+    "Regime-Switching Calibrated": "#C44E52",
 }
+MSGARCH_MODEL_LABEL = MODEL_SPECS["msgarch"]["label"]
 
 
 @dataclass
@@ -194,27 +196,33 @@ def _load_company_mapping(merton_file: Path) -> pd.DataFrame:
 
 
 def _load_model_long(model_key: str, spec: dict, output_dir: Path) -> pd.DataFrame:
-    model_path = output_dir / spec["file"]
-    if not model_path.exists():
-        raise FileNotFoundError(f"Missing model file: {model_path}")
-
-    df = pd.read_csv(model_path)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
     long_parts = []
+    calibrated_col = spec.get("calibrated_col", "calibrated")
+    calibrated_dir = output_dir / "calibration"
     for mat in MATURITIES:
-        col = f"{spec['prefix']}_{mat}y"
-        if col not in df.columns:
-            continue
-        part = df[["gvkey", "date", col]].copy()
-        part = part.rename(columns={col: "model_spread_bps"})
+        model_path = calibrated_dir / f"{spec['calibrated_file_prefix']}_{mat}y.csv"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Missing calibrated model file: {model_path}")
+
+        df = pd.read_csv(model_path)
+        required_cols = {"gvkey", "date", calibrated_col}
+        missing_cols = sorted(required_cols - set(df.columns))
+        if missing_cols:
+            raise ValueError(
+                f"Missing required columns in {model_path.name}: {missing_cols}. "
+                f"Expected at least {sorted(required_cols)}"
+            )
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        part = df[["gvkey", "date", calibrated_col]].copy()
+        part = part.rename(columns={calibrated_col: "model_spread_bps"})
         part["model"] = model_key
         part["model_label"] = spec["label"]
         part["maturity"] = f"{mat}y"
         long_parts.append(part)
 
     if not long_parts:
-        raise ValueError(f"No spread columns found for {model_key} in {model_path}")
+        raise ValueError(f"No calibrated spread data found for {model_key}")
 
     model_long = pd.concat(long_parts, ignore_index=True)
     model_long["model_spread_bps"] = pd.to_numeric(model_long["model_spread_bps"], errors="coerce")
@@ -365,6 +373,92 @@ def compute_performance_summary(panel: pd.DataFrame, segment_cols: list[str], mi
         records.append(base)
 
     return pd.DataFrame(records)
+
+
+def rank_models_by_segment(
+    perf_df: pd.DataFrame,
+    segment_cols: list[str],
+    metric_col: str,
+    higher_is_better: bool,
+    metric_name: str,
+) -> pd.DataFrame:
+    cols = segment_cols + ["model", "model_label", metric_col]
+    ranked = perf_df[cols].dropna(subset=[metric_col]).copy()
+    if ranked.empty:
+        return pd.DataFrame(columns=cols + ["rank_position", "n_models", "metric"])
+
+    sort_cols = segment_cols + [metric_col, "model_label"]
+    ascending = [True] * len(segment_cols) + [not higher_is_better, True]
+    ranked = ranked.sort_values(sort_cols, ascending=ascending)
+
+    grouped = ranked.groupby(segment_cols, dropna=False)
+    ranked["rank_position"] = grouped.cumcount() + 1
+    ranked["n_models"] = grouped["model"].transform("size")
+    ranked["metric"] = metric_name
+    return ranked
+
+
+def compute_rank_shares(rank_df: pd.DataFrame, segment_cols: list[str]) -> pd.DataFrame:
+    if rank_df.empty:
+        return pd.DataFrame(columns=segment_cols + ["rank_position", "model_label", "n_rank", "share"])
+
+    out = rank_df.groupby(segment_cols + ["rank_position", "model_label"], dropna=False).size().reset_index(name="n_rank")
+    out["share"] = out["n_rank"] / out.groupby(segment_cols + ["rank_position"], dropna=False)["n_rank"].transform("sum")
+    return out
+
+
+def compute_segment_rank_tables(
+    perf_tables: dict[str, tuple[pd.DataFrame, list[str]]],
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    metric_specs = [
+        ("rmse_bps", False),
+        ("corr_levels", True),
+        ("corr_changes", True),
+    ]
+
+    rank_tables: dict[str, pd.DataFrame] = {}
+    rank_share_tables: dict[str, pd.DataFrame] = {}
+    for table_name, (perf_df, segment_cols) in perf_tables.items():
+        for metric_col, higher_is_better in metric_specs:
+            rank_name = f"rank_{metric_col}_{table_name}"
+            ranked = rank_models_by_segment(
+                perf_df=perf_df,
+                segment_cols=segment_cols,
+                metric_col=metric_col,
+                higher_is_better=higher_is_better,
+                metric_name=metric_col,
+            )
+            rank_tables[rank_name] = ranked
+            rank_share_tables[f"{rank_name}_share"] = compute_rank_shares(ranked, segment_cols)
+
+    return rank_tables, rank_share_tables
+
+
+def _write_rank_summary_by_maturity(
+    f,
+    rank_df: pd.DataFrame,
+    metric_col: str,
+    title: str,
+) -> None:
+    if rank_df.empty or "maturity" not in rank_df.columns:
+        return
+
+    f.write(f"\n{title} by maturity (rank 1 to 4):\n")
+    for mat in sorted(rank_df["maturity"].dropna().unique()):
+        sub = rank_df[rank_df["maturity"] == mat].sort_values("rank_position")
+        if sub.empty:
+            continue
+
+        f.write(f"\n{mat}:\n")
+        def _fmt(v: float) -> str:
+            return f"{v:.2f}" if metric_col == "rmse_bps" else f"{v:.3f}"
+
+        for _, row in sub.iterrows():
+            unit = " bps" if metric_col == "rmse_bps" else ""
+            f.write(
+                f"  - Rank {int(row['rank_position'])}: "
+                f"{row['model_label']} ({metric_col}={_fmt(row[metric_col])}{unit})\n"
+            )
 
 
 # Diebold-Mariano test for predictive accuracy
@@ -587,7 +681,7 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
 
     src_period = best_tables.get("best_model_share_by_period", pd.DataFrame())
     if not src_period.empty:
-        tmp = src_period[src_period["best_model_label"] == "MS-GARCH"].copy()
+        tmp = src_period[src_period["best_model_label"] == MSGARCH_MODEL_LABEL].copy()
         if not tmp.empty:
             tmp["segment_type"] = "period"
             tmp["segment"] = tmp["period"].astype(str) + " | " + tmp["maturity"].astype(str)
@@ -595,7 +689,7 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
 
     src_vol = best_tables.get("best_model_share_by_volatility", pd.DataFrame())
     if not src_vol.empty:
-        tmp = src_vol[src_vol["best_model_label"] == "MS-GARCH"].copy()
+        tmp = src_vol[src_vol["best_model_label"] == MSGARCH_MODEL_LABEL].copy()
         if not tmp.empty:
             tmp["segment_type"] = "volatility"
             tmp["segment"] = tmp["vol_regime"].astype(str) + " | " + tmp["maturity"].astype(str)
@@ -603,7 +697,7 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
 
     src_period_vol = best_tables.get("best_model_share_by_period_volatility", pd.DataFrame())
     if not src_period_vol.empty:
-        tmp = src_period_vol[src_period_vol["best_model_label"] == "MS-GARCH"].copy()
+        tmp = src_period_vol[src_period_vol["best_model_label"] == MSGARCH_MODEL_LABEL].copy()
         if not tmp.empty:
             tmp["segment_type"] = "period_volatility"
             tmp["segment"] = (
@@ -623,7 +717,12 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
     return msgarch_best
 
 
-def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], output_dir: Path) -> None:
+def create_plots(
+    panel: pd.DataFrame,
+    best_tables: dict[str, pd.DataFrame],
+    output_dir: Path,
+    rank_share_tables: dict[str, pd.DataFrame] | None = None,
+) -> None:
     # Generate and save plots
 
     sns.set_theme(style="whitegrid")
@@ -766,17 +865,97 @@ def create_plots(panel: pd.DataFrame, best_tables: dict[str, pd.DataFrame], outp
     # MS-GARCH wins across period, volatility and maturity
     by_period_vol = best_tables.get("best_model_share_by_period_volatility", pd.DataFrame())
     if not by_period_vol.empty:
-        msg = by_period_vol[by_period_vol["best_model_label"] == "MS-GARCH"].copy()
+        msg = by_period_vol[by_period_vol["best_model_label"] == MSGARCH_MODEL_LABEL].copy()
         if not msg.empty:
             msg["period_vol"] = msg["period"].astype(str) + " | " + msg["vol_regime"].astype(str)
             pivot = msg.pivot_table(index="period_vol", columns="maturity", values="share", aggfunc="mean")
             plt.figure(figsize=(8, max(4, 0.35 * len(pivot))))
             sns.heatmap(pivot, annot=True, fmt=".2f", cmap="Greens", vmin=0, vmax=1)
-            plt.title("MS-GARCH Win Share by Period and Volatility Regime")
+            plt.title(f"{MSGARCH_MODEL_LABEL} Win Share by Period and Volatility Regime")
             plt.xlabel("Maturity")
             plt.ylabel("Period | Volatility")
             plt.tight_layout()
             plt.savefig(fig_dir / "msgarch_win_share_period_volatility.png", dpi=220)
+            plt.close()
+
+    if rank_share_tables is None:
+        rank_share_tables = {}
+
+    rmse_lev = rank_share_tables.get("rank_rmse_bps_by_leverage_share", pd.DataFrame())
+    if not rmse_lev.empty:
+        for rank_value, title_stub, file_stub in [
+            (2, "Rank 2 RMSE Share", "rank2"),
+            (4, "Rank 4 RMSE Share", "rank4"),
+        ]:
+            sub = rmse_lev[rmse_lev["rank_position"] == rank_value].copy()
+            if sub.empty:
+                continue
+            plt.figure(figsize=(11, 6))
+            sns.barplot(
+                data=sub,
+                x="leverage_group",
+                y="share",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                errorbar=None,
+            )
+            plt.title(f"{title_stub} by Leverage Group")
+            plt.xlabel("Leverage Group")
+            plt.ylabel("Share")
+            plt.tight_layout()
+            plt.savefig(fig_dir / f"rmse_{file_stub}_rank_share_by_leverage.png", dpi=220)
+            plt.close()
+
+    rmse_period = rank_share_tables.get("rank_rmse_bps_by_period_share", pd.DataFrame())
+    if not rmse_period.empty:
+        period_order = ["Pre-COVID", "COVID Shock", "Recovery", "Post-Recovery"]
+        rmse_period["period"] = pd.Categorical(rmse_period["period"], categories=period_order, ordered=True)
+        for rank_value, title_stub, file_stub in [
+            (2, "Rank 2 RMSE Share", "rank2"),
+            (4, "Rank 4 RMSE Share", "rank4"),
+        ]:
+            sub = rmse_period[rmse_period["rank_position"] == rank_value].copy()
+            if sub.empty:
+                continue
+            plt.figure(figsize=(12, 6))
+            sns.barplot(
+                data=sub.sort_values(["period", "maturity"]),
+                x="period",
+                y="share",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                errorbar=None,
+            )
+            plt.title(f"{title_stub} by Macro Period")
+            plt.xlabel("Period")
+            plt.ylabel("Share")
+            plt.tight_layout()
+            plt.savefig(fig_dir / f"rmse_{file_stub}_rank_share_by_period.png", dpi=220)
+            plt.close()
+
+    corr_period = rank_share_tables.get("rank_corr_levels_by_period_share", pd.DataFrame())
+    if not corr_period.empty:
+        sub = corr_period[corr_period["rank_position"] == 4].copy()
+        if not sub.empty:
+            period_order = ["Pre-COVID", "COVID Shock", "Recovery", "Post-Recovery"]
+            sub["period"] = pd.Categorical(sub["period"], categories=period_order, ordered=True)
+            plt.figure(figsize=(12, 6))
+            sns.barplot(
+                data=sub.sort_values(["period", "maturity"]),
+                x="period",
+                y="share",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                errorbar=None,
+            )
+            plt.title("Rank 4 corr_levels Share by Macro Period")
+            plt.xlabel("Period")
+            plt.ylabel("Share")
+            plt.tight_layout()
+            plt.savefig(fig_dir / "corr_levels_rank4_share_by_period.png", dpi=220)
             plt.close()
 
 
@@ -843,6 +1022,30 @@ def run_model_performance_paper(
     period_vol_perf.to_csv(out_dir / "performance_by_period_volatility.csv", index=False)
     firm_perf.to_csv(out_dir / "performance_by_company.csv", index=False)
 
+    perf_tables = {
+        "overall": (overall_perf, ["maturity"]),
+        "by_leverage": (leverage_perf, ["leverage_group", "maturity"]),
+        "by_year": (year_perf, ["year", "maturity"]),
+        "by_period": (period_perf, ["period", "maturity"]),
+        "by_volatility": (volatility_perf, ["vol_regime", "maturity"]),
+        "by_period_volatility": (period_vol_perf, ["period", "vol_regime", "maturity"]),
+        "by_company": (firm_perf, ["gvkey", "company", "maturity", "leverage_group"]),
+    }
+
+    print("Computing metric ranking tables (rank 1-4)...")
+    rank_tables, rank_share_tables = compute_segment_rank_tables(perf_tables)
+    for name, df in rank_tables.items():
+        df.to_csv(out_dir / f"{name}.csv", index=False)
+    for name, df in rank_share_tables.items():
+        df.to_csv(out_dir / f"{name}.csv", index=False)
+
+    manifest_rows = []
+    for name, df in rank_tables.items():
+        manifest_rows.append({"table_type": "rank", "name": name, "rows": int(len(df)), "file": f"{name}.csv"})
+    for name, df in rank_share_tables.items():
+        manifest_rows.append({"table_type": "rank_share", "name": name, "rows": int(len(df)), "file": f"{name}.csv"})
+    pd.DataFrame(manifest_rows).to_csv(out_dir / "rank_tables_manifest.csv", index=False)
+
     print("Computing best-model dominance tables...")
     best_tables = compute_best_model_tables(panel)
     for name, df in best_tables.items():
@@ -874,7 +1077,7 @@ def run_model_performance_paper(
     hw_period_vol.to_csv(out_dir / "hw_tests_by_period_volatility.csv", index=False)
 
     print("Creating publication-quality figures...")
-    create_plots(panel, best_tables, out_dir)
+    create_plots(panel, best_tables, out_dir, rank_share_tables=rank_share_tables)
 
     print("Writing concise text summary...")
     with open(out_dir / "analysis_summary.txt", "w", encoding="utf-8") as f:
@@ -913,13 +1116,32 @@ def run_model_performance_paper(
                     f.write(f"  - {row['best_model_label']}: {100 * row['share']:.1f}%\n")
 
         if not msgarch_best.empty:
-            f.write("\nWhere MS-GARCH is strongest (top segments):\n")
+            f.write(f"\nWhere {MSGARCH_MODEL_LABEL} is strongest (top segments):\n")
             top = msgarch_best.head(12)
             for _, row in top.iterrows():
                 f.write(
                     f"  - [{row['segment_type']}] {row['segment']}: "
                     f"win share={100 * row['share']:.1f}% (n={int(row['n_best'])})\n"
                 )
+
+        _write_rank_summary_by_maturity(
+            f,
+            rank_tables.get("rank_rmse_bps_overall", pd.DataFrame()),
+            metric_col="rmse_bps",
+            title="Average RMSE Ranking",
+        )
+        _write_rank_summary_by_maturity(
+            f,
+            rank_tables.get("rank_corr_levels_overall", pd.DataFrame()),
+            metric_col="corr_levels",
+            title="Correlation Levels Ranking",
+        )
+        _write_rank_summary_by_maturity(
+            f,
+            rank_tables.get("rank_corr_changes_overall", pd.DataFrame()),
+            metric_col="corr_changes",
+            title="Correlation Changes Ranking",
+        )
 
     outputs = {
         "root": out_dir,
@@ -932,6 +1154,12 @@ def run_model_performance_paper(
         "period_volatility": out_dir / "performance_by_period_volatility.csv",
         "firm": out_dir / "performance_by_company.csv",
         "msgarch_best": out_dir / "msgarch_best_segments.csv",
+        "rank_manifest": out_dir / "rank_tables_manifest.csv",
+        "rank_rmse_overall": out_dir / "rank_rmse_bps_overall.csv",
+        "rank_corr_levels_overall": out_dir / "rank_corr_levels_overall.csv",
+        "rank_corr_changes_overall": out_dir / "rank_corr_changes_overall.csv",
+        "rank_rmse_share_by_period": out_dir / "rank_rmse_bps_by_period_share.csv",
+        "rank_rmse_share_by_leverage": out_dir / "rank_rmse_bps_by_leverage_share.csv",
         "filters": out_dir / "filter_metadata.csv",
         "summary": out_dir / "analysis_summary.txt",
         "figures": out_dir / "figures",
