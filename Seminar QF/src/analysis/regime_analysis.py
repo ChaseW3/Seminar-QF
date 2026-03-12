@@ -333,6 +333,9 @@ def compute_param_summary_by_company(
     if missing_df:
         raise ValueError(f"df is missing required columns: {missing_df}")
 
+    # nu is optional but included when present
+    has_nu = 'nu_0' in df.columns and 'nu_1' in df.columns
+
     required_w = ['gvkey', 'maturity', 'start_date', 'end_date']
     missing_w = [c for c in required_w if c not in windows_df.columns]
     if missing_w:
@@ -393,6 +396,8 @@ def compute_param_summary_by_company(
         ]
 
         param_cols = ['alpha_0', 'beta_0', 'alpha_1', 'beta_1']
+        if has_nu:
+            param_cols += ['nu_0', 'nu_1']
         firm_valid = firm_df.dropna(subset=param_cols, how='all')
 
         if len(firm_valid) == 0:
@@ -400,7 +405,10 @@ def compute_param_summary_by_company(
             continue
 
         for regime in (0, 1):
-            for param in ('alpha', 'beta'):
+            params_for_regime = ['alpha', 'beta']
+            if has_nu:
+                params_for_regime.append('nu')
+            for param in params_for_regime:
                 col = f'{param}_{regime}'
                 if col not in firm_valid.columns:
                     continue
@@ -435,7 +443,7 @@ def compute_param_summary_by_company(
 
 
 def display_param_summary(summary: pd.DataFrame):
-    # Per company display of alpha and beta summary
+    # Per company display of alpha, beta (and nu when present) summary
     try:
         from IPython.display import display as ipy_display
         _display = ipy_display
@@ -470,9 +478,7 @@ def run_ms_garch_analysis(ms_garch_df: pd.DataFrame, verbose: bool = True):
     metrics = extract_regime_metrics(ms_garch_df)
 
     if verbose:
-        print('=' * 80)
-        print('MS-GARCH  —  DERIVED PER-REGIME METRICS')
-        print('=' * 80)
+        print('MS-GARCH per-regime metrics')
         display_cols = ['omega', 'alpha', 'beta', 'nu', 'persistence',
                         'stationary', 'uncond_vol', 'half_life',
                         'p_stay', 'steady_state', 'expected_duration']

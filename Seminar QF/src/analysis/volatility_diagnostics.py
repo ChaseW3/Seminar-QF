@@ -20,17 +20,15 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     # Run comprehensive volatility diagnostics
     os.makedirs(output_dir, exist_ok=True)
     
-    print("\n" + "="*80)
-    print("VOLATILITY DIAGNOSTICS: IDENTIFYING PROBLEMATIC FIRMS")
-    print("="*80 + "\n")
+    print("\nVolatility diagnostics: identifying problematic firms")
     
     df_garch = pd.read_csv(garch_file)
     df_garch['date'] = pd.to_datetime(df_garch['date'])
     
-    print(f"✓ Loaded GARCH data: {len(df_garch):,} observations")
+    print(f"Loaded GARCH data: {len(df_garch):,} observations")
     
     firms = df_garch['gvkey'].unique()
-    print(f"✓ Number of firms: {len(firms)}")
+    print(f"Number of firms: {len(firms)}")
 
     # GARCH parameter and return distribution analysis per firm
     
@@ -134,13 +132,13 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     # Monte Carlo volatility diagnostics
     if mc_garch_file and os.path.exists(mc_garch_file):
         print("\n" + "-"*60)
-        print("PART 2: MONTE CARLO VOLATILITY ANALYSIS")
+        print("Part 2: Monte Carlo volatility analysis")
         print("-"*60 + "\n")
         
         df_mc = pd.read_csv(mc_garch_file)
         df_mc['date'] = pd.to_datetime(df_mc['date'])
         
-        print(f"✓ Loaded MC data: {len(df_mc):,} observations")
+        print(f"Loaded MC data: {len(df_mc):,} observations")
         
         target_col = None
         is_variance = False
@@ -160,8 +158,8 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
             is_daily_mean = False
         
         if target_col is None:
-            print("⚠ Warning: No volatility columns found in MC results. Skipping MC volatility diagnostics.")
-            print("   (This is normal if using optimized MC that only outputs PD/spreads)")
+            print("Warning: No volatility columns found in MC results. Skipping MC volatility diagnostics.")
+            print("  (Normal if using optimized MC that only outputs PD/spreads)")
             mc_stats = pd.DataFrame({'gvkey': df_mc['gvkey'].unique()})
         else:
             mc_stats = df_mc.groupby('gvkey').agg({
@@ -201,7 +199,7 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     # Summary
 
     print("\n" + "-"*60)
-    print("PART 3: DIAGNOSTIC SUMMARY")
+    print("Part 3: Diagnostic summary")
     print("-"*60 + "\n")
     
     # Separate problematic from clean firms
@@ -219,7 +217,7 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     )
     
     if len(df_problematic) > 0:
-        print("PROBLEMATIC FIRMS (sorted by severity):\n")
+        print("Problematic firms (sorted by severity):\n")
         print("-" * 100)
         print(f"{'gvkey':>10} | {'Ann.Vol Max':>12} | {'GARCH α+β':>10} | {'Extreme Ret':>12} | Issues")
         print("-" * 100)
@@ -233,7 +231,7 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         print("-" * 100)
     
     # Issue type breakdown
-    print("\n\nISSUE TYPE BREAKDOWN:")
+    print("\n\nIssue type breakdown:")
     print("-" * 40)
     
     issue_counts = {}
@@ -249,21 +247,21 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
     # Save diagnostics
     
     print("\n" + "-"*60)
-    print("PART 4: SAVING DIAGNOSTIC REPORTS")
+    print("Part 4: Saving diagnostic reports")
     print("-"*60 + "\n")
     
     diagnostics_file = os.path.join(output_dir, 'firm_volatility_diagnostics.csv')
     df_firm_stats.to_csv(diagnostics_file, index=False)
-    print(f"✓ Saved: {diagnostics_file}")
+    print(f"Saved: {diagnostics_file}")
     
     problematic_file = os.path.join(output_dir, 'problematic_firms.csv')
     df_problematic.to_csv(problematic_file, index=False)
-    print(f"✓ Saved: {problematic_file}")
+    print(f"Saved: {problematic_file}")
     
     clean_firms_df = df_firm_stats[~df_firm_stats['is_problematic']][['gvkey']].copy()
     clean_file = os.path.join(output_dir, 'clean_firms.csv')
     clean_firms_df.to_csv(clean_file, index=False)
-    print(f"✓ Saved: {clean_file}")
+    print(f"Saved: {clean_file}")
     
     # Save summary 
     summary_file = os.path.join(output_dir, 'diagnostics_summary.txt')
@@ -279,11 +277,9 @@ def run_volatility_diagnostics(garch_file, mc_garch_file=None, output_dir='./dia
         f.write("ISSUE BREAKDOWN:\n")
         for issue_type, count in sorted(issue_counts.items(), key=lambda x: -x[1]):
             f.write(f"  {issue_type}: {count}\n")
-    print(f"✓ Saved: {summary_file}")
+    print(f"Saved: {summary_file}")
     
-    print("\n" + "="*80)
-    print("DIAGNOSTICS COMPLETE")
-    print("="*80 + "\n")
+    print("\nDiagnostics complete")
     
     return {
         'problematic_firms': problematic_firms,
@@ -303,7 +299,7 @@ def filter_problematic_firms(df, problematic_firms, gvkey_column='gvkey'):
     final_rows = len(df_filtered)
     final_firms = df_filtered[gvkey_column].nunique()
     
-    print(f"Filtered problematic firms: {initial_firms} → {final_firms} firms ({initial_rows:,} → {final_rows:,} rows)")
+    print(f"Filtered problematic firms: {initial_firms} to {final_firms} firms ({initial_rows:,} to {final_rows:,} rows)")
     
     return df_filtered
 
