@@ -572,29 +572,32 @@ def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.D
                     }
                 )
 
-            t_hw, p_hw, r_a, r_b = _hw_corr_diff_test(grp, model_a, model_b)
-            if pd.isna(t_hw):
-                continue
-            hw_rows.append(
-                {
-                    **segment,
-                    "Model_1": model_a,
-                    "Model_2": model_b,
-                    "n_obs": int(
-                        grp.pivot_table(
-                            index=["gvkey", "date", "maturity"],
-                            columns="model",
-                            values="model_spread_bps",
-                            aggfunc="first",
-                        )[[model_a, model_b]].dropna().shape[0]
-                    ),
-                    "r_market_m1": r_a,
-                    "r_market_m2": r_b,
-                    "t_HW": t_hw,
-                    "p_value": p_hw,
-                    "Significance": _sig_stars(p_hw),
-                }
-            )
+                # Hotelling-Williams per maturity (mirrors DM breakdown)
+                grp_mat = grp[grp["maturity"] == maturity]
+                t_hw, p_hw, r_a, r_b = _hw_corr_diff_test(grp_mat, model_a, model_b)
+                if pd.isna(t_hw):
+                    continue
+                hw_rows.append(
+                    {
+                        **segment,
+                        "maturity": maturity,
+                        "Model_1": model_a,
+                        "Model_2": model_b,
+                        "n_obs": int(
+                            grp_mat.pivot_table(
+                                index=["gvkey", "date", "maturity"],
+                                columns="model",
+                                values="model_spread_bps",
+                                aggfunc="first",
+                            )[[model_a, model_b]].dropna().shape[0]
+                        ),
+                        "r_market_m1": r_a,
+                        "r_market_m2": r_b,
+                        "t_HW": t_hw,
+                        "p_value": p_hw,
+                        "Significance": _sig_stars(p_hw),
+                    }
+                )
 
     return pd.DataFrame(dm_rows), pd.DataFrame(hw_rows)
 
