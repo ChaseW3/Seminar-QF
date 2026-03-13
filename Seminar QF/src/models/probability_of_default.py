@@ -9,10 +9,10 @@ def _add_regime_weighted_volatility(df):
     # Adds regime weighted volatility column using probability weighted average of regime volatilities
     try:
         from src.utils import config
-        params_file = config.OUTPUT_DIR / 'regime_switching_parameters.csv'
+        params_file = config.TABLES_DIR / 'regime_switching_parameters.csv'
     except ImportError:
         from pathlib import Path
-        params_file = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "regime_switching_parameters.csv"
+        params_file = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "tables" / "regime_switching_parameters.csv"
     
     # Load regime parameters
     try:
@@ -272,8 +272,14 @@ def calculate_merton_pd_normal(daily_returns_file):
 def get_regime_volatility(df_regime):
     # Returns regime weighted volatility falling back to asset volatility or a 30 percent default
     import os
+    from pathlib import Path
     
-    params_file = 'regime_switching_parameters.csv'
+    try:
+        from src.utils import config
+        params_file = config.TABLES_DIR / 'regime_switching_parameters.csv'
+    except ImportError:
+        params_file = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "tables" / "regime_switching_parameters.csv"
+
     if os.path.exists(params_file):
         params_df = pd.read_csv(params_file)
         

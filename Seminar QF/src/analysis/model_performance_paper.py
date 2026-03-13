@@ -72,7 +72,9 @@ NESTED_MODEL_PAIRS = [
 
 @dataclass
 class AnalysisConfig:
-    output_dir: Path
+    tables_dir: Path
+    figures_dir: Path
+    calibration_dir: Path
     input_dir: Path
     min_obs_segment: int = 60
     min_obs_firm: int = 60
@@ -203,12 +205,11 @@ def _load_company_mapping(merton_file: Path) -> pd.DataFrame:
     return merton_df[cols].drop_duplicates(subset=["gvkey", "date"])
 
 
-def _load_model_long(model_key: str, spec: dict, output_dir: Path) -> pd.DataFrame:
+def _load_model_long(model_key: str, spec: dict, calibration_dir: Path) -> pd.DataFrame:
     long_parts = []
     calibrated_col = spec.get("calibrated_col", "calibrated")
-    calibrated_dir = output_dir / "calibration"
     for mat in MATURITIES:
-        model_path = calibrated_dir / f"{spec['calibrated_file_prefix']}_{mat}y.csv"
+        model_path = calibration_dir / f"{spec['calibrated_file_prefix']}_{mat}y.csv"
         if not model_path.exists():
             raise FileNotFoundError(f"Missing calibrated model file: {model_path}")
 
@@ -244,7 +245,11 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     market_long = _to_long_market(cds_market)
 
     print("Loading company and leverage mapping...")
-    mapping_file = cfg.output_dir / "merged_data_with_merton.csv"
+    mapping_file = cfg.tables_dir / "merged_data_with_merton.csv"
+    if not mapping_file.exists():
+        legacy_mapping_file = cfg.tables_dir.parent / "merged_data_with_merton.csv"
+        if legacy_mapping_file.exists():
+            mapping_file = legacy_mapping_file
     company_map = _load_company_mapping(mapping_file)
 
     company_static = company_map[["gvkey", "company"]].drop_duplicates(subset=["gvkey"])
@@ -253,7 +258,7 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     panel_parts = []
     for model_key, spec in MODEL_SPECS.items():
         print(f"  - Loading {spec['label']}...")
-        model_long = _load_model_long(model_key, spec, cfg.output_dir)
+        model_long = _load_model_long(model_key, spec, cfg.calibration_dir)
         model_long = model_long.merge(company_static, on="gvkey", how="left")
         model_long = model_long.merge(company_map[["gvkey", "date", "leverage_ratio"]], on=["gvkey", "date"], how="left")
 
@@ -911,14 +916,13 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
 def create_plots(
     panel: pd.DataFrame,
     best_tables: dict[str, pd.DataFrame],
-    output_dir: Path,
+    figures_dir: Path,
     rank_share_tables: dict[str, pd.DataFrame] | None = None,
 ) -> None:
     # Generate and save plots
 
     sns.set_theme(style="whitegrid")
-    fig_dir = output_dir / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     # Winner share by leverage and maturity
     tbl = best_tables["best_model_share_by_leverage"].copy()
@@ -938,7 +942,7 @@ def create_plots(
         plt.ylabel("Share of Dates Where Model Has Lowest Absolute Error")
         plt.legend(title="Model", loc="best")
         plt.tight_layout()
-        plt.savefig(fig_dir / "best_model_share_by_leverage.png", dpi=220)
+        plt.savefig(figures_dir / "best_model_share_by_leverage.png", dpi=220)
         plt.close()
 
     # Year-maturity heatmaps of best model shares
@@ -954,7 +958,7 @@ def create_plots(
             plt.ylabel("Year")
             plt.tight_layout()
             safe_name = model_label.lower().replace("-", "_").replace(" ", "_")
-            plt.savefig(fig_dir / f"heatmap_wins_{safe_name}.png", dpi=220)
+            plt.savefig(figures_dir / f"heatmap_wins_{safe_name}.png", dpi=220)
             plt.close()
 
     # RMSE trends by year
@@ -976,7 +980,7 @@ def create_plots(
         )
         g.set_axis_labels("Year", "RMSE (bps)")
         g.fig.suptitle("RMSE Trends by Model and Maturity", y=1.02)
-        g.savefig(fig_dir / "rmse_trend_by_year.png", dpi=220)
+        g.savefig(figures_dir / "rmse_trend_by_year.png", dpi=220)
         plt.close("all")
 
     # Firm-level RMSE distribution
@@ -1001,7 +1005,7 @@ def create_plots(
         plt.xlabel("Model")
         plt.ylabel("RMSE (bps)")
         plt.tight_layout()
-        plt.savefig(fig_dir / "firm_rmse_boxplot.png", dpi=220)
+        plt.savefig(figures_dir / "firm_rmse_boxplot.png", dpi=220)
         plt.close()
 
     # Correlation comparison
@@ -1028,7 +1032,7 @@ def create_plots(
         plt.xlabel("Maturity")
         plt.ylabel("Correlation")
         plt.tight_layout()
-        plt.savefig(fig_dir / "correlation_by_model_maturity.png", dpi=220)
+        plt.savefig(figures_dir / "correlation_by_model_maturity.png", dpi=220)
         plt.close()
 
     # Winner share by period
@@ -1050,7 +1054,7 @@ def create_plots(
         plt.xlabel("Period")
         plt.ylabel("Share of Wins")
         plt.tight_layout()
-        plt.savefig(fig_dir / "best_model_share_by_period.png", dpi=220)
+        plt.savefig(figures_dir / "best_model_share_by_period.png", dpi=220)
         plt.close()
 
     # MS-GARCH wins across period, volatility and maturity
@@ -1066,7 +1070,7 @@ def create_plots(
             plt.xlabel("Maturity")
             plt.ylabel("Period | Volatility")
             plt.tight_layout()
-            plt.savefig(fig_dir / "msgarch_win_share_period_volatility.png", dpi=220)
+            plt.savefig(figures_dir / "msgarch_win_share_period_volatility.png", dpi=220)
             plt.close()
 
     if rank_share_tables is None:
@@ -1095,7 +1099,7 @@ def create_plots(
             plt.xlabel("Leverage Group")
             plt.ylabel("Share")
             plt.tight_layout()
-            plt.savefig(fig_dir / f"rmse_{file_stub}_rank_share_by_leverage.png", dpi=220)
+            plt.savefig(figures_dir / f"rmse_{file_stub}_rank_share_by_leverage.png", dpi=220)
             plt.close()
 
     rmse_period = rank_share_tables.get("rank_rmse_bps_by_period_share", pd.DataFrame())
@@ -1123,7 +1127,7 @@ def create_plots(
             plt.xlabel("Period")
             plt.ylabel("Share")
             plt.tight_layout()
-            plt.savefig(fig_dir / f"rmse_{file_stub}_rank_share_by_period.png", dpi=220)
+            plt.savefig(figures_dir / f"rmse_{file_stub}_rank_share_by_period.png", dpi=220)
             plt.close()
 
     corr_period = rank_share_tables.get("rank_corr_levels_by_period_share", pd.DataFrame())
@@ -1146,7 +1150,7 @@ def create_plots(
             plt.xlabel("Period")
             plt.ylabel("Share")
             plt.tight_layout()
-            plt.savefig(fig_dir / "corr_levels_rank4_share_by_period.png", dpi=220)
+            plt.savefig(figures_dir / "corr_levels_rank4_share_by_period.png", dpi=220)
             plt.close()
 
 
@@ -1161,13 +1165,27 @@ def run_model_performance_paper(
 ) -> dict[str, Path]:
     # Build panel, compute all metrics, run tests, save outputs
     if output_dir is None:
-        output_dir = config.OUTPUT_DIR
+        tables_dir = config.TABLES_DIR
+        figures_dir = config.FIGURES_DIR
+        calibration_dir = config.CALIBRATION_DIR
+    else:
+        tables_dir = Path(output_dir)
+        figures_dir = Path(output_dir) / "figures"
+        calibration_dir = Path(output_dir) / "calibration"
     if input_dir is None:
         input_dir = config.INPUT_DIR
 
-    cfg = AnalysisConfig(output_dir=Path(output_dir), input_dir=Path(input_dir), period_ranges=period_ranges)
-    out_dir = cfg.output_dir / save_subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = AnalysisConfig(
+        tables_dir=Path(tables_dir),
+        figures_dir=Path(figures_dir),
+        calibration_dir=Path(calibration_dir),
+        input_dir=Path(input_dir),
+        period_ranges=period_ranges,
+    )
+    out_tables_dir = cfg.tables_dir / save_subdir
+    out_figures_dir = cfg.figures_dir / save_subdir
+    out_tables_dir.mkdir(parents=True, exist_ok=True)
+    out_figures_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 90)
     print("PAPER MODEL COMPARISON ANALYSIS")
@@ -1193,8 +1211,8 @@ def run_model_performance_paper(
         f"period={filter_meta['selected_period']}; "
         f"leverage_group={filter_meta['selected_leverage_group']}"
     )
-    panel.to_csv(out_dir / "model_comparison_panel.csv", index=False)
-    pd.DataFrame([filter_meta]).to_csv(out_dir / "filter_metadata.csv", index=False)
+    panel.to_csv(out_tables_dir / "model_comparison_panel.csv", index=False)
+    pd.DataFrame([filter_meta]).to_csv(out_tables_dir / "filter_metadata.csv", index=False)
 
     print("Computing performance tables...")
     overall_perf = compute_performance_summary(panel, ["maturity"], min_obs=cfg.min_obs_segment)
@@ -1205,13 +1223,13 @@ def run_model_performance_paper(
     period_vol_perf = compute_performance_summary(panel, ["period", "vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
     firm_perf = compute_performance_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=cfg.min_obs_firm)
 
-    overall_perf.to_csv(out_dir / "performance_overall.csv", index=False)
-    leverage_perf.to_csv(out_dir / "performance_by_leverage.csv", index=False)
-    year_perf.to_csv(out_dir / "performance_by_year.csv", index=False)
-    period_perf.to_csv(out_dir / "performance_by_period.csv", index=False)
-    volatility_perf.to_csv(out_dir / "performance_by_volatility.csv", index=False)
-    period_vol_perf.to_csv(out_dir / "performance_by_period_volatility.csv", index=False)
-    firm_perf.to_csv(out_dir / "performance_by_company.csv", index=False)
+    overall_perf.to_csv(out_tables_dir / "performance_overall.csv", index=False)
+    leverage_perf.to_csv(out_tables_dir / "performance_by_leverage.csv", index=False)
+    year_perf.to_csv(out_tables_dir / "performance_by_year.csv", index=False)
+    period_perf.to_csv(out_tables_dir / "performance_by_period.csv", index=False)
+    volatility_perf.to_csv(out_tables_dir / "performance_by_volatility.csv", index=False)
+    period_vol_perf.to_csv(out_tables_dir / "performance_by_period_volatility.csv", index=False)
+    firm_perf.to_csv(out_tables_dir / "performance_by_company.csv", index=False)
 
     perf_tables = {
         "overall": (overall_perf, ["maturity"]),
@@ -1226,24 +1244,24 @@ def run_model_performance_paper(
     print("Computing metric ranking tables (rank 1-4)...")
     rank_tables, rank_share_tables = compute_segment_rank_tables(perf_tables)
     for name, df in rank_tables.items():
-        df.to_csv(out_dir / f"{name}.csv", index=False)
+        df.to_csv(out_tables_dir / f"{name}.csv", index=False)
     for name, df in rank_share_tables.items():
-        df.to_csv(out_dir / f"{name}.csv", index=False)
+        df.to_csv(out_tables_dir / f"{name}.csv", index=False)
 
     manifest_rows = []
     for name, df in rank_tables.items():
         manifest_rows.append({"table_type": "rank", "name": name, "rows": int(len(df)), "file": f"{name}.csv"})
     for name, df in rank_share_tables.items():
         manifest_rows.append({"table_type": "rank_share", "name": name, "rows": int(len(df)), "file": f"{name}.csv"})
-    pd.DataFrame(manifest_rows).to_csv(out_dir / "rank_tables_manifest.csv", index=False)
+    pd.DataFrame(manifest_rows).to_csv(out_tables_dir / "rank_tables_manifest.csv", index=False)
 
     print("Computing best-model dominance tables...")
     best_tables = compute_best_model_tables(panel)
     for name, df in best_tables.items():
-        df.to_csv(out_dir / f"{name}.csv", index=False)
+        df.to_csv(out_tables_dir / f"{name}.csv", index=False)
 
     msgarch_best = compute_msgarch_best_segments(best_tables)
-    msgarch_best.to_csv(out_dir / "msgarch_best_segments.csv", index=False)
+    msgarch_best.to_csv(out_tables_dir / "msgarch_best_segments.csv", index=False)
 
     print("Running pairwise forecast and correlation tests...")
     cw_overall, hw_overall = run_pairwise_tests(panel, group_cols=[])
@@ -1253,19 +1271,19 @@ def run_model_performance_paper(
     cw_vol, hw_vol = run_pairwise_tests(panel, group_cols=["vol_regime"])
     cw_period_vol, hw_period_vol = run_pairwise_tests(panel, group_cols=["period", "vol_regime"])
 
-    cw_overall.to_csv(out_dir / "cw_tests_overall.csv", index=False)
-    cw_lev.to_csv(out_dir / "cw_tests_by_leverage.csv", index=False)
-    cw_year.to_csv(out_dir / "cw_tests_by_year.csv", index=False)
-    cw_period.to_csv(out_dir / "cw_tests_by_period.csv", index=False)
-    cw_vol.to_csv(out_dir / "cw_tests_by_volatility.csv", index=False)
-    cw_period_vol.to_csv(out_dir / "cw_tests_by_period_volatility.csv", index=False)
+    cw_overall.to_csv(out_tables_dir / "cw_tests_overall.csv", index=False)
+    cw_lev.to_csv(out_tables_dir / "cw_tests_by_leverage.csv", index=False)
+    cw_year.to_csv(out_tables_dir / "cw_tests_by_year.csv", index=False)
+    cw_period.to_csv(out_tables_dir / "cw_tests_by_period.csv", index=False)
+    cw_vol.to_csv(out_tables_dir / "cw_tests_by_volatility.csv", index=False)
+    cw_period_vol.to_csv(out_tables_dir / "cw_tests_by_period_volatility.csv", index=False)
 
-    hw_overall.to_csv(out_dir / "hw_tests_overall.csv", index=False)
-    hw_lev.to_csv(out_dir / "hw_tests_by_leverage.csv", index=False)
-    hw_year.to_csv(out_dir / "hw_tests_by_year.csv", index=False)
-    hw_period.to_csv(out_dir / "hw_tests_by_period.csv", index=False)
-    hw_vol.to_csv(out_dir / "hw_tests_by_volatility.csv", index=False)
-    hw_period_vol.to_csv(out_dir / "hw_tests_by_period_volatility.csv", index=False)
+    hw_overall.to_csv(out_tables_dir / "hw_tests_overall.csv", index=False)
+    hw_lev.to_csv(out_tables_dir / "hw_tests_by_leverage.csv", index=False)
+    hw_year.to_csv(out_tables_dir / "hw_tests_by_year.csv", index=False)
+    hw_period.to_csv(out_tables_dir / "hw_tests_by_period.csv", index=False)
+    hw_vol.to_csv(out_tables_dir / "hw_tests_by_volatility.csv", index=False)
+    hw_period_vol.to_csv(out_tables_dir / "hw_tests_by_period_volatility.csv", index=False)
 
     print("Running Pearson correlation significance tests...")
     pc_overall = run_pearson_tests(panel, group_cols=[])
@@ -1275,18 +1293,18 @@ def run_model_performance_paper(
     pc_vol = run_pearson_tests(panel, group_cols=["vol_regime"])
     pc_period_vol = run_pearson_tests(panel, group_cols=["period", "vol_regime"])
 
-    pc_overall.to_csv(out_dir / "pearson_tests_overall.csv", index=False)
-    pc_lev.to_csv(out_dir / "pearson_tests_by_leverage.csv", index=False)
-    pc_year.to_csv(out_dir / "pearson_tests_by_year.csv", index=False)
-    pc_period.to_csv(out_dir / "pearson_tests_by_period.csv", index=False)
-    pc_vol.to_csv(out_dir / "pearson_tests_by_volatility.csv", index=False)
-    pc_period_vol.to_csv(out_dir / "pearson_tests_by_period_volatility.csv", index=False)
+    pc_overall.to_csv(out_tables_dir / "pearson_tests_overall.csv", index=False)
+    pc_lev.to_csv(out_tables_dir / "pearson_tests_by_leverage.csv", index=False)
+    pc_year.to_csv(out_tables_dir / "pearson_tests_by_year.csv", index=False)
+    pc_period.to_csv(out_tables_dir / "pearson_tests_by_period.csv", index=False)
+    pc_vol.to_csv(out_tables_dir / "pearson_tests_by_volatility.csv", index=False)
+    pc_period_vol.to_csv(out_tables_dir / "pearson_tests_by_period_volatility.csv", index=False)
 
     print("Creating publication-quality figures...")
-    create_plots(panel, best_tables, out_dir, rank_share_tables=rank_share_tables)
+    create_plots(panel, best_tables, out_figures_dir, rank_share_tables=rank_share_tables)
 
     print("Writing concise text summary...")
-    with open(out_dir / "analysis_summary.txt", "w", encoding="utf-8") as f:
+    with open(out_tables_dir / "analysis_summary.txt", "w", encoding="utf-8") as f:
         f.write("Model Performance Comparison Summary\n")
         f.write("=" * 44 + "\n\n")
         f.write(f"Total panel rows: {len(panel):,}\n")
@@ -1350,30 +1368,32 @@ def run_model_performance_paper(
         )
 
     outputs = {
-        "root": out_dir,
-        "panel": out_dir / "model_comparison_panel.csv",
-        "overall": out_dir / "performance_overall.csv",
-        "leverage": out_dir / "performance_by_leverage.csv",
-        "year": out_dir / "performance_by_year.csv",
-        "period": out_dir / "performance_by_period.csv",
-        "volatility": out_dir / "performance_by_volatility.csv",
-        "period_volatility": out_dir / "performance_by_period_volatility.csv",
-        "firm": out_dir / "performance_by_company.csv",
-        "msgarch_best": out_dir / "msgarch_best_segments.csv",
-        "rank_manifest": out_dir / "rank_tables_manifest.csv",
-        "rank_rmse_overall": out_dir / "rank_rmse_bps_overall.csv",
-        "rank_corr_levels_overall": out_dir / "rank_corr_levels_overall.csv",
-        "rank_corr_changes_overall": out_dir / "rank_corr_changes_overall.csv",
-        "rank_rmse_share_by_period": out_dir / "rank_rmse_bps_by_period_share.csv",
-        "rank_rmse_share_by_leverage": out_dir / "rank_rmse_bps_by_leverage_share.csv",
-        "cw_overall": out_dir / "cw_tests_overall.csv",
-        "filters": out_dir / "filter_metadata.csv",
-        "summary": out_dir / "analysis_summary.txt",
-        "figures": out_dir / "figures",
+        "tables_root": out_tables_dir,
+        "figures_root": out_figures_dir,
+        "panel": out_tables_dir / "model_comparison_panel.csv",
+        "overall": out_tables_dir / "performance_overall.csv",
+        "leverage": out_tables_dir / "performance_by_leverage.csv",
+        "year": out_tables_dir / "performance_by_year.csv",
+        "period": out_tables_dir / "performance_by_period.csv",
+        "volatility": out_tables_dir / "performance_by_volatility.csv",
+        "period_volatility": out_tables_dir / "performance_by_period_volatility.csv",
+        "firm": out_tables_dir / "performance_by_company.csv",
+        "msgarch_best": out_tables_dir / "msgarch_best_segments.csv",
+        "rank_manifest": out_tables_dir / "rank_tables_manifest.csv",
+        "rank_rmse_overall": out_tables_dir / "rank_rmse_bps_overall.csv",
+        "rank_corr_levels_overall": out_tables_dir / "rank_corr_levels_overall.csv",
+        "rank_corr_changes_overall": out_tables_dir / "rank_corr_changes_overall.csv",
+        "rank_rmse_share_by_period": out_tables_dir / "rank_rmse_bps_by_period_share.csv",
+        "rank_rmse_share_by_leverage": out_tables_dir / "rank_rmse_bps_by_leverage_share.csv",
+        "cw_overall": out_tables_dir / "cw_tests_overall.csv",
+        "filters": out_tables_dir / "filter_metadata.csv",
+        "summary": out_tables_dir / "analysis_summary.txt",
+        "figures": out_figures_dir,
     }
 
     print("Analysis complete.")
-    print(f"Results saved in: {out_dir}")
+    print(f"Table outputs saved in: {out_tables_dir}")
+    print(f"Figure outputs saved in: {out_figures_dir}")
     return outputs
 
 

@@ -2,12 +2,21 @@
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from scipy.optimize import minimize
 from scipy.special import expit
 from numba import njit
 import math
 import warnings
 warnings.filterwarnings('ignore')
+
+try:
+    from src.utils import config
+    TABLES_DIR = config.TABLES_DIR
+except ImportError:
+    TABLES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "tables"
+
+TABLES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Numerical safety bounds
 NU_LOWER_BOUND = 2.1
@@ -900,9 +909,14 @@ def run_ms_garch_estimation_optimized(data_df,
                                       gvkey_selected=None,
                                       return_column='asset_return_daily',
                                       gvkey_column='gvkey',
-                                      output_file='ms_garch_parameters.csv',
+                                      output_file=None,
                                       verbose=True):
     # Rolling MS-GARCH estimation for multiple firms; saves month-end params and forward-fills to daily
+    output_path = TABLES_DIR / 'ms_garch_parameters.csv' if output_file is None else Path(output_file)
+    if not output_path.is_absolute() and output_file is not None:
+        output_path = TABLES_DIR / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     firms = data_df[gvkey_column].unique() if gvkey_selected is None else gvkey_selected
     firms = [f for f in firms if not pd.isna(f)]
 
@@ -1124,10 +1138,10 @@ def run_ms_garch_estimation_optimized(data_df,
                 'msgarch_blend_weight', 'adaptive_window_days', 'window_regime_state',
                 'log_likelihood', 'aic', 'bic', 'n_obs']
         params_df = params_df[[c for c in cols if c in params_df.columns]]
-        params_df.to_csv(output_file, index=False)
+        params_df.to_csv(output_path, index=False)
 
         if verbose:
-            print(f"MS-GARCH parameters saved: {len(params_df)} firm-months → {output_file}")
+            print(f"MS-GARCH parameters saved: {len(params_df)} firm-months → {output_path}")
 
         data_with_vol['date'] = pd.to_datetime(data_with_vol['date'])
         merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'log_likelihood', 'aic', 'bic', 'n_obs']]

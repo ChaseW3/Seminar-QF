@@ -14,9 +14,11 @@ import sys
 # Import config for output paths
 try:
     from src.utils import config
-    OUTPUT_DIR = config.OUTPUT_DIR
+    TABLES_DIR = config.TABLES_DIR
 except ImportError:
-    OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output"
+    TABLES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "tables"
+
+TABLES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @njit(cache=True)
@@ -509,7 +511,7 @@ def run_regime_switching_estimation(daily_returns_df):
     # Save Parameters and Merge (matching GARCH approach)
     if all_params:
         params_df = pd.DataFrame(all_params)
-        output_path = OUTPUT_DIR / 'regime_switching_parameters.csv'
+        output_path = TABLES_DIR / 'regime_switching_parameters.csv'
         params_df.to_csv(output_path, index=False)
         print(f"\nSaved Regime Switching parameters (month-ends) to '{output_path}'")
         

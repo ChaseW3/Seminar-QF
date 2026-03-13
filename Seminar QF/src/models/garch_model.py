@@ -8,9 +8,11 @@ from pathlib import Path
 # Import config for output paths
 try:
     from src.utils import config
-    OUTPUT_DIR = config.OUTPUT_DIR
+    TABLES_DIR = config.TABLES_DIR
 except ImportError:
-    OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output"
+    TABLES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "output" / "tables"
+
+TABLES_DIR.mkdir(parents=True, exist_ok=True)
 
 def sanitize_garch_params(params_row):
     # Clean up estimated GARCH params before saving — clips/repairs values that would
@@ -260,7 +262,7 @@ def run_garch_estimation(daily_returns_df):
     # Save parameters for Monte Carlo and reference
     if params_list:
         params_df = pd.DataFrame(params_list)
-        output_path = OUTPUT_DIR / 'garch_parameters.csv'
+        output_path = TABLES_DIR / 'garch_parameters.csv'
         params_df.to_csv(output_path, index=False)
         print(f"\nSaved GARCH parameters to '{output_path}'")
         

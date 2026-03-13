@@ -242,17 +242,27 @@ def calculate_cds_correlations(
 def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Run the full CDS correlation analysis for all available models
     if output_dir is None:
-        output_dir = config.OUTPUT_DIR
+        output_dir = config.TABLES_DIR
     if input_dir is None:
         input_dir = config.INPUT_DIR
     
     output_dir = Path(output_dir)
     input_dir = Path(input_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    legacy_output_dir = output_dir.parent if output_dir.name == 'tables' else output_dir
+
+    def resolve_input_file(filename):
+        preferred = output_dir / filename
+        if preferred.exists():
+            return preferred
+        legacy = legacy_output_dir / filename
+        return legacy
     
     # Load market CDS data
     cds_market = load_all_market_cds_data(input_dir)
     
-    merton_file = output_dir / 'merged_data_with_merton.csv'
+    merton_file = resolve_input_file('merged_data_with_merton.csv')
     
     results = {}
     
@@ -284,7 +294,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
             return None
     
     # Merton Monte Carlo
-    merton_mc_file = output_dir / 'daily_monte_carlo_merton_results.csv'
+    merton_mc_file = resolve_input_file('daily_monte_carlo_merton_results.csv')
     if merton_mc_file.exists():
         model_df = prepare_mc_file(merton_mc_file, 'merton_mc_implied_spread', 'cds_spread_merton_mc')
         if model_df is not None:
@@ -299,7 +309,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         print(f"Warning: {merton_mc_file} not found. Run Merton MC simulation first.")
     
     # GARCH
-    garch_mc_file = output_dir / 'daily_monte_carlo_garch_results.csv'
+    garch_mc_file = resolve_input_file('daily_monte_carlo_garch_results.csv')
     if garch_mc_file.exists():
         model_df = prepare_mc_file(garch_mc_file, 'mc_garch_implied_spread', 'cds_spread_garch_mc')
         if model_df is not None:
@@ -314,7 +324,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         print(f"Warning: {garch_mc_file} not found.")
     
     # Regime Switching
-    rs_mc_file = output_dir / 'daily_monte_carlo_regime_switching_results.csv'
+    rs_mc_file = resolve_input_file('daily_monte_carlo_regime_switching_results.csv')
     if rs_mc_file.exists():
         model_df = prepare_mc_file(rs_mc_file, 'rs_implied_spread', 'cds_spread_regime_switching_mc')
         if model_df is not None:
@@ -329,7 +339,7 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
         print(f"Warning: {rs_mc_file} not found.")
     
     # MS-GARCH
-    msgarch_mc_file = output_dir / 'daily_monte_carlo_ms_garch_results.csv'
+    msgarch_mc_file = resolve_input_file('daily_monte_carlo_ms_garch_results.csv')
     if msgarch_mc_file.exists():
         model_df = prepare_mc_file(msgarch_mc_file, 'mc_ms_garch_implied_spread', 'cds_spread_msgarch_mc')
         if model_df is not None:
@@ -442,8 +452,9 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
 def plot_cds_correlations(results, output_dir=None, maturity=5, axis_limit=None):
     # Scatter plots of model-implied vs market CDS spreads for each model
     if output_dir is None:
-        output_dir = config.OUTPUT_DIR
+        output_dir = config.FIGURES_DIR
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Which models are available
     available_models = []
