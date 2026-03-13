@@ -135,21 +135,6 @@ pip install -e .
 
 ---
 
-## Task 6 — Add a paper-export script
-
-Figures are generated into `data/output/figures/` (after Task 4) but `paper_appendix/figures/` is always empty. Make the copy explicit and repeatable.
-
-**File to create:** `src/utils/export_paper_figures.py`
-
-This script should:
-1. Read a manifest (a hardcoded list, or a glob pattern) of the specific figure files needed for the paper
-2. Copy them from `data/output/figures/` into `paper_appendix/figures/`
-3. Print a summary of what was copied / what was missing
-
-**Guardrail:** The script must be non-destructive — use `shutil.copy2` (not move). Never delete the source files.
-
----
-
 
 ## Final structure after all tasks are complete
 
