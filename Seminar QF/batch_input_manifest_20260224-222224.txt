@@ -1,8 +1,0 @@
-run_id=20260224-222224
-region=us-central1
-bucket=seminar-qf-batch-data-001
-input_prefix=data/releases/20260224-222224
-output_prefix=output/runs/20260224-222224/results_1k
-regime_file=data/output/daily_asset_returns_with_regime_switching.csv
-ms_garch_file=data/output/daily_asset_returns_with_msgarch.csv
-merton_file=data/output/merged_data_with_merton.csv
