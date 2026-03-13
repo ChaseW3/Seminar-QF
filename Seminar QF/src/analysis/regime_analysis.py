@@ -129,13 +129,6 @@ def plot_parameter_comparison(metrics_df: pd.DataFrame, figsize=(14, 5)):
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, axis='y')
 
-    for bars in (bars0, bars1):
-        for bar in bars:
-            h = bar.get_height()
-            fmt = f'{h:.2e}' if abs(h) < 0.001 else f'{h:.4f}'
-            ax.text(bar.get_x() + bar.get_width() / 2, h,
-                    fmt, ha='center', va='bottom', fontsize=8)
-
     if has_nu:
         ax2 = axes[1]
         x2 = np.arange(1)
@@ -147,8 +140,6 @@ def plot_parameter_comparison(metrics_df: pd.DataFrame, figsize=(14, 5)):
         ax2.set_xticklabels(['Nu (df)'], fontsize=12)
         ax2.set_title('Degrees of Freedom', fontsize=13, fontweight='bold')
         ax2.grid(True, alpha=0.3, axis='y')
-        for xp, v in [(x2[0] - width / 2, v0), (x2[0] + width / 2, v1)]:
-            ax2.text(xp, v + 0.5, f'{v:.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
 
     plt.tight_layout()
     plt.show()
@@ -171,9 +162,6 @@ def plot_persistence_and_volatility(metrics_df: pd.DataFrame, figsize=(14, 5)):
     ax.set_title('GARCH Persistence by Regime', fontsize=13, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
-    for bar, v in zip(bars, vals):
-        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.005,
-                f'{v:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     # Unconditional volatility
     ax = axes[1]
@@ -182,10 +170,6 @@ def plot_persistence_and_volatility(metrics_df: pd.DataFrame, figsize=(14, 5)):
     ax.set_ylabel('Unconditional Volatility (%)')
     ax.set_title('Unconditional Volatility by Regime', fontsize=13, fontweight='bold')
     ax.grid(True, alpha=0.3, axis='y')
-    for bar, v in zip(bars, uvols):
-        if not np.isnan(v):
-            ax.text(bar.get_x() + bar.get_width() / 2, v + 0.05,
-                    f'{v:.2f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     plt.tight_layout()
     plt.show()

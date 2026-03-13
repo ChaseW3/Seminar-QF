@@ -69,7 +69,6 @@ NESTED_MODEL_PAIRS = [
     ("merton_mc", "msgarch"),
 ]
 
-
 @dataclass
 class AnalysisConfig:
     tables_dir: Path
@@ -81,7 +80,6 @@ class AnalysisConfig:
     leverage_quantiles: int = 3
     volatility_window_days: int = 63
     period_ranges: dict[str, tuple[str | None, str | None]] | None = None
-
 
 def _normalize_maturity_values(values: list[int | str]) -> list[str]:
     normalized = []
@@ -103,14 +101,12 @@ def _normalize_maturity_values(values: list[int | str]) -> list[str]:
 
     return normalized
 
-
 def _to_selector_list(selector: int | str | list[int | str] | None) -> list[int | str] | None:
     if selector is None:
         return None
     if isinstance(selector, list):
         return selector
     return [selector]
-
 
 def _apply_runtime_filters(
     panel: pd.DataFrame,
@@ -171,7 +167,6 @@ def _apply_runtime_filters(
 
     return filtered, metadata
 
-
 def _to_long_market(cds_market_df: pd.DataFrame) -> pd.DataFrame:
     long_frames = []
     for mat in MATURITIES:
@@ -188,7 +183,6 @@ def _to_long_market(cds_market_df: pd.DataFrame) -> pd.DataFrame:
     market_long["market_spread_bps"] = pd.to_numeric(market_long["market_spread_bps"], errors="coerce")
     return market_long.dropna(subset=["date", "company_cds", "market_spread_bps"])
 
-
 def _load_company_mapping(merton_file: Path) -> pd.DataFrame:
     merton_df = pd.read_csv(merton_file, usecols=["gvkey", "company", "liabilities_total", "asset_value", "mkt_cap", "date"])
     merton_df["date"] = pd.to_datetime(merton_df["date"], errors="coerce")
@@ -203,7 +197,6 @@ def _load_company_mapping(merton_file: Path) -> pd.DataFrame:
 
     cols = ["gvkey", "date", "company", "leverage_ratio"]
     return merton_df[cols].drop_duplicates(subset=["gvkey", "date"])
-
 
 def _load_model_long(model_key: str, spec: dict, calibration_dir: Path) -> pd.DataFrame:
     long_parts = []
@@ -236,7 +229,6 @@ def _load_model_long(model_key: str, spec: dict, calibration_dir: Path) -> pd.Da
     model_long = pd.concat(long_parts, ignore_index=True)
     model_long["model_spread_bps"] = pd.to_numeric(model_long["model_spread_bps"], errors="coerce")
     return model_long.dropna(subset=["gvkey", "date", "model_spread_bps"])
-
 
 # Build the unified panel: merge all model spreads with market CDS data
 def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
@@ -292,7 +284,6 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     panel = panel.sort_values(["gvkey", "maturity", "model", "date"])
 
     return panel
-
 
 # Add day-over-day change columns for model and market spreads
 def add_change_series(panel: pd.DataFrame) -> pd.DataFrame:
@@ -351,7 +342,6 @@ def add_period_and_volatility_regimes(panel: pd.DataFrame, cfg: AnalysisConfig) 
     out["vol_regime"] = out["vol_regime"].fillna("Intermediate Vol")
     return out
 
-
 # Compute RMSE, MAE, bias, and correlation metrics per segment
 def compute_performance_summary(panel: pd.DataFrame, segment_cols: list[str], min_obs: int) -> pd.DataFrame:
     records = []
@@ -387,7 +377,6 @@ def compute_performance_summary(panel: pd.DataFrame, segment_cols: list[str], mi
 
     return pd.DataFrame(records)
 
-
 def rank_models_by_segment(
     perf_df: pd.DataFrame,
     segment_cols: list[str],
@@ -410,7 +399,6 @@ def rank_models_by_segment(
     ranked["metric"] = metric_name
     return ranked
 
-
 def compute_rank_shares(rank_df: pd.DataFrame, segment_cols: list[str]) -> pd.DataFrame:
     if rank_df.empty:
         return pd.DataFrame(columns=segment_cols + ["rank_position", "model_label", "n_rank", "share"])
@@ -418,7 +406,6 @@ def compute_rank_shares(rank_df: pd.DataFrame, segment_cols: list[str]) -> pd.Da
     out = rank_df.groupby(segment_cols + ["rank_position", "model_label"], dropna=False).size().reset_index(name="n_rank")
     out["share"] = out["n_rank"] / out.groupby(segment_cols + ["rank_position"], dropna=False)["n_rank"].transform("sum")
     return out
-
 
 def compute_segment_rank_tables(
     perf_tables: dict[str, tuple[pd.DataFrame, list[str]]],
@@ -446,7 +433,6 @@ def compute_segment_rank_tables(
 
     return rank_tables, rank_share_tables
 
-
 def _write_rank_summary_by_maturity(
     f,
     rank_df: pd.DataFrame,
@@ -473,7 +459,6 @@ def _write_rank_summary_by_maturity(
                 f"{row['model_label']} ({metric_col}={_fmt(row[metric_col])}{unit})\n"
             )
 
-
 def _resolve_hac_lags(n_obs: int, maxlags: int | None = None) -> int:
     if n_obs <= 1:
         return 0
@@ -482,19 +467,12 @@ def _resolve_hac_lags(n_obs: int, maxlags: int | None = None) -> int:
     # Common Newey-West automatic lag rule.
     return max(1, min(int(np.floor(4 * (n_obs / 100) ** (2 / 9))), n_obs - 1))
 
-
 def cw_test_nested(
     benchmark_spread: np.ndarray | pd.Series,
     extended_spread: np.ndarray | pd.Series,
     observed_spread: np.ndarray | pd.Series,
     maxlags: int | None = None,
 ) -> tuple[float, float, int]:
-    """Clark-West test for nested model comparison using HAC/Newey-West variance.
-
-    The null is one-sided: benchmark performs at least as well as extended,
-    i.e., E[f_t] <= 0 where
-    f_t = e_b^2 - [e_e^2 - (s_b - s_e)^2].
-    """
     bench = pd.to_numeric(pd.Series(benchmark_spread), errors="coerce")
     ext = pd.to_numeric(pd.Series(extended_spread), errors="coerce")
     obs = pd.to_numeric(pd.Series(observed_spread), errors="coerce")
@@ -527,37 +505,10 @@ def cw_test_nested(
     pval_one_sided = float(1 - stats.norm.cdf(stat))
     return stat, pval_one_sided, n_eff
 
-
 def pearson_correlation_test(
     observed_changes: np.ndarray | pd.Series,
     model_changes: np.ndarray | pd.Series,
 ) -> tuple[float, float, float, int]:
-    """Pearson correlation test for spread innovations.
-
-    Tests H0: ρ = 0 (correlation equals zero) against H1: ρ ≠ 0 (two-sided).
-    
-    The test statistic is:
-        t = ρ * sqrt(T - 2) / sqrt(1 - ρ²)
-    which follows a Student-t distribution with T - 2 degrees of freedom under H0.
-
-    Parameters
-    ----------
-    observed_changes : array-like
-        Observed CDS spread changes (ΔS^CDS).
-    model_changes : array-like
-        Model-implied spread innovations (Δs̃^(m)).
-
-    Returns
-    -------
-    rho : float
-        Pearson correlation coefficient.
-    t_stat : float
-        Test statistic.
-    pval_two_sided : float
-        Two-sided p-value from Student-t distribution with T-2 df.
-    n_obs : int
-        Number of valid observations.
-    """
     obs = pd.to_numeric(pd.Series(observed_changes), errors="coerce")
     mod = pd.to_numeric(pd.Series(model_changes), errors="coerce")
 
@@ -590,7 +541,6 @@ def pearson_correlation_test(
         pval_two_sided = 2 * (1 - stats.t.cdf(abs(t_stat), df=n - 2))
 
     return float(rho), float(t_stat), float(pval_two_sided), n
-
 
 # Hotelling-Williams test for comparing two dependent correlations with market
 def _hw_corr_diff_test(df: pd.DataFrame, model_a: str, model_b: str) -> tuple[float, float, float, float]:
@@ -627,7 +577,6 @@ def _hw_corr_diff_test(df: pd.DataFrame, model_a: str, model_b: str) -> tuple[fl
     pval = 2 * (1 - stats.norm.cdf(abs(t_hw)))
     return float(t_hw), float(pval), float(r_a), float(r_b)
 
-
 def _sig_stars(p: float) -> str:
     if pd.isna(p):
         return ""
@@ -638,7 +587,6 @@ def _sig_stars(p: float) -> str:
     if p < 0.10:
         return "*"
     return ""
-
 
 # Run Clark-West and Hotelling-Williams tests for nested model pairs within each segment
 def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -729,26 +677,7 @@ def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.D
 
     return pd.DataFrame(cw_rows), pd.DataFrame(hw_rows)
 
-
 def run_pearson_tests(panel: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
-    """Run Pearson correlation tests for each model-maturity combination.
-    
-    Tests whether the correlation between model-implied spread changes and 
-    observed changes is significantly different from zero (H0: ρ = 0).
-
-    Parameters
-    ----------
-    panel : pd.DataFrame
-        Analysis panel with delta_model and delta_market columns.
-    group_cols : list[str]
-        Grouping columns for segmentation (e.g., ['maturity'], ['leverage_group', 'maturity']).
-
-    Returns
-    -------
-    pd.DataFrame
-        Test results with columns: segment columns, maturity, model, model_label,
-        correlation, t_statistic, p_value, n_obs, significance.
-    """
     rows = []
     grouped = panel.groupby(group_cols, dropna=False) if group_cols else [((), panel)]
 
@@ -793,7 +722,6 @@ def run_pearson_tests(panel: pd.DataFrame, group_cols: list[str]) -> pd.DataFram
                 )
 
     return pd.DataFrame(rows)
-
 
 # For each observation, pick the model with lowest absolute error
 def compute_best_model_tables(panel: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -870,7 +798,6 @@ def compute_best_model_tables(panel: pd.DataFrame) -> dict[str, pd.DataFrame]:
         "best_model_by_company": dominant_company,
     }
 
-
 # Identify segments where MS-GARCH has the highest win share
 def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     parts = []
@@ -912,7 +839,6 @@ def compute_msgarch_best_segments(best_tables: dict[str, pd.DataFrame]) -> pd.Da
     msgarch_best = msgarch_best.sort_values(["share", "n_best"], ascending=[False, False])
     return msgarch_best
 
-
 def create_plots(
     panel: pd.DataFrame,
     best_tables: dict[str, pd.DataFrame],
@@ -952,7 +878,7 @@ def create_plots(
             sub = by_year[by_year["best_model_label"] == model_label]
             pivot = sub.pivot_table(index="year", columns="maturity", values="share", aggfunc="mean")
             plt.figure(figsize=(7, 5))
-            sns.heatmap(pivot, annot=True, fmt=".2f", cmap="Blues", vmin=0, vmax=1)
+            sns.heatmap(pivot, annot=False, cmap="Blues", vmin=0, vmax=1)
             plt.title(f"{model_label}: Share of Wins by Year and Maturity")
             plt.xlabel("Maturity")
             plt.ylabel("Year")
@@ -1065,7 +991,7 @@ def create_plots(
             msg["period_vol"] = msg["period"].astype(str) + " | " + msg["vol_regime"].astype(str)
             pivot = msg.pivot_table(index="period_vol", columns="maturity", values="share", aggfunc="mean")
             plt.figure(figsize=(8, max(4, 0.35 * len(pivot))))
-            sns.heatmap(pivot, annot=True, fmt=".2f", cmap="Greens", vmin=0, vmax=1)
+            sns.heatmap(pivot, annot=False, cmap="Greens", vmin=0, vmax=1)
             plt.title(f"{MSGARCH_MODEL_LABEL} Win Share by Period and Volatility Regime")
             plt.xlabel("Maturity")
             plt.ylabel("Period | Volatility")
@@ -1152,7 +1078,6 @@ def create_plots(
             plt.tight_layout()
             plt.savefig(figures_dir / "corr_levels_rank4_share_by_period.png", dpi=220)
             plt.close()
-
 
 def run_model_performance_paper(
     output_dir: Path | None = None,
@@ -1395,7 +1320,6 @@ def run_model_performance_paper(
     print(f"Table outputs saved in: {out_tables_dir}")
     print(f"Figure outputs saved in: {out_figures_dir}")
     return outputs
-
 
 if __name__ == "__main__":
     run_model_performance_paper()

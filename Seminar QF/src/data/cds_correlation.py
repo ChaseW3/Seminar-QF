@@ -8,7 +8,6 @@ try:
 except ImportError:
     from src.utils import config
 
-
 # Company name mapping between model output and CDS market data
 COMPANY_MAPPING = {
     'ADIDAS AG': 'ADIDAS AG',
@@ -47,7 +46,6 @@ COMPANY_MAPPING = {
     'WOLTERS KLUWER NV': 'WOLTERS KLUWER NV',
 }
 
-
 def load_cds_market_data(filepath, maturity):
     # Load CDS market data from an Excel file for a given maturity
     df = pd.read_excel(filepath, header=None)
@@ -81,7 +79,6 @@ def load_cds_market_data(filepath, maturity):
     
     return data_long.dropna(subset=['date', 'company_cds'])
 
-
 def load_all_market_cds_data(input_dir=None):
     # Load and merge all CDS market data
     if input_dir is None:
@@ -103,7 +100,6 @@ def load_all_market_cds_data(input_dir=None):
     print(f"  Combined market CDS data: {len(cds_market)} rows")
     
     return cds_market
-
 
 def calculate_cds_correlations(
     model_cds_file,
@@ -238,7 +234,6 @@ def calculate_cds_correlations(
     
     return merged, metrics, firm_metrics_df
 
-
 def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     # Run the full CDS correlation analysis for all available models
     if output_dir is None:
@@ -268,7 +263,6 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     # Helper function to transform Monte Carlo results to CDS spread format
     def prepare_mc_file(mc_file, spread_col_prefix, output_col_prefix):
-        """Read Monte Carlo file and rename spread columns, converting to basis points."""
         try:
             df = pd.read_csv(mc_file)
             df['date'] = pd.to_datetime(df['date'])
@@ -448,7 +442,6 @@ def run_cds_correlation_analysis(output_dir=None, input_dir=None):
     
     return results
 
-
 def plot_cds_correlations(results, output_dir=None, maturity=5, axis_limit=None):
     # Scatter plots of model-implied vs market CDS spreads for each model
     if output_dir is None:
@@ -506,7 +499,7 @@ def plot_cds_correlations(results, output_dir=None, maturity=5, axis_limit=None)
             
             # Calculate correlation, this uses all data
             corr = valid[model_col].corr(valid[market_col])
-            ax.set_title(f'{model_name}\nCorrelation: {corr:.4f}{label_suffix}', fontsize=10)
+            ax.set_title(f'{model_name}', fontsize=10)
             ax.set_xlabel('Market CDS Spread (bps)')
             ax.set_ylabel('Model CDS Spread (bps)')
             ax.legend(fontsize=8)

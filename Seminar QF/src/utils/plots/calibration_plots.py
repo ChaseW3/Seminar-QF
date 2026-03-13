@@ -64,14 +64,11 @@ def plot_scatter_comparison(
         maxv = axis_limit or max(valid['market'].quantile(0.99), valid[col].quantile(0.99)) * 1.05
         ax.plot([0, maxv], [0, maxv], 'r--', linewidth=1, label='45° line')
 
-        corr = valid['market'].corr(valid[col])
-        rmse = np.sqrt(((valid['market'] - valid[col]) ** 2).mean())
-
         ax.set_xlim(0, maxv)
         ax.set_ylim(0, maxv)
         ax.set_xlabel('Market CDS (bps)')
         ax.set_ylabel(f'{label} CDS (bps)')
-        ax.set_title(f'{label}\nCorr = {corr:.4f}  |  RMSE = {rmse:.1f} bps')
+        ax.set_title(f'{label}')
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.25)
         ax.set_aspect('equal', adjustable='box')
@@ -226,15 +223,8 @@ def plot_mean_median_vs_market(
         ax.plot(daily['date'], daily[f'{agg}_cal'],
                 color='tab:red', linewidth=1.6, label='Calibrated Model', alpha=0.85)
 
-        corr_raw = daily[f'{agg}_market'].corr(daily[f'{agg}_raw'])
-        corr_cal = daily[f'{agg}_market'].corr(daily[f'{agg}_cal'])
-        rmse_raw = np.sqrt(((daily[f'{agg}_market'] - daily[f'{agg}_raw']) ** 2).mean())
-        rmse_cal = np.sqrt(((daily[f'{agg}_market'] - daily[f'{agg}_cal']) ** 2).mean())
-
         ax.set_title(
-            f'{agg.capitalize()} Spreads – {model_name} {maturity}\n'
-            f'Corr (raw/cal): {corr_raw:.3f} / {corr_cal:.3f}  |  '
-            f'RMSE (raw/cal): {rmse_raw:.1f} / {rmse_cal:.1f} bps',
+            f'{agg.capitalize()} Spreads – {model_name} {maturity}',
             fontsize=12, fontweight='bold',
         )
         ax.set_ylabel(f'{agg.capitalize()} CDS Spread (bps)')
@@ -329,11 +319,6 @@ def plot_mean_median_by_leverage(
             n_firms=('gvkey', 'nunique'),
         ).sort_values('date')
 
-        corr_raw = daily['agg_market'].corr(daily['agg_raw'])
-        corr_cal = daily['agg_market'].corr(daily['agg_cal'])
-        rmse_raw = np.sqrt(((daily['agg_market'] - daily['agg_raw']) ** 2).mean())
-        rmse_cal = np.sqrt(((daily['agg_market'] - daily['agg_cal']) ** 2).mean())
-
         ax.plot(daily['date'], daily['agg_market'],
                 color='black', linewidth=2.4, label='Market CDS', alpha=0.85)
         ax.plot(daily['date'], daily['agg_raw'],
@@ -342,9 +327,7 @@ def plot_mean_median_by_leverage(
                 color='tab:red', linewidth=1.6, label='Calibrated Model', alpha=0.85)
 
         ax.set_title(
-            f"{group_name} | Firms={sub['gvkey'].nunique()} | "
-            f"Corr raw/cal: {corr_raw:.3f}/{corr_cal:.3f} | "
-            f"RMSE raw/cal: {rmse_raw:.1f}/{rmse_cal:.1f} bps",
+            f"{group_name}",
             fontsize=11, fontweight='bold',
         )
         ax.set_ylabel(f'{aggregation.capitalize()} CDS (bps)')

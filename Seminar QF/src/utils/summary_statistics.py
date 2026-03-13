@@ -2,16 +2,6 @@ import pandas as pd
 import numpy as np
 
 def calculate_summary_statistics(df, return_col='asset_return_daily'):
-    """
-    Calculate summary statistics for the dataset.
-
-    Args:
-        df (pd.DataFrame): Input dataframe containing firm data and returns.
-        return_col (str): Column name for asset returns.
-
-    Returns:
-        pd.DataFrame: A dataframe containing the calculated statistics.
-    """
     stats = {}
 
     # 1. Number of firms
