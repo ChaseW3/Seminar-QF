@@ -3,7 +3,7 @@ import numpy as np
 from datetime import timedelta
 import numba
 from joblib import Parallel, delayed
-from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
+from src.data.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 # Monte Carlo simulation under Markov-Switching GARCH dynamics, computes default probabilities and CDS-implied spreads
 

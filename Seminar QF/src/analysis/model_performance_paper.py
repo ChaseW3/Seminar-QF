@@ -12,7 +12,7 @@ import statsmodels.api as sm
 from scipy import stats
 
 try:
-    from src.analysis.cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
+    from src.data.cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
     from src.utils import config
 except ImportError:
     from cds_correlation import COMPANY_MAPPING, load_all_market_cds_data

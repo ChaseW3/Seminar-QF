@@ -3,7 +3,7 @@ import numpy as np
 import numba
 from datetime import timedelta
 from joblib import Parallel, delayed
-from src.analysis.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
+from src.data.cds_date_filter import load_allowed_cds_dates, filter_df_to_allowed_dates
 
 # Monte Carlo simulation of asset paths under the classic Merton model (constant volatility).
 # Computes default probabilities and CDS-implied spreads at 1Y/3Y/5Y horizons.
