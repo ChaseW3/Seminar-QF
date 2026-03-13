@@ -523,6 +523,70 @@ def cw_test_nested(
     return stat, pval_one_sided, n_eff
 
 
+def pearson_correlation_test(
+    observed_changes: np.ndarray | pd.Series,
+    model_changes: np.ndarray | pd.Series,
+) -> tuple[float, float, float, int]:
+    """Pearson correlation test for spread innovations.
+
+    Tests H0: ρ = 0 (correlation equals zero) against H1: ρ ≠ 0 (two-sided).
+    
+    The test statistic is:
+        t = ρ * sqrt(T - 2) / sqrt(1 - ρ²)
+    which follows a Student-t distribution with T - 2 degrees of freedom under H0.
+
+    Parameters
+    ----------
+    observed_changes : array-like
+        Observed CDS spread changes (ΔS^CDS).
+    model_changes : array-like
+        Model-implied spread innovations (Δs̃^(m)).
+
+    Returns
+    -------
+    rho : float
+        Pearson correlation coefficient.
+    t_stat : float
+        Test statistic.
+    pval_two_sided : float
+        Two-sided p-value from Student-t distribution with T-2 df.
+    n_obs : int
+        Number of valid observations.
+    """
+    obs = pd.to_numeric(pd.Series(observed_changes), errors="coerce")
+    mod = pd.to_numeric(pd.Series(model_changes), errors="coerce")
+
+    # Align series and remove missing values
+    valid = ~(obs.isna() | mod.isna())
+    obs = obs[valid]
+    mod = mod[valid]
+
+    n = len(obs)
+    if n < 3:
+        return np.nan, np.nan, np.nan, n
+
+    # Pearson correlation coefficient
+    rho = obs.corr(mod)
+    if pd.isna(rho):
+        return np.nan, np.nan, np.nan, n
+
+    # t-statistic: t = ρ * sqrt(T - 2) / sqrt(1 - ρ²)
+    denom = np.sqrt(1 - rho ** 2)
+    if denom == 0 or np.isnan(denom):
+        # Perfect correlation
+        t_stat = np.inf if rho > 0 else -np.inf
+    else:
+        t_stat = rho * np.sqrt(n - 2) / denom
+
+    # Two-sided p-value from Student-t distribution with n-2 df
+    if pd.isna(t_stat) or np.isinf(t_stat):
+        pval_two_sided = 0.0 if np.isinf(t_stat) else np.nan
+    else:
+        pval_two_sided = 2 * (1 - stats.t.cdf(abs(t_stat), df=n - 2))
+
+    return float(rho), float(t_stat), float(pval_two_sided), n
+
+
 # Hotelling-Williams test for comparing two dependent correlations with market
 def _hw_corr_diff_test(df: pd.DataFrame, model_a: str, model_b: str) -> tuple[float, float, float, float]:
     wide = df.pivot_table(
@@ -659,6 +723,71 @@ def run_pairwise_tests(panel: pd.DataFrame, group_cols: list[str]) -> tuple[pd.D
                 )
 
     return pd.DataFrame(cw_rows), pd.DataFrame(hw_rows)
+
+
+def run_pearson_tests(panel: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    """Run Pearson correlation tests for each model-maturity combination.
+    
+    Tests whether the correlation between model-implied spread changes and 
+    observed changes is significantly different from zero (H0: ρ = 0).
+
+    Parameters
+    ----------
+    panel : pd.DataFrame
+        Analysis panel with delta_model and delta_market columns.
+    group_cols : list[str]
+        Grouping columns for segmentation (e.g., ['maturity'], ['leverage_group', 'maturity']).
+
+    Returns
+    -------
+    pd.DataFrame
+        Test results with columns: segment columns, maturity, model, model_label,
+        correlation, t_statistic, p_value, n_obs, significance.
+    """
+    rows = []
+    grouped = panel.groupby(group_cols, dropna=False) if group_cols else [((), panel)]
+
+    for keys, grp in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        segment = {k: v for k, v in zip(group_cols, keys)}
+
+        # For each maturity and model combo
+        for maturity in grp["maturity"].dropna().unique():
+            grp_mat = grp[grp["maturity"] == maturity]
+            valid_data = grp_mat[["delta_market", "delta_model", "model", "model_label"]].dropna()
+
+            if valid_data.empty:
+                continue
+
+            for model_key, model_label in valid_data[["model", "model_label"]].drop_duplicates().values:
+                model_data = valid_data[valid_data["model"] == model_key]
+                if len(model_data) < 30:
+                    continue
+
+                rho, t_stat, pval, n_obs = pearson_correlation_test(
+                    observed_changes=model_data["delta_market"].to_numpy(),
+                    model_changes=model_data["delta_model"].to_numpy(),
+                )
+
+                if pd.isna(rho):
+                    continue
+
+                rows.append(
+                    {
+                        **segment,
+                        "maturity": maturity,
+                        "model": model_key,
+                        "model_label": model_label,
+                        "correlation": rho,
+                        "t_statistic": t_stat,
+                        "p_value": pval,
+                        "n_obs": int(n_obs),
+                        "significance": _sig_stars(pval),
+                    }
+                )
+
+    return pd.DataFrame(rows)
 
 
 # For each observation, pick the model with lowest absolute error
@@ -1137,6 +1266,21 @@ def run_model_performance_paper(
     hw_period.to_csv(out_dir / "hw_tests_by_period.csv", index=False)
     hw_vol.to_csv(out_dir / "hw_tests_by_volatility.csv", index=False)
     hw_period_vol.to_csv(out_dir / "hw_tests_by_period_volatility.csv", index=False)
+
+    print("Running Pearson correlation significance tests...")
+    pc_overall = run_pearson_tests(panel, group_cols=[])
+    pc_lev = run_pearson_tests(panel, group_cols=["leverage_group"])
+    pc_year = run_pearson_tests(panel, group_cols=["year"])
+    pc_period = run_pearson_tests(panel, group_cols=["period"])
+    pc_vol = run_pearson_tests(panel, group_cols=["vol_regime"])
+    pc_period_vol = run_pearson_tests(panel, group_cols=["period", "vol_regime"])
+
+    pc_overall.to_csv(out_dir / "pearson_tests_overall.csv", index=False)
+    pc_lev.to_csv(out_dir / "pearson_tests_by_leverage.csv", index=False)
+    pc_year.to_csv(out_dir / "pearson_tests_by_year.csv", index=False)
+    pc_period.to_csv(out_dir / "pearson_tests_by_period.csv", index=False)
+    pc_vol.to_csv(out_dir / "pearson_tests_by_volatility.csv", index=False)
+    pc_period_vol.to_csv(out_dir / "pearson_tests_by_period_volatility.csv", index=False)
 
     print("Creating publication-quality figures...")
     create_plots(panel, best_tables, out_dir, rank_share_tables=rank_share_tables)
