@@ -4,8 +4,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from typing import Dict, Optional, List
 
-# Plotting for the affine calibration module
-
 
 def plot_timeseries(
     cal_df: pd.DataFrame,
@@ -17,7 +15,6 @@ def plot_timeseries(
     # Time-series for market, raw-model, and calibrated spreads for one firm
     firm = cal_df[cal_df['gvkey'] == gvkey].sort_values('date').copy()
     if firm.empty:
-        print(f"No data for gvkey {gvkey}")
         return
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -90,7 +87,6 @@ def plot_rolling_betas(
     # Line plots of cross-sectional median betas over time with IQR bands
     valid = cal_df.dropna(subset=['beta0', 'beta1'])
     if valid.empty:
-        print("No calibration parameters to plot.")
         return
 
     daily = valid.groupby('date').agg(
@@ -105,7 +101,6 @@ def plot_rolling_betas(
 
     fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True)
 
-    # β₀
     ax = axes[0]
     ax.plot(daily['date'], daily['b0_median'], color='tab:blue', label='Median β₀')
     ax.fill_between(daily['date'], daily['b0_q25'], daily['b0_q75'], alpha=0.2, color='tab:blue')
@@ -115,7 +110,6 @@ def plot_rolling_betas(
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # β₁
     ax = axes[1]
     ax.plot(daily['date'], daily['b1_median'], color='tab:orange', label='Median β₁')
     ax.fill_between(daily['date'], daily['b1_q25'], daily['b1_q75'], alpha=0.2, color='tab:orange')
@@ -137,7 +131,7 @@ def plot_rmse_comparison(
     figsize: tuple = (12, 5),
     save_path: Optional[str] = None,
 ):
-    # Grouped bar chart for RMSE raw vs callibrated for each model and maturity
+    # Grouped bar chart for RMSE raw vs calibrated for each model and maturity
     rows = []
     for model, mats in metrics_dict.items():
         for mat, m in mats.items():
@@ -179,7 +173,7 @@ def plot_rmse_comparison(
 def metrics_summary_table(
     metrics_dict: Dict[str, Dict[str, Dict[str, float]]],
 ) -> pd.DataFrame:
-    # Build dataset of all evaluation metrics
+    # Build a dataset of all evaluation metrics
     rows = []
     for model, mats in metrics_dict.items():
         for mat, m in mats.items():
@@ -199,7 +193,6 @@ def plot_mean_median_vs_market(
     # Time series cross-sectional mean and median of calibrated, raw and market spreads
     valid = cal_df.dropna(subset=['calibrated', 'market']).copy()
     if valid.empty:
-        print("No valid calibrated data to plot.")
         return
 
     valid['date'] = pd.to_datetime(valid['date'])
@@ -245,7 +238,7 @@ def _assign_leverage_groups(
     leverage_metric: str = 'debt_to_equity',
     n_groups: int = 3,
 ) -> tuple:
-    # Attach a leverage_group column to cal_df using firm-level leverage from the Merton file
+    # Attach a leverage_group column using firm-level leverage from the Merton file
     lev_df = pd.read_csv(merton_file, parse_dates=['date'])
     required = ['gvkey', 'date', 'liabilities_total', 'mkt_cap', 'asset_value']
     lev_df = lev_df[[c for c in required if c in lev_df.columns]].copy()
@@ -257,13 +250,11 @@ def _assign_leverage_groups(
         lev_df['leverage_value'] = lev_df['liabilities_total'] / lev_df['asset_value'].replace(0, np.nan)
         leverage_label = 'Debt / Assets'
 
-    # Median leverage per firm
     firm_lev = (
         lev_df.dropna(subset=['leverage_value'])
         .groupby('gvkey', as_index=False)['leverage_value']
         .median()
     )
-    # Quantile-based groups
     quantiles = np.linspace(0, 1, n_groups + 1)
     edges = np.unique(firm_lev['leverage_value'].quantile(quantiles).values)
     actual = len(edges) - 1
@@ -301,7 +292,6 @@ def plot_mean_median_by_leverage(
     groups_present = [g for g in group_names if g in merged['leverage_group'].unique()]
     n_panels = len(groups_present)
     if n_panels == 0:
-        print("No data with leverage groups available.")
         return
 
     fig, axes = plt.subplots(n_panels, 1,
@@ -344,13 +334,3 @@ def plot_mean_median_by_leverage(
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
-
-    # Print leverage group
-    firm_info = merged[['gvkey', 'company', 'leverage_group', 'leverage_value']].drop_duplicates('gvkey')
-    firm_info = firm_info.sort_values(['leverage_group', 'leverage_value'])
-    print(f"\nFirm membership ({leverage_label}):")
-    for gn in groups_present:
-        g = firm_info[firm_info['leverage_group'] == gn]
-        print(f"\n  {gn}  ({len(g)} firms)")
-        for _, r in g.iterrows():
-            print(f"    gvkey={r['gvkey']}  {r.get('company',''):<35s}  leverage={r['leverage_value']:.4f}")

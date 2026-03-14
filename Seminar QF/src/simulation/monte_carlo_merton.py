@@ -75,7 +75,7 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
         # Initialize log-asset paths for all simulations
         log_asset = np.full(num_simulations, log_v0)
         
-        # Daily risk-neutral drift: constant for Merton (r/252 − 0.5σ²)
+        # Daily risk-neutral drift
         if valid_rf:
             rf_daily = rf_rate / 252.0
         else:
@@ -90,13 +90,13 @@ def simulate_merton_pd_spreads_jit(sigma_daily_arr,
             # Draw standard normal innovations
             z = np.random.standard_normal(num_simulations)
             
-            # Truncate at ±5σ to prevent extreme tail draws
+            # Truncate at +/-5 sigma to prevent extreme tail draws
             z = np.clip(z, -5.0, 5.0)
             
             # Update asset paths, constant volatility version
             eps = sigma * z
             
-            # Risk-neutral dynamics: log(V_t+1) = log(V_t) + drift + σ·Z
+            # Risk-neutral dynamics
             log_asset += drift_daily + eps
             
             # Check if today is a horizon date, record defaults and payoffs

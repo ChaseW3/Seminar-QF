@@ -7,9 +7,8 @@ from scipy.optimize import minimize
 from scipy.special import expit
 from numba import njit
 import sys
-# Parallel imports removed — overhead exceeds benefit for this model size
-# from joblib import Parallel, delayed
-# import multiprocessing
+
+
 
 # Import config for output paths
 try:
@@ -23,7 +22,7 @@ TABLES_DIR.mkdir(parents=True, exist_ok=True)
 
 @njit(cache=True)
 def _numba_gammaln(x):
-    # Lanczos approximation — needed because scipy.special is not available inside numba JIT
+    # Lanczos approximation 
     g = 7
     c = np.array([
         0.99999999999980993, 676.5203681218851, -1259.1392167224028,
@@ -48,8 +47,7 @@ def _t_log_likelihood(x, nu, sigma2):
 
 @njit(cache=True)
 def hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
-    # Hamilton filter forward pass — returns LL, filtered probs, and predicted probs.
-    # Predicted probs are kept because the Kim smoother needs them for the backward pass.
+    # Hamilton filter forward pass, returns LL, filtered probs, and predicted probs
     T = len(returns)
     filtered_prob = np.zeros((T, 2))
     predicted_prob = np.zeros((T, 2))
@@ -106,14 +104,13 @@ def hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, 
 
 @njit(cache=True)
 def hamilton_filter_t_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1):
-    # Thin wrapper that drops the predicted probs — kept for any callers that only need LL + filtered
+    # Thin wrapper that drops the predicted probs, kept for any callers that only need LL and filtered
     ll, filt, _ = hamilton_filter_t_details_jit(returns, mu_0, mu_1, sigma2_0, sigma2_1, p00, p11, nu_0, nu_1)
     return ll, filt
 
 @njit(cache=True)
 def kim_smoother_t_jit(filtered_prob, predicted_prob, p00, p11):
-    # Kim smoother backward pass — gives P(S_t = i | all data), which is sharper
-    # than filtered probs because it uses future information
+    # Kim smoother backward pass
     T = filtered_prob.shape[0]
     smoothed_prob = np.zeros((T, 2))
     
@@ -177,7 +174,7 @@ def calculate_expected_transitions_jit(smoothed_prob, filtered_prob, predicted_p
 @njit(cache=True)
 def _t_log_likelihood_sum(params_arr, returns, weights):
     # Weighted negative log-likelihood for one regime's emission distribution.
-    # params_arr = [mu, log_sigma2, log(nu-2)] — log-parameterised so optimizer is unconstrained
+
     mu = params_arr[0]
     sigma2 = np.exp(params_arr[1])
     nu = 2.0 + np.exp(params_arr[2])
@@ -196,7 +193,7 @@ def _t_log_likelihood_sum(params_arr, returns, weights):
 
 class MarkovSwitchingTDist:
     # Two-regime Hamilton filter with t-distributed emissions, fitted by EM.
-    # Regime 0 is low-vol, regime 1 is high-vol — enforced by a label-swap at the end.
+    # Regime 0 is low-vol, regime 1 is high-vol
     
     def __init__(self):
         self.params = {}
@@ -288,7 +285,7 @@ class MarkovSwitchingTDist:
                     np.log(max(current_nu - 2.0, 1e-4))
                 ])
                 
-                # log_sigma2 capped at 3 ≈ exp(3) ≈ daily vol of ~4.5% unscaled; nu kept in [~2.1, 200]
+                
                 b_regime = [
                     (None, None), # mu
                     (-15, 3),     # log_sigma2
@@ -394,10 +391,8 @@ def _process_single_firm(gvkey, firm_df):
         
         # Scale returns by 100 for numerical stability; params are unscaled before saving
         if scaled_available:
-            # already scaled — just remember to unscale when storing
             calc_scale_factor = 100.0
         else:
-            # raw scale — scale up now, unscale when storing
             returns = returns * 100.0
             calc_scale_factor = 100.0
         

@@ -137,11 +137,11 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
                 t_sample = z / np.sqrt(v / nu) * t_factor
             
 
-            # Truncate innovations at ±5σ to prevent extreme tail draws
+            # Truncate innovations at +/-5 sigma to prevent extreme tail draws
             t_sample = np.clip(t_sample, -5.0, 5.0)
             eps = sigma * t_sample
 
-            # Risk-neutral asset dynamics: log(V_t+1) = log(V_t) + (r - 0.5σ²) + σ·Z
+            # Risk-neutral asset dynamics
             drift = rf_daily - 0.5 * sigma2
             log_asset += drift + eps
             
@@ -160,7 +160,7 @@ def simulate_garch_pd_spreads_t_jit(omega_arr, alpha_arr, beta_arr,
                 payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)
             
-            # Update GARCH variance: σ²_{t+1} = ω + α·ε² + β·σ²_t
+            # Update GARCH variance
             sigma2 = omega + alpha * eps**2 + beta * sigma2
             sigma2 = np.minimum(sigma2, SIGMA2_MAX_DAILY)
             sigma2 = np.maximum(sigma2, 1e-12)
