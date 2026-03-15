@@ -31,39 +31,39 @@ MODEL_SPECS = {
         "calibrated_file_prefix": "calibrated_spreads_merton",
         "mc_file": "daily_monte_carlo_merton_results.csv",
         "pd_prefix": "merton_mc_pd",
-        "label": "Merton Calibrated",
+        "label": "Merton",
     },
     "garch": {
         "calibrated_file_prefix": "calibrated_spreads_garch",
         "mc_file": "daily_monte_carlo_garch_results.csv",
         "pd_prefix": "mc_garch_pd",
-        "label": "GARCH Calibrated",
+        "label": "GARCH",
     },
     "rs": {
         "calibrated_file_prefix": "calibrated_spreads_regime_switching",
         "mc_file": "daily_monte_carlo_regime_switching_results.csv",
         "pd_prefix": "rs_pd",
-        "label": "Regime-Switching Calibrated",
+        "label": "Regime-Switching",
     },
     "msgarch": {
         "calibrated_file_prefix": "calibrated_spreads_ms_garch",
         "mc_file": "daily_monte_carlo_ms_garch_results.csv",
         "pd_prefix": "mc_ms_garch_pd",
-        "label": "MS-GARCH Calibrated",
+        "label": "MS-GARCH",
     },
 }
 
 MODEL_LABEL_ORDER = [
-    "GARCH Calibrated",
-    "MS-GARCH Calibrated",
-    "Merton Calibrated",
-    "Regime-Switching Calibrated",
+    "GARCH",
+    "MS-GARCH",
+    "Merton",
+    "Regime-Switching",
 ]
 MODEL_COLORS = {
-    "GARCH Calibrated": "#4C72B0",
-    "MS-GARCH Calibrated": "#DD8452",
-    "Merton Calibrated": "#55A868",
-    "Regime-Switching Calibrated": "#C44E52",
+    "GARCH": "#4C72B0",
+    "MS-GARCH": "#DD8452",
+    "Merton": "#55A868",
+    "Regime-Switching": "#C44E52",
 }
 MSGARCH_MODEL_LABEL = MODEL_SPECS["msgarch"]["label"]
 NESTED_MODEL_PAIRS = [
@@ -80,6 +80,7 @@ class AnalysisConfig:
     figures_dir: Path
     calibration_dir: Path
     input_dir: Path
+    pd_data_dir: Path
     min_obs_segment: int = 60
     min_obs_firm: int = 60
     leverage_quantiles: int = 3
@@ -235,16 +236,12 @@ def _load_model_long(model_key: str, spec: dict, calibration_dir: Path) -> pd.Da
     model_long["model_spread_bps"] = pd.to_numeric(model_long["model_spread_bps"], errors="coerce")
     return model_long.dropna(subset=["gvkey", "date", "model_spread_bps"])
 
-def _resolve_existing_file(candidates: list[Path], file_name: str) -> Path:
-    for base in candidates:
-        candidate = Path(base) / file_name
-        if candidate.exists():
-            return candidate
-    tried = "\n".join(str(Path(base) / file_name) for base in candidates)
-    raise FileNotFoundError(f"Could not locate {file_name}. Tried:\n{tried}")
-
-def _load_model_pd_long(model_key: str, spec: dict, data_dirs: list[Path]) -> pd.DataFrame:
-    mc_file = _resolve_existing_file(data_dirs, spec["mc_file"])
+def _load_model_pd_long(model_key: str, spec: dict, pd_data_dir: Path) -> pd.DataFrame:
+    mc_file = Path(pd_data_dir) / spec["mc_file"]
+    if not mc_file.exists():
+        raise FileNotFoundError(
+            f"Missing non-calibrated Monte Carlo PD file for {model_key}: {mc_file}"
+        )
     df = pd.read_csv(mc_file)
 
     if "gvkey" not in df.columns or "date" not in df.columns:
@@ -288,13 +285,11 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     company_static = company_map[["gvkey", "company"]].drop_duplicates(subset=["gvkey"])
     company_static["company_cds"] = company_static["company"].map(COMPANY_MAPPING)
 
-    data_dirs = [cfg.calibration_dir.parent, cfg.tables_dir, cfg.tables_dir.parent]
-
     panel_parts = []
     for model_key, spec in MODEL_SPECS.items():
         print(f"  - Loading {spec['label']}...")
         model_long = _load_model_long(model_key, spec, cfg.calibration_dir)
-        model_pd_long = _load_model_pd_long(model_key, spec, data_dirs)
+        model_pd_long = _load_model_pd_long(model_key, spec, cfg.pd_data_dir)
         if not model_pd_long.empty:
             model_long = model_long.merge(
                 model_pd_long,
@@ -1175,10 +1170,12 @@ def run_model_performance_paper(
         tables_dir = config.TABLES_DIR
         figures_dir = config.FIGURES_DIR
         calibration_dir = config.CALIBRATION_DIR
+        pd_data_dir = config.OUTPUT_DIR
     else:
         tables_dir = Path(output_dir)
         figures_dir = Path(output_dir) / "figures"
         calibration_dir = Path(output_dir) / "calibration"
+        pd_data_dir = Path(output_dir)
     if input_dir is None:
         input_dir = config.INPUT_DIR
 
@@ -1187,6 +1184,7 @@ def run_model_performance_paper(
         figures_dir=Path(figures_dir),
         calibration_dir=Path(calibration_dir),
         input_dir=Path(input_dir),
+        pd_data_dir=Path(pd_data_dir),
         period_ranges=period_ranges,
     )
     out_tables_dir = cfg.tables_dir / save_subdir
