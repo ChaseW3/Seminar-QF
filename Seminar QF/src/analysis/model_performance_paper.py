@@ -1156,6 +1156,129 @@ def create_plots(
             plt.savefig(figures_dir / "corr_levels_rank4_share_by_period.png", dpi=220)
             plt.close()
 
+def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> None:
+    # Build line diagrams from saved output tables so visuals can be recreated from outputs alone.
+    sns.set_theme(style="whitegrid")
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    period_order = ["Pre-COVID", "COVID Shock", "Recovery", "Post-Recovery"]
+    leverage_order = ["Low Leverage", "Mid Leverage", "High Leverage"]
+
+    perf_year_path = tables_dir / "performance_by_year.csv"
+    if perf_year_path.exists():
+        perf_year = pd.read_csv(perf_year_path)
+        if not perf_year.empty:
+            g = sns.relplot(
+                data=perf_year,
+                x="year",
+                y="rmse_bps",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Year", "RMSE (bps)")
+            g.fig.suptitle("RMSE by Year (From Output Tables)", y=1.02)
+            g.savefig(figures_dir / "line_rmse_by_year_from_outputs.png", dpi=220)
+            plt.close("all")
+
+            g = sns.relplot(
+                data=perf_year,
+                x="year",
+                y="corr_levels",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": True},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Year", "Correlation (Levels)")
+            g.fig.suptitle("Correlation (Levels) by Year (From Output Tables)", y=1.02)
+            g.savefig(figures_dir / "line_corr_levels_by_year_from_outputs.png", dpi=220)
+            plt.close("all")
+
+    pd_year_path = tables_dir / "pd_by_year.csv"
+    if pd_year_path.exists():
+        pd_year = pd.read_csv(pd_year_path)
+        if not pd_year.empty:
+            g = sns.relplot(
+                data=pd_year,
+                x="year",
+                y="mean_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Year", "Mean PD (%)")
+            g.fig.suptitle("Mean PD by Year (From Output Tables)", y=1.02)
+            g.savefig(figures_dir / "line_mean_pd_by_year_from_outputs.png", dpi=220)
+            plt.close("all")
+
+    pd_period_path = tables_dir / "pd_by_period.csv"
+    if pd_period_path.exists():
+        pd_period = pd.read_csv(pd_period_path)
+        if not pd_period.empty:
+            pd_period["period"] = pd.Categorical(pd_period["period"], categories=period_order, ordered=True)
+            g = sns.relplot(
+                data=pd_period.sort_values(["period", "maturity"]),
+                x="period",
+                y="mean_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Period", "Mean PD (%)")
+            for ax in g.axes.flat:
+                ax.tick_params(axis="x", rotation=20)
+            g.fig.suptitle("Mean PD by Period (From Output Tables)", y=1.04)
+            g.savefig(figures_dir / "line_mean_pd_by_period_from_outputs.png", dpi=220)
+            plt.close("all")
+
+    pd_lev_path = tables_dir / "pd_by_leverage.csv"
+    if pd_lev_path.exists():
+        pd_lev = pd.read_csv(pd_lev_path)
+        if not pd_lev.empty:
+            pd_lev["leverage_group"] = pd.Categorical(pd_lev["leverage_group"], categories=leverage_order, ordered=True)
+            g = sns.relplot(
+                data=pd_lev.sort_values(["leverage_group", "maturity"]),
+                x="leverage_group",
+                y="mean_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Leverage Group", "Mean PD (%)")
+            g.fig.suptitle("Mean PD by Leverage Group (From Output Tables)", y=1.03)
+            g.savefig(figures_dir / "line_mean_pd_by_leverage_from_outputs.png", dpi=220)
+            plt.close("all")
+
 def run_model_performance_paper(
     output_dir: Path | None = None,
     input_dir: Path | None = None,
@@ -1323,6 +1446,9 @@ def run_model_performance_paper(
 
     print("Creating publication-quality figures...")
     create_plots(panel, best_tables, out_figures_dir, rank_share_tables=rank_share_tables)
+
+    print("Creating line diagrams from output tables...")
+    create_line_diagrams_from_outputs(out_tables_dir, out_figures_dir)
 
     print("Writing concise text summary...")
     with open(out_tables_dir / "analysis_summary.txt", "w", encoding="utf-8") as f:
