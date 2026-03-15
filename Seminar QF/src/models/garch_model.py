@@ -15,7 +15,7 @@ except ImportError:
 TABLES_DIR.mkdir(parents=True, exist_ok=True)
 
 def sanitize_garch_params(params_row):
-    # Clean up estimated GARCH params before saving — clips/repairs values that would
+    # Clean up estimated GARCH params before saving, clips/repairs values that would
     # break the Monte Carlo or produce economically nonsensical simulations
     p = params_row.copy()
     flags = []
@@ -50,7 +50,7 @@ def sanitize_garch_params(params_row):
         flags.append('clipped_beta_zero')
         is_repaired = True
         
-    # Flag very low beta — implies almost no volatility memory, likely an unstable fit
+    # Flag very low beta, implies almost no volatility memory
     min_beta = 0.05
     if p['beta'] < min_beta:
         flags.append('low_beta_warning')
@@ -88,7 +88,7 @@ def sanitize_garch_params(params_row):
 
 def run_garch_estimation(daily_returns_df):
     # Fit a rolling GARCH(1,1)-t on daily asset returns, one 252-day window per month per firm.
-    # Returns are scaled ×100 before fitting for numerical stability, then parameters are
+    # Returns are scaled x100 before fitting for numerical stability, then parameters are
     # rescaled back to decimal units before saving.
     print("Estimating GARCH(1,1)-t on daily asset returns")
     
@@ -174,7 +174,7 @@ def run_garch_estimation(daily_returns_df):
             try:
                 diag_total += 1
                 
-                # GARCH(1,1) with Student-t — arch enforces alpha+beta < 1 by default
+                # GARCH(1,1) with Student-t, arch enforces alpha+beta < 1 by default
                 am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
                 
                 # Warm start from last window if available
@@ -206,7 +206,7 @@ def run_garch_estimation(daily_returns_df):
                 beta = beta_est
                 nu = nu_est
                 
-                # Last conditional vol is in scaled units — divide to get decimal daily vol
+                # Last conditional vol is in scaled units, divide to get decimal daily vol
                 last_cond_vol_scaled = res.conditional_volatility[-1]
                 sigma0 = last_cond_vol_scaled / SCALE_FACTOR
                 
@@ -245,7 +245,6 @@ def run_garch_estimation(daily_returns_df):
                 last_params = res.params
                 
             except Exception as e:
-                # print(f"Error estimating GARCH for {gvkey} on {date_point}: {e}")
                 continue
 
     print("\nGARCH estimation diagnostics:")
@@ -293,7 +292,7 @@ def run_garch_estimation(daily_returns_df):
         fill_cols = ['garch_omega', 'garch_alpha', 'garch_beta', 'garch_nu', 'garch_mu_daily', 'garch_sigma0']
         df_out[fill_cols] = df_out.groupby('gvkey')[fill_cols].ffill()
         
-        # Calculate daily volatility for convenience — prefer last conditional vol,
+        # Calculate daily volatility for convenience, prefer last conditional vol,
         # fall back to unconditional sqrt(omega/(1-a-b)) where sigma0 is missing
         df_out['garch_volatility'] = df_out['garch_sigma0']
         

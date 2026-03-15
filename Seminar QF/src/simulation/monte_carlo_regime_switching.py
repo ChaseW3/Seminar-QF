@@ -39,7 +39,7 @@ def simulate_regime_switching_vectorized(
     spread_out = np.full((n_horizons, num_firms), np.nan)
     debt_out = np.full((n_horizons, num_firms), np.nan)
     
-    # Regime fractions: (2, num_firms)
+    # Regime fractions (2, num_firms)
     regime_fractions = np.zeros((2, num_firms))
     
     # Pre-compute which days correspond to output horizons
@@ -183,10 +183,10 @@ def simulate_regime_switching_vectorized(
             # Select innovation based on current regime of each path
             z_t = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
-            # Truncate at ±5σ to prevent extreme tail draws
+            # Truncate at +/-5 sigma to prevent extreme tail draws
             z_t = np.clip(z_t, -5.0, 5.0)
             
-            # Risk-neutral dynamics: log(V_t+1) = log(V_t) + (r - 0.5σ²) + σ·Z
+            # Risk-neutral dynamics
             r_curr = sigma * z_t
             drift = rf_daily - 0.5 * sigma * sigma
             log_asset += drift + r_curr
@@ -201,7 +201,7 @@ def simulate_regime_switching_vectorized(
                 defaults = (log_asset < log_liability_T).astype(np.float64)
                 default_counts[h] = np.sum(defaults)
                 
-                # Payoff = min(asset, liability) — creditor recovery
+                # Payoff = min(asset, liability)
                 asset_T = np.exp(log_asset)
                 payoffs = np.minimum(asset_T, liability_T)
                 payoff_sums[h] = np.sum(payoffs)

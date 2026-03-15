@@ -806,7 +806,7 @@ class MSGARCHOptimized:
         persistence_0 = alpha_0 + beta_0
         persistence_1 = alpha_1 + beta_1
 
-        # Label-switching correction: composite calm-score (vol share + nu share); if >1 regime 0 is actually high-vol → swap
+        # Label-switching correction
         calm_score_0 = uncond_vol_0 / (uncond_vol_0 + uncond_vol_1) + nu_1 / (nu_0 + nu_1)
         if calm_score_0 > 1.0:
             omega_0, omega_1 = omega_1, omega_0
@@ -1140,9 +1140,7 @@ def run_ms_garch_estimation_optimized(data_df,
         params_df = params_df[[c for c in cols if c in params_df.columns]]
         params_df.to_csv(output_path, index=False)
 
-        if verbose:
-            print(f"MS-GARCH parameters saved: {len(params_df)} firm-months → {output_path}")
-
+        
         data_with_vol['date'] = pd.to_datetime(data_with_vol['date'])
         merge_cols = [c for c in params_df.columns if c not in ['gvkey', 'date', 'log_likelihood', 'aic', 'bic', 'n_obs']]
         data_with_vol = data_with_vol.drop(columns=[c for c in merge_cols if c in data_with_vol.columns])

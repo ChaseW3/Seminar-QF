@@ -174,13 +174,13 @@ def simulate_ms_garch_pd_spreads_t_jit(omega_0_arr, omega_1_arr, alpha_0_arr, al
             # Select innovation based on current regime of each path
             t_sample = np.where(regime_1_mask, t_sample_1, t_sample_0)
             
-            # Truncate at ±5σ to prevent extreme tail draws
+            # Truncate at 5 sigma to prevent extreme tail draws
             t_sample = np.clip(t_sample, -5.0, 5.0)
             
             # Update asset paths with regime-specific volatility
             eps = sigma * t_sample
 
-            # Risk-neutral dynamics: log(V_t+1) = log(V_t) + (r - 0.5σ²) + σ·Z
+            # Risk-neutral dynamics
             drift = rf_daily - 0.5 * sigma2
             log_asset += drift + eps
             
