@@ -11,12 +11,9 @@ import seaborn as sns
 import statsmodels.api as sm
 from scipy import stats
 
-try:
-    from src.data.cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
-    from src.utils import config
-except ImportError:
-    from cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
-    from src.utils import config
+from src.data.cds_correlation import COMPANY_MAPPING, load_all_market_cds_data
+from src.utils import config
+
 
 # Compare calibrated Merton, GARCH, Regime-Switching, and MS-GARCH implied spreads
 # against market CDS spreads
@@ -32,18 +29,26 @@ DEFAULT_PERIOD_RANGES = {
 MODEL_SPECS = {
     "merton_mc": {
         "calibrated_file_prefix": "calibrated_spreads_merton",
+        "mc_file": "daily_monte_carlo_merton_results.csv",
+        "pd_prefix": "merton_mc_pd",
         "label": "Merton Calibrated",
     },
     "garch": {
         "calibrated_file_prefix": "calibrated_spreads_garch",
+        "mc_file": "daily_monte_carlo_garch_results.csv",
+        "pd_prefix": "mc_garch_pd",
         "label": "GARCH Calibrated",
     },
     "rs": {
         "calibrated_file_prefix": "calibrated_spreads_regime_switching",
+        "mc_file": "daily_monte_carlo_regime_switching_results.csv",
+        "pd_prefix": "rs_pd",
         "label": "Regime-Switching Calibrated",
     },
     "msgarch": {
         "calibrated_file_prefix": "calibrated_spreads_ms_garch",
+        "mc_file": "daily_monte_carlo_ms_garch_results.csv",
+        "pd_prefix": "mc_ms_garch_pd",
         "label": "MS-GARCH Calibrated",
     },
 }
@@ -230,6 +235,42 @@ def _load_model_long(model_key: str, spec: dict, calibration_dir: Path) -> pd.Da
     model_long["model_spread_bps"] = pd.to_numeric(model_long["model_spread_bps"], errors="coerce")
     return model_long.dropna(subset=["gvkey", "date", "model_spread_bps"])
 
+def _resolve_existing_file(candidates: list[Path], file_name: str) -> Path:
+    for base in candidates:
+        candidate = Path(base) / file_name
+        if candidate.exists():
+            return candidate
+    tried = "\n".join(str(Path(base) / file_name) for base in candidates)
+    raise FileNotFoundError(f"Could not locate {file_name}. Tried:\n{tried}")
+
+def _load_model_pd_long(model_key: str, spec: dict, data_dirs: list[Path]) -> pd.DataFrame:
+    mc_file = _resolve_existing_file(data_dirs, spec["mc_file"])
+    df = pd.read_csv(mc_file)
+
+    if "gvkey" not in df.columns or "date" not in df.columns:
+        raise ValueError(f"Missing required columns ['gvkey', 'date'] in {mc_file.name}")
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    long_parts = []
+    pd_prefix = spec["pd_prefix"]
+    for mat in MATURITIES:
+        pd_col = f"{pd_prefix}_{mat}y"
+        if pd_col not in df.columns:
+            continue
+        part = df[["gvkey", "date", pd_col]].copy()
+        part = part.rename(columns={pd_col: "model_pd"})
+        part["model"] = model_key
+        part["maturity"] = f"{mat}y"
+        long_parts.append(part)
+
+    if not long_parts:
+        return pd.DataFrame(columns=["gvkey", "date", "model", "maturity", "model_pd"])
+
+    out = pd.concat(long_parts, ignore_index=True)
+    out["model_pd"] = pd.to_numeric(out["model_pd"], errors="coerce")
+    return out.dropna(subset=["gvkey", "date", "model", "maturity", "model_pd"])
+
 # Build the unified panel: merge all model spreads with market CDS data
 def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     print("Loading market CDS data...")
@@ -247,10 +288,21 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     company_static = company_map[["gvkey", "company"]].drop_duplicates(subset=["gvkey"])
     company_static["company_cds"] = company_static["company"].map(COMPANY_MAPPING)
 
+    data_dirs = [cfg.calibration_dir.parent, cfg.tables_dir, cfg.tables_dir.parent]
+
     panel_parts = []
     for model_key, spec in MODEL_SPECS.items():
         print(f"  - Loading {spec['label']}...")
         model_long = _load_model_long(model_key, spec, cfg.calibration_dir)
+        model_pd_long = _load_model_pd_long(model_key, spec, data_dirs)
+        if not model_pd_long.empty:
+            model_long = model_long.merge(
+                model_pd_long,
+                on=["gvkey", "date", "model", "maturity"],
+                how="left",
+            )
+        else:
+            model_long["model_pd"] = np.nan
         model_long = model_long.merge(company_static, on="gvkey", how="left")
         model_long = model_long.merge(company_map[["gvkey", "date", "leverage_ratio"]], on=["gvkey", "date"], how="left")
 
@@ -267,6 +319,8 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
     panel["error_bps"] = panel["market_spread_bps"] - panel["model_spread_bps"]
     panel["abs_error_bps"] = panel["error_bps"].abs()
     panel["sq_error_bps"] = panel["error_bps"] ** 2
+    panel["model_pd"] = pd.to_numeric(panel.get("model_pd", np.nan), errors="coerce")
+    panel["model_pd_pct"] = panel["model_pd"] * 100
     panel["year"] = panel["date"].dt.year
 
     valid_lev = panel["leverage_ratio"].replace([np.inf, -np.inf], np.nan).dropna()
@@ -371,6 +425,34 @@ def compute_performance_summary(panel: pd.DataFrame, segment_cols: list[str], mi
                 "bias_bps": bias,
                 "corr_levels": corr_lvl,
                 "corr_changes": corr_chg,
+            }
+        )
+        records.append(base)
+
+    return pd.DataFrame(records)
+
+def compute_pd_summary(panel: pd.DataFrame, segment_cols: list[str], min_obs: int) -> pd.DataFrame:
+    records = []
+
+    grouped = panel.groupby(segment_cols + ["model", "model_label"], dropna=False)
+    for keys, grp in grouped:
+        pd_data = grp["model_pd"].dropna()
+        if len(pd_data) < min_obs:
+            continue
+
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        base = {k: v for k, v in zip(segment_cols + ["model", "model_label"], keys)}
+        base.update(
+            {
+                "n_obs_pd": int(len(pd_data)),
+                "mean_pd": float(pd_data.mean()),
+                "median_pd": float(pd_data.median()),
+                "std_pd": float(pd_data.std()),
+                "p95_pd": float(pd_data.quantile(0.95)),
+                "mean_pd_pct": float((pd_data * 100).mean()),
+                "median_pd_pct": float((pd_data * 100).median()),
             }
         )
         records.append(base)
@@ -1148,6 +1230,15 @@ def run_model_performance_paper(
     period_vol_perf = compute_performance_summary(panel, ["period", "vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
     firm_perf = compute_performance_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=cfg.min_obs_firm)
 
+    print("Computing PD summary tables...")
+    pd_overall = compute_pd_summary(panel, ["maturity"], min_obs=cfg.min_obs_segment)
+    pd_leverage = compute_pd_summary(panel, ["leverage_group", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_year = compute_pd_summary(panel, ["year", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_period = compute_pd_summary(panel, ["period", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_volatility = compute_pd_summary(panel, ["vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_period_vol = compute_pd_summary(panel, ["period", "vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_firm = compute_pd_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=cfg.min_obs_firm)
+
     overall_perf.to_csv(out_tables_dir / "performance_overall.csv", index=False)
     leverage_perf.to_csv(out_tables_dir / "performance_by_leverage.csv", index=False)
     year_perf.to_csv(out_tables_dir / "performance_by_year.csv", index=False)
@@ -1155,6 +1246,13 @@ def run_model_performance_paper(
     volatility_perf.to_csv(out_tables_dir / "performance_by_volatility.csv", index=False)
     period_vol_perf.to_csv(out_tables_dir / "performance_by_period_volatility.csv", index=False)
     firm_perf.to_csv(out_tables_dir / "performance_by_company.csv", index=False)
+    pd_overall.to_csv(out_tables_dir / "pd_overall.csv", index=False)
+    pd_leverage.to_csv(out_tables_dir / "pd_by_leverage.csv", index=False)
+    pd_year.to_csv(out_tables_dir / "pd_by_year.csv", index=False)
+    pd_period.to_csv(out_tables_dir / "pd_by_period.csv", index=False)
+    pd_volatility.to_csv(out_tables_dir / "pd_by_volatility.csv", index=False)
+    pd_period_vol.to_csv(out_tables_dir / "pd_by_period_volatility.csv", index=False)
+    pd_firm.to_csv(out_tables_dir / "pd_by_company.csv", index=False)
 
     perf_tables = {
         "overall": (overall_perf, ["maturity"]),
@@ -1255,6 +1353,17 @@ def run_model_performance_paper(
                         f"Corr(levels)={row['corr_levels']:.3f}, Corr(changes)={row['corr_changes']:.3f}\n"
                     )
 
+            if not pd_overall.empty:
+                f.write("\nOverall PD by maturity and model:\n")
+                for mat in sorted(pd_overall["maturity"].unique()):
+                    sub = pd_overall[pd_overall["maturity"] == mat].sort_values("mean_pd")
+                    f.write(f"\n{mat}:\n")
+                    for _, row in sub.iterrows():
+                        f.write(
+                            f"  - {row['model_label']}: Mean PD={row['mean_pd_pct']:.3f}%, "
+                            f"Median PD={row['median_pd_pct']:.3f}%, P95 PD={row['p95_pd']*100:.3f}%\n"
+                        )
+
         if not best_tables["best_model_share_overall"].empty:
             f.write("\nBest-model share by maturity:\n")
             for mat in sorted(best_tables["best_model_share_overall"]["maturity"].unique()):
@@ -1303,6 +1412,13 @@ def run_model_performance_paper(
         "volatility": out_tables_dir / "performance_by_volatility.csv",
         "period_volatility": out_tables_dir / "performance_by_period_volatility.csv",
         "firm": out_tables_dir / "performance_by_company.csv",
+        "pd_overall": out_tables_dir / "pd_overall.csv",
+        "pd_leverage": out_tables_dir / "pd_by_leverage.csv",
+        "pd_year": out_tables_dir / "pd_by_year.csv",
+        "pd_period": out_tables_dir / "pd_by_period.csv",
+        "pd_volatility": out_tables_dir / "pd_by_volatility.csv",
+        "pd_period_volatility": out_tables_dir / "pd_by_period_volatility.csv",
+        "pd_firm": out_tables_dir / "pd_by_company.csv",
         "msgarch_best": out_tables_dir / "msgarch_best_segments.csv",
         "rank_manifest": out_tables_dir / "rank_tables_manifest.csv",
         "rank_rmse_overall": out_tables_dir / "rank_rmse_bps_overall.csv",
