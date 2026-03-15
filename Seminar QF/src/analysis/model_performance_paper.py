@@ -1229,6 +1229,46 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
             g.savefig(figures_dir / "line_mean_pd_by_year_from_outputs.png", dpi=220)
             plt.close("all")
 
+            g = sns.relplot(
+                data=pd_year,
+                x="year",
+                y="median_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Year", "Median PD (%)")
+            g.fig.suptitle("Median PD by Year (From Output Tables)", y=1.02)
+            g.savefig(figures_dir / "line_median_pd_by_year_from_outputs.png", dpi=220)
+            plt.close("all")
+
+            pd_year = pd_year.copy()
+            pd_year["std_pd_pct"] = pd.to_numeric(pd_year["std_pd"], errors="coerce") * 100
+            g = sns.relplot(
+                data=pd_year,
+                x="year",
+                y="std_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Year", "PD Std Dev (%)")
+            g.fig.suptitle("PD Std Dev by Year (From Output Tables)", y=1.02)
+            g.savefig(figures_dir / "line_std_pd_by_year_from_outputs.png", dpi=220)
+            plt.close("all")
+
     pd_period_path = tables_dir / "pd_by_period.csv"
     if pd_period_path.exists():
         pd_period = pd.read_csv(pd_period_path)
@@ -1255,6 +1295,50 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
             g.savefig(figures_dir / "line_mean_pd_by_period_from_outputs.png", dpi=220)
             plt.close("all")
 
+            g = sns.relplot(
+                data=pd_period.sort_values(["period", "maturity"]),
+                x="period",
+                y="median_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Period", "Median PD (%)")
+            for ax in g.axes.flat:
+                ax.tick_params(axis="x", rotation=20)
+            g.fig.suptitle("Median PD by Period (From Output Tables)", y=1.04)
+            g.savefig(figures_dir / "line_median_pd_by_period_from_outputs.png", dpi=220)
+            plt.close("all")
+
+            pd_period = pd_period.copy()
+            pd_period["std_pd_pct"] = pd.to_numeric(pd_period["std_pd"], errors="coerce") * 100
+            g = sns.relplot(
+                data=pd_period.sort_values(["period", "maturity"]),
+                x="period",
+                y="std_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Period", "PD Std Dev (%)")
+            for ax in g.axes.flat:
+                ax.tick_params(axis="x", rotation=20)
+            g.fig.suptitle("PD Std Dev by Period (From Output Tables)", y=1.04)
+            g.savefig(figures_dir / "line_std_pd_by_period_from_outputs.png", dpi=220)
+            plt.close("all")
+
     pd_lev_path = tables_dir / "pd_by_leverage.csv"
     if pd_lev_path.exists():
         pd_lev = pd.read_csv(pd_lev_path)
@@ -1277,6 +1361,46 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
             g.set_axis_labels("Leverage Group", "Mean PD (%)")
             g.fig.suptitle("Mean PD by Leverage Group (From Output Tables)", y=1.03)
             g.savefig(figures_dir / "line_mean_pd_by_leverage_from_outputs.png", dpi=220)
+            plt.close("all")
+
+            g = sns.relplot(
+                data=pd_lev.sort_values(["leverage_group", "maturity"]),
+                x="leverage_group",
+                y="median_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Leverage Group", "Median PD (%)")
+            g.fig.suptitle("Median PD by Leverage Group (From Output Tables)", y=1.03)
+            g.savefig(figures_dir / "line_median_pd_by_leverage_from_outputs.png", dpi=220)
+            plt.close("all")
+
+            pd_lev = pd_lev.copy()
+            pd_lev["std_pd_pct"] = pd.to_numeric(pd_lev["std_pd"], errors="coerce") * 100
+            g = sns.relplot(
+                data=pd_lev.sort_values(["leverage_group", "maturity"]),
+                x="leverage_group",
+                y="std_pd_pct",
+                hue="model_label",
+                hue_order=MODEL_LABEL_ORDER,
+                palette=MODEL_COLORS,
+                col="maturity",
+                kind="line",
+                marker="o",
+                facet_kws={"sharey": False},
+                height=4,
+                aspect=1.1,
+            )
+            g.set_axis_labels("Leverage Group", "PD Std Dev (%)")
+            g.fig.suptitle("PD Std Dev by Leverage Group (From Output Tables)", y=1.03)
+            g.savefig(figures_dir / "line_std_pd_by_leverage_from_outputs.png", dpi=220)
             plt.close("all")
 
 def run_model_performance_paper(
