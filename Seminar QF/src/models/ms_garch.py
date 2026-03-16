@@ -905,7 +905,7 @@ class MSGARCHOptimized:
 
 
 
-def run_ms_garch_estimation_optimized(data_df,
+def run_ms_garch_estimation(data_df,
                                       gvkey_selected=None,
                                       return_column='asset_return_daily',
                                       gvkey_column='gvkey',
@@ -1153,4 +1153,4 @@ def run_ms_garch_estimation_optimized(data_df,
 
 # Aliases for backward compatibility
 MSGARCH = MSGARCHOptimized
-run_ms_garch_estimation = run_ms_garch_estimation_optimized
+run_ms_garch_estimation = run_ms_garch_estimation

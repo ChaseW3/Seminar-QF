@@ -270,11 +270,9 @@ def _load_model_pd_long(model_key: str, spec: dict, pd_data_dir: Path) -> pd.Dat
 
 # Build the unified panel: merge all model spreads with market CDS data
 def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
-    print("Loading market CDS data...")
     cds_market = load_all_market_cds_data(cfg.input_dir)
     market_long = _to_long_market(cds_market)
 
-    print("Loading company and leverage mapping...")
     mapping_file = cfg.tables_dir / "merged_data_with_merton.csv"
     if not mapping_file.exists():
         legacy_mapping_file = cfg.tables_dir.parent / "merged_data_with_merton.csv"
@@ -287,7 +285,6 @@ def build_panel(cfg: AnalysisConfig) -> pd.DataFrame:
 
     panel_parts = []
     for model_key, spec in MODEL_SPECS.items():
-        print(f"  - Loading {spec['label']}...")
         model_long = _load_model_long(model_key, spec, cfg.calibration_dir)
         model_pd_long = _load_model_pd_long(model_key, spec, cfg.pd_data_dir)
         if not model_pd_long.empty:
@@ -1664,10 +1661,6 @@ def run_model_performance_paper(
     out_tables_dir.mkdir(parents=True, exist_ok=True)
     out_figures_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 90)
-    print("PAPER MODEL COMPARISON ANALYSIS")
-    print("=" * 90)
-
     panel = build_panel(cfg)
     panel = add_period_and_volatility_regimes(panel, cfg)
     panel = add_change_series(panel)
@@ -1681,7 +1674,7 @@ def run_model_performance_paper(
             f"leverage_group={filter_meta['selected_leverage_group']}."
         )
 
-    print(f"Unified panel observations: {len(panel):,}")
+    print(f"Panel observations: {len(panel):,}")
     print(
         "Active filters: "
         f"maturity={filter_meta['selected_maturity']}; "
@@ -1691,7 +1684,6 @@ def run_model_performance_paper(
     panel.to_csv(out_tables_dir / "model_comparison_panel.csv", index=False)
     pd.DataFrame([filter_meta]).to_csv(out_tables_dir / "filter_metadata.csv", index=False)
 
-    print("Computing performance tables...")
     overall_perf = compute_performance_summary(panel, ["maturity"], min_obs=cfg.min_obs_segment)
     leverage_perf = compute_performance_summary(panel, ["leverage_group", "maturity"], min_obs=cfg.min_obs_segment)
     year_perf = compute_performance_summary(panel, ["year", "maturity"], min_obs=cfg.min_obs_segment)
@@ -1700,7 +1692,6 @@ def run_model_performance_paper(
     period_vol_perf = compute_performance_summary(panel, ["period", "vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
     firm_perf = compute_performance_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=cfg.min_obs_firm)
 
-    print("Computing PD summary tables...")
     pd_overall = compute_pd_summary(panel, ["maturity"], min_obs=cfg.min_obs_segment)
     pd_leverage = compute_pd_summary(panel, ["leverage_group", "maturity"], min_obs=cfg.min_obs_segment)
     pd_year = compute_pd_summary(panel, ["year", "maturity"], min_obs=cfg.min_obs_segment)
@@ -1738,7 +1729,6 @@ def run_model_performance_paper(
         "by_company": (firm_perf, ["gvkey", "company", "maturity", "leverage_group"]),
     }
 
-    print("Computing metric ranking tables (rank 1-4)...")
     rank_tables, rank_share_tables = compute_segment_rank_tables(perf_tables)
     for name, df in rank_tables.items():
         df.to_csv(out_tables_dir / f"{name}.csv", index=False)
@@ -1752,7 +1742,6 @@ def run_model_performance_paper(
         manifest_rows.append({"table_type": "rank_share", "name": name, "rows": int(len(df)), "file": f"{name}.csv"})
     pd.DataFrame(manifest_rows).to_csv(out_tables_dir / "rank_tables_manifest.csv", index=False)
 
-    print("Computing best-model dominance tables...")
     best_tables = compute_best_model_tables(panel)
     for name, df in best_tables.items():
         df.to_csv(out_tables_dir / f"{name}.csv", index=False)
@@ -1760,7 +1749,6 @@ def run_model_performance_paper(
     msgarch_best = compute_msgarch_best_segments(best_tables)
     msgarch_best.to_csv(out_tables_dir / "msgarch_best_segments.csv", index=False)
 
-    print("Running pairwise forecast and correlation tests...")
     cw_overall, hw_overall = run_pairwise_tests(panel, group_cols=[])
     cw_lev, hw_lev = run_pairwise_tests(panel, group_cols=["leverage_group"])
     cw_year, hw_year = run_pairwise_tests(panel, group_cols=["year"])
@@ -1782,7 +1770,6 @@ def run_model_performance_paper(
     hw_vol.to_csv(out_tables_dir / "hw_tests_by_volatility.csv", index=False)
     hw_period_vol.to_csv(out_tables_dir / "hw_tests_by_period_volatility.csv", index=False)
 
-    print("Running Pearson correlation significance tests...")
     pc_overall = run_pearson_tests(panel, group_cols=[])
     pc_lev = run_pearson_tests(panel, group_cols=["leverage_group"])
     pc_year = run_pearson_tests(panel, group_cols=["year"])
@@ -1797,13 +1784,10 @@ def run_model_performance_paper(
     pc_vol.to_csv(out_tables_dir / "pearson_tests_by_volatility.csv", index=False)
     pc_period_vol.to_csv(out_tables_dir / "pearson_tests_by_period_volatility.csv", index=False)
 
-    print("Creating publication-quality figures...")
     create_plots(panel, best_tables, out_figures_dir, rank_share_tables=rank_share_tables)
 
-    print("Creating line diagrams from output tables...")
     create_line_diagrams_from_outputs(out_tables_dir, out_figures_dir)
 
-    print("Writing concise text summary...")
     with open(out_tables_dir / "analysis_summary.txt", "w", encoding="utf-8") as f:
         f.write("Model Performance Comparison Summary\n")
         f.write("=" * 44 + "\n\n")
@@ -1911,9 +1895,6 @@ def run_model_performance_paper(
         "figures": out_figures_dir,
     }
 
-    print("Analysis complete.")
-    print(f"Table outputs saved in: {out_tables_dir}")
-    print(f"Figure outputs saved in: {out_figures_dir}")
     return outputs
 
 if __name__ == "__main__":
