@@ -981,6 +981,7 @@ def create_plots(
             height=4,
             aspect=1.1,
         )
+        g.set_titles("{col_name}")
         g.set_axis_labels("Year", "RMSE (bps)")
         g.fig.suptitle("RMSE Trends by Model and Maturity", y=1.02)
         g.savefig(figures_dir / "rmse_trend_by_year.png", dpi=220)
@@ -1164,6 +1165,235 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
     period_order = ["Pre-COVID", "COVID Shock", "Recovery", "Post-Recovery"]
     leverage_order = ["Low Leverage", "Mid Leverage", "High Leverage"]
 
+    def _plot_mean_with_std(
+        df: pd.DataFrame,
+        x_col: str,
+        mean_col: str,
+        std_col: str,
+        title: str,
+        y_label: str,
+        file_name: str,
+        x_order: list[str] | None = None,
+        rotate_xticks: bool = False,
+        y_min: float | None = None,
+        y_max: float | None = None,
+    ) -> None:
+        mats = [m for m in ["1y", "3y", "5y"] if m in set(df["maturity"].astype(str).unique())]
+        if not mats:
+            return
+
+        fig, axes = plt.subplots(1, len(mats), figsize=(4.6 * len(mats), 4), sharey=False)
+        if len(mats) == 1:
+            axes = [axes]
+
+        for ax, mat in zip(axes, mats):
+            sub = df[df["maturity"].astype(str) == mat].copy()
+            if sub.empty:
+                continue
+
+            for model_label in MODEL_LABEL_ORDER:
+                mdl = sub[sub["model_label"] == model_label].copy()
+                if mdl.empty:
+                    continue
+
+                y = pd.to_numeric(mdl[mean_col], errors="coerce").to_numpy()
+                sd = pd.to_numeric(mdl[std_col], errors="coerce").fillna(0).to_numpy()
+                color = MODEL_COLORS.get(model_label)
+
+                if x_order is None:
+                    mdl = mdl.sort_values(x_col)
+                    x = pd.to_numeric(mdl[x_col], errors="coerce").to_numpy()
+                    y = pd.to_numeric(mdl[mean_col], errors="coerce").to_numpy()
+                    sd = pd.to_numeric(mdl[std_col], errors="coerce").fillna(0).to_numpy()
+                    lower = y - sd
+                    upper = y + sd
+                    if y_min is not None:
+                        lower = np.maximum(lower, y_min)
+                    if y_max is not None:
+                        upper = np.minimum(upper, y_max)
+                    ax.plot(x, y, marker="o", linewidth=2, label=model_label, color=color)
+                    ax.fill_between(x, lower, upper, color=color, alpha=0.15)
+                else:
+                    order_map = {name: i for i, name in enumerate(x_order)}
+                    mdl[x_col] = mdl[x_col].astype(str)
+                    mdl = mdl[mdl[x_col].isin(order_map)].copy()
+                    if mdl.empty:
+                        continue
+                    mdl["x_idx"] = mdl[x_col].map(order_map)
+                    mdl = mdl.sort_values("x_idx")
+                    x = mdl["x_idx"].to_numpy()
+                    y = pd.to_numeric(mdl[mean_col], errors="coerce").to_numpy()
+                    sd = pd.to_numeric(mdl[std_col], errors="coerce").fillna(0).to_numpy()
+                    lower = y - sd
+                    upper = y + sd
+                    if y_min is not None:
+                        lower = np.maximum(lower, y_min)
+                    if y_max is not None:
+                        upper = np.minimum(upper, y_max)
+                    yerr = np.vstack((y - lower, upper - y))
+                    ax.errorbar(x, y, yerr=yerr, marker="o", linewidth=2, capsize=3, label=model_label, color=color)
+                    ax.set_xticks(range(len(x_order)))
+                    ax.set_xticklabels(x_order, rotation=20 if rotate_xticks else 0)
+
+            ax.set_title(mat)
+            ax.set_xlabel(x_col.replace("_", " ").title())
+            ax.grid(True, axis="y", alpha=0.25)
+
+        axes[0].set_ylabel(y_label)
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.02),
+                ncol=4,
+                frameon=False,
+            )
+        fig.suptitle(title, y=0.98)
+        fig.tight_layout(rect=[0, 0.06, 1, 0.93])
+        fig.savefig(figures_dir / file_name, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+    def _plot_combo_relplot(
+        df: pd.DataFrame,
+        x_col: str,
+        y_col: str,
+        title: str,
+        y_label: str,
+        file_name: str,
+        row_col: str,
+        x_order: list[str] | None = None,
+        rotate_xticks: bool = False,
+    ) -> None:
+        plot_df = df.copy()
+        if x_order is not None:
+            plot_df[x_col] = pd.Categorical(plot_df[x_col], categories=x_order, ordered=True)
+            plot_df = plot_df.sort_values([row_col, x_col, "maturity"])
+
+        g = sns.relplot(
+            data=plot_df,
+            x=x_col,
+            y=y_col,
+            hue="model_label",
+            hue_order=MODEL_LABEL_ORDER,
+            palette=MODEL_COLORS,
+            col="maturity",
+            row=row_col,
+            kind="line",
+            marker="o",
+            facet_kws={"sharey": False, "margin_titles": True},
+            height=3.4,
+            aspect=1.2,
+        )
+        g.set_titles(col_template="{col_name}", row_template="{row_name}")
+        g.set_axis_labels(x_col.replace("_", " ").title(), y_label)
+        if rotate_xticks:
+            for ax in g.axes.flat:
+                ax.tick_params(axis="x", rotation=20)
+        g.fig.subplots_adjust(top=0.93, bottom=0.08)
+        g.fig.suptitle(title, y=0.98)
+        g.savefig(figures_dir / file_name, dpi=220, bbox_inches="tight")
+        plt.close("all")
+
+    def _plot_combo_mean_with_std(
+        df: pd.DataFrame,
+        x_col: str,
+        mean_col: str,
+        std_col: str,
+        title: str,
+        y_label: str,
+        file_name: str,
+        row_col: str,
+        x_order: list[str] | None = None,
+        rotate_xticks: bool = False,
+        y_min: float | None = None,
+        y_max: float | None = None,
+    ) -> None:
+        row_values = [str(v) for v in df[row_col].dropna().unique()]
+        if row_col == "leverage_group":
+            row_values = [v for v in leverage_order if v in set(row_values)]
+        mats = [m for m in ["1y", "3y", "5y"] if m in set(df["maturity"].astype(str).unique())]
+        if not row_values or not mats:
+            return
+
+        fig, axes = plt.subplots(
+            len(row_values),
+            len(mats),
+            figsize=(4.8 * len(mats), 3.4 * len(row_values)),
+            sharey=False,
+            squeeze=False,
+        )
+
+        for row_idx, row_value in enumerate(row_values):
+            for col_idx, mat in enumerate(mats):
+                ax = axes[row_idx][col_idx]
+                sub = df[(df[row_col].astype(str) == row_value) & (df["maturity"].astype(str) == mat)].copy()
+                if sub.empty:
+                    ax.set_visible(False)
+                    continue
+
+                for model_label in MODEL_LABEL_ORDER:
+                    mdl = sub[sub["model_label"] == model_label].copy()
+                    if mdl.empty:
+                        continue
+                    color = MODEL_COLORS.get(model_label)
+
+                    if x_order is None:
+                        mdl = mdl.sort_values(x_col)
+                        x = pd.to_numeric(mdl[x_col], errors="coerce").to_numpy()
+                    else:
+                        order_map = {name: i for i, name in enumerate(x_order)}
+                        mdl[x_col] = mdl[x_col].astype(str)
+                        mdl = mdl[mdl[x_col].isin(order_map)].copy()
+                        if mdl.empty:
+                            continue
+                        mdl["x_idx"] = mdl[x_col].map(order_map)
+                        mdl = mdl.sort_values("x_idx")
+                        x = mdl["x_idx"].to_numpy()
+
+                    y = pd.to_numeric(mdl[mean_col], errors="coerce").to_numpy()
+                    sd = pd.to_numeric(mdl[std_col], errors="coerce").fillna(0).to_numpy()
+                    lower = y - sd
+                    upper = y + sd
+                    if y_min is not None:
+                        lower = np.maximum(lower, y_min)
+                    if y_max is not None:
+                        upper = np.minimum(upper, y_max)
+
+                    if x_order is None:
+                        ax.plot(x, y, marker="o", linewidth=2, label=model_label, color=color)
+                        ax.fill_between(x, lower, upper, color=color, alpha=0.15)
+                    else:
+                        yerr = np.vstack((y - lower, upper - y))
+                        ax.errorbar(x, y, yerr=yerr, marker="o", linewidth=2, capsize=3, label=model_label, color=color)
+                        ax.set_xticks(range(len(x_order)))
+                        ax.set_xticklabels(x_order, rotation=20 if rotate_xticks else 0)
+
+                if row_idx == 0:
+                    ax.set_title(mat)
+                if col_idx == 0:
+                    ax.set_ylabel(f"{row_value}\n{y_label}")
+                else:
+                    ax.set_ylabel("")
+                ax.set_xlabel(x_col.replace("_", " ").title())
+                ax.grid(True, axis="y", alpha=0.25)
+
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        if handles:
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.01),
+                ncol=4,
+                frameon=False,
+            )
+        fig.suptitle(title, y=0.98)
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+        fig.savefig(figures_dir / file_name, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
     perf_year_path = tables_dir / "performance_by_year.csv"
     if perf_year_path.exists():
         perf_year = pd.read_csv(perf_year_path)
@@ -1182,8 +1412,9 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
                 height=4,
                 aspect=1.1,
             )
+            g.set_titles("{col_name}")
             g.set_axis_labels("Year", "RMSE (bps)")
-            g.fig.suptitle("RMSE by Year (From Output Tables)", y=1.02)
+            g.fig.suptitle("RMSE by Year", y=1.02)
             g.savefig(figures_dir / "line_rmse_by_year_from_outputs.png", dpi=220)
             plt.close("all")
 
@@ -1201,8 +1432,9 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
                 height=4,
                 aspect=1.1,
             )
+            g.set_titles("{col_name}")
             g.set_axis_labels("Year", "Correlation (Levels)")
-            g.fig.suptitle("Correlation (Levels) by Year (From Output Tables)", y=1.02)
+            g.fig.suptitle("Correlation (Levels) by Year", y=1.02)
             g.savefig(figures_dir / "line_corr_levels_by_year_from_outputs.png", dpi=220)
             plt.close("all")
 
@@ -1210,24 +1442,19 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
     if pd_year_path.exists():
         pd_year = pd.read_csv(pd_year_path)
         if not pd_year.empty:
-            g = sns.relplot(
-                data=pd_year,
-                x="year",
-                y="mean_pd_pct",
-                hue="model_label",
-                hue_order=MODEL_LABEL_ORDER,
-                palette=MODEL_COLORS,
-                col="maturity",
-                kind="line",
-                marker="o",
-                facet_kws={"sharey": False},
-                height=4,
-                aspect=1.1,
+            pd_year = pd_year.copy()
+            pd_year["std_pd_pct"] = pd.to_numeric(pd_year["std_pd"], errors="coerce") * 100
+            _plot_mean_with_std(
+                df=pd_year,
+                x_col="year",
+                mean_col="mean_pd_pct",
+                std_col="std_pd_pct",
+                title="Mean PD by Year with +/-1 Std Dev",
+                y_label="Mean PD (%)",
+                file_name="line_mean_pd_by_year_from_outputs.png",
+                y_min=0,
+                y_max=100,
             )
-            g.set_axis_labels("Year", "Mean PD (%)")
-            g.fig.suptitle("Mean PD by Year (From Output Tables)", y=1.02)
-            g.savefig(figures_dir / "line_mean_pd_by_year_from_outputs.png", dpi=220)
-            plt.close("all")
 
             g = sns.relplot(
                 data=pd_year,
@@ -1243,30 +1470,10 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
                 height=4,
                 aspect=1.1,
             )
+            g.set_titles("{col_name}")
             g.set_axis_labels("Year", "Median PD (%)")
-            g.fig.suptitle("Median PD by Year (From Output Tables)", y=1.02)
+            g.fig.suptitle("Median PD by Year", y=1.02)
             g.savefig(figures_dir / "line_median_pd_by_year_from_outputs.png", dpi=220)
-            plt.close("all")
-
-            pd_year = pd_year.copy()
-            pd_year["std_pd_pct"] = pd.to_numeric(pd_year["std_pd"], errors="coerce") * 100
-            g = sns.relplot(
-                data=pd_year,
-                x="year",
-                y="std_pd_pct",
-                hue="model_label",
-                hue_order=MODEL_LABEL_ORDER,
-                palette=MODEL_COLORS,
-                col="maturity",
-                kind="line",
-                marker="o",
-                facet_kws={"sharey": False},
-                height=4,
-                aspect=1.1,
-            )
-            g.set_axis_labels("Year", "PD Std Dev (%)")
-            g.fig.suptitle("PD Std Dev by Year (From Output Tables)", y=1.02)
-            g.savefig(figures_dir / "line_std_pd_by_year_from_outputs.png", dpi=220)
             plt.close("all")
 
     pd_period_path = tables_dir / "pd_by_period.csv"
@@ -1274,26 +1481,21 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
         pd_period = pd.read_csv(pd_period_path)
         if not pd_period.empty:
             pd_period["period"] = pd.Categorical(pd_period["period"], categories=period_order, ordered=True)
-            g = sns.relplot(
-                data=pd_period.sort_values(["period", "maturity"]),
-                x="period",
-                y="mean_pd_pct",
-                hue="model_label",
-                hue_order=MODEL_LABEL_ORDER,
-                palette=MODEL_COLORS,
-                col="maturity",
-                kind="line",
-                marker="o",
-                facet_kws={"sharey": False},
-                height=4,
-                aspect=1.1,
+            pd_period = pd_period.copy()
+            pd_period["std_pd_pct"] = pd.to_numeric(pd_period["std_pd"], errors="coerce") * 100
+            _plot_mean_with_std(
+                df=pd_period,
+                x_col="period",
+                mean_col="mean_pd_pct",
+                std_col="std_pd_pct",
+                title="Mean PD by Period with +/-1 Std Dev",
+                y_label="Mean PD (%)",
+                file_name="line_mean_pd_by_period_from_outputs.png",
+                x_order=period_order,
+                rotate_xticks=True,
+                y_min=0,
+                y_max=100,
             )
-            g.set_axis_labels("Period", "Mean PD (%)")
-            for ax in g.axes.flat:
-                ax.tick_params(axis="x", rotation=20)
-            g.fig.suptitle("Mean PD by Period (From Output Tables)", y=1.04)
-            g.savefig(figures_dir / "line_mean_pd_by_period_from_outputs.png", dpi=220)
-            plt.close("all")
 
             g = sns.relplot(
                 data=pd_period.sort_values(["period", "maturity"]),
@@ -1309,34 +1511,12 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
                 height=4,
                 aspect=1.1,
             )
+            g.set_titles("{col_name}")
             g.set_axis_labels("Period", "Median PD (%)")
             for ax in g.axes.flat:
                 ax.tick_params(axis="x", rotation=20)
-            g.fig.suptitle("Median PD by Period (From Output Tables)", y=1.04)
+            g.fig.suptitle("Median PD by Period", y=1.04)
             g.savefig(figures_dir / "line_median_pd_by_period_from_outputs.png", dpi=220)
-            plt.close("all")
-
-            pd_period = pd_period.copy()
-            pd_period["std_pd_pct"] = pd.to_numeric(pd_period["std_pd"], errors="coerce") * 100
-            g = sns.relplot(
-                data=pd_period.sort_values(["period", "maturity"]),
-                x="period",
-                y="std_pd_pct",
-                hue="model_label",
-                hue_order=MODEL_LABEL_ORDER,
-                palette=MODEL_COLORS,
-                col="maturity",
-                kind="line",
-                marker="o",
-                facet_kws={"sharey": False},
-                height=4,
-                aspect=1.1,
-            )
-            g.set_axis_labels("Period", "PD Std Dev (%)")
-            for ax in g.axes.flat:
-                ax.tick_params(axis="x", rotation=20)
-            g.fig.suptitle("PD Std Dev by Period (From Output Tables)", y=1.04)
-            g.savefig(figures_dir / "line_std_pd_by_period_from_outputs.png", dpi=220)
             plt.close("all")
 
     pd_lev_path = tables_dir / "pd_by_leverage.csv"
@@ -1344,24 +1524,20 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
         pd_lev = pd.read_csv(pd_lev_path)
         if not pd_lev.empty:
             pd_lev["leverage_group"] = pd.Categorical(pd_lev["leverage_group"], categories=leverage_order, ordered=True)
-            g = sns.relplot(
-                data=pd_lev.sort_values(["leverage_group", "maturity"]),
-                x="leverage_group",
-                y="mean_pd_pct",
-                hue="model_label",
-                hue_order=MODEL_LABEL_ORDER,
-                palette=MODEL_COLORS,
-                col="maturity",
-                kind="line",
-                marker="o",
-                facet_kws={"sharey": False},
-                height=4,
-                aspect=1.1,
+            pd_lev = pd_lev.copy()
+            pd_lev["std_pd_pct"] = pd.to_numeric(pd_lev["std_pd"], errors="coerce") * 100
+            _plot_mean_with_std(
+                df=pd_lev,
+                x_col="leverage_group",
+                mean_col="mean_pd_pct",
+                std_col="std_pd_pct",
+                title="Mean PD by Leverage with +/-1 Std Dev",
+                y_label="Mean PD (%)",
+                file_name="line_mean_pd_by_leverage_from_outputs.png",
+                x_order=leverage_order,
+                y_min=0,
+                y_max=100,
             )
-            g.set_axis_labels("Leverage Group", "Mean PD (%)")
-            g.fig.suptitle("Mean PD by Leverage Group (From Output Tables)", y=1.03)
-            g.savefig(figures_dir / "line_mean_pd_by_leverage_from_outputs.png", dpi=220)
-            plt.close("all")
 
             g = sns.relplot(
                 data=pd_lev.sort_values(["leverage_group", "maturity"]),
@@ -1377,31 +1553,80 @@ def create_line_diagrams_from_outputs(tables_dir: Path, figures_dir: Path) -> No
                 height=4,
                 aspect=1.1,
             )
+            g.set_titles("{col_name}")
             g.set_axis_labels("Leverage Group", "Median PD (%)")
-            g.fig.suptitle("Median PD by Leverage Group (From Output Tables)", y=1.03)
+            g.fig.suptitle("Median PD by Leverage Group", y=1.03)
             g.savefig(figures_dir / "line_median_pd_by_leverage_from_outputs.png", dpi=220)
             plt.close("all")
 
-            pd_lev = pd_lev.copy()
-            pd_lev["std_pd_pct"] = pd.to_numeric(pd_lev["std_pd"], errors="coerce") * 100
-            g = sns.relplot(
-                data=pd_lev.sort_values(["leverage_group", "maturity"]),
-                x="leverage_group",
-                y="std_pd_pct",
-                hue="model_label",
-                hue_order=MODEL_LABEL_ORDER,
-                palette=MODEL_COLORS,
-                col="maturity",
-                kind="line",
-                marker="o",
-                facet_kws={"sharey": False},
-                height=4,
-                aspect=1.1,
+    pd_year_lev_path = tables_dir / "pd_by_year_leverage.csv"
+    if pd_year_lev_path.exists():
+        pd_year_lev = pd.read_csv(pd_year_lev_path)
+        if not pd_year_lev.empty:
+            pd_year_lev["leverage_group"] = pd.Categorical(
+                pd_year_lev["leverage_group"], categories=leverage_order, ordered=True
             )
-            g.set_axis_labels("Leverage Group", "PD Std Dev (%)")
-            g.fig.suptitle("PD Std Dev by Leverage Group (From Output Tables)", y=1.03)
-            g.savefig(figures_dir / "line_std_pd_by_leverage_from_outputs.png", dpi=220)
-            plt.close("all")
+            pd_year_lev = pd_year_lev.copy()
+            pd_year_lev["std_pd_pct"] = pd.to_numeric(pd_year_lev["std_pd"], errors="coerce") * 100
+            _plot_combo_mean_with_std(
+                df=pd_year_lev,
+                x_col="year",
+                mean_col="mean_pd_pct",
+                std_col="std_pd_pct",
+                title="Mean PD by Year and Leverage Group with +/-1 Std Dev",
+                y_label="Mean PD (%)",
+                file_name="line_mean_pd_by_year_leverage_from_outputs.png",
+                row_col="leverage_group",
+                y_min=0,
+                y_max=100,
+            )
+            _plot_combo_relplot(
+                df=pd_year_lev,
+                x_col="year",
+                y_col="median_pd_pct",
+                title="Median PD by Year and Leverage Group",
+                y_label="Median PD (%)",
+                file_name="line_median_pd_by_year_leverage_from_outputs.png",
+                row_col="leverage_group",
+            )
+
+    pd_period_lev_path = tables_dir / "pd_by_period_leverage.csv"
+    if pd_period_lev_path.exists():
+        pd_period_lev = pd.read_csv(pd_period_lev_path)
+        if not pd_period_lev.empty:
+            pd_period_lev["leverage_group"] = pd.Categorical(
+                pd_period_lev["leverage_group"], categories=leverage_order, ordered=True
+            )
+            pd_period_lev["period"] = pd.Categorical(
+                pd_period_lev["period"], categories=period_order, ordered=True
+            )
+            pd_period_lev = pd_period_lev.copy()
+            pd_period_lev["std_pd_pct"] = pd.to_numeric(pd_period_lev["std_pd"], errors="coerce") * 100
+            _plot_combo_mean_with_std(
+                df=pd_period_lev,
+                x_col="period",
+                mean_col="mean_pd_pct",
+                std_col="std_pd_pct",
+                title="Mean PD by Period and Leverage Group with +/-1 Std Dev",
+                y_label="Mean PD (%)",
+                file_name="line_mean_pd_by_period_leverage_from_outputs.png",
+                row_col="leverage_group",
+                x_order=period_order,
+                rotate_xticks=True,
+                y_min=0,
+                y_max=100,
+            )
+            _plot_combo_relplot(
+                df=pd_period_lev,
+                x_col="period",
+                y_col="median_pd_pct",
+                title="Median PD by Period and Leverage Group",
+                y_label="Median PD (%)",
+                file_name="line_median_pd_by_period_leverage_from_outputs.png",
+                row_col="leverage_group",
+                x_order=period_order,
+                rotate_xticks=True,
+            )
 
 def run_model_performance_paper(
     output_dir: Path | None = None,
@@ -1479,7 +1704,9 @@ def run_model_performance_paper(
     pd_overall = compute_pd_summary(panel, ["maturity"], min_obs=cfg.min_obs_segment)
     pd_leverage = compute_pd_summary(panel, ["leverage_group", "maturity"], min_obs=cfg.min_obs_segment)
     pd_year = compute_pd_summary(panel, ["year", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_year_leverage = compute_pd_summary(panel, ["year", "leverage_group", "maturity"], min_obs=cfg.min_obs_segment)
     pd_period = compute_pd_summary(panel, ["period", "maturity"], min_obs=cfg.min_obs_segment)
+    pd_period_leverage = compute_pd_summary(panel, ["period", "leverage_group", "maturity"], min_obs=cfg.min_obs_segment)
     pd_volatility = compute_pd_summary(panel, ["vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
     pd_period_vol = compute_pd_summary(panel, ["period", "vol_regime", "maturity"], min_obs=cfg.min_obs_segment)
     pd_firm = compute_pd_summary(panel, ["gvkey", "company", "maturity", "leverage_group"], min_obs=cfg.min_obs_firm)
@@ -1494,7 +1721,9 @@ def run_model_performance_paper(
     pd_overall.to_csv(out_tables_dir / "pd_overall.csv", index=False)
     pd_leverage.to_csv(out_tables_dir / "pd_by_leverage.csv", index=False)
     pd_year.to_csv(out_tables_dir / "pd_by_year.csv", index=False)
+    pd_year_leverage.to_csv(out_tables_dir / "pd_by_year_leverage.csv", index=False)
     pd_period.to_csv(out_tables_dir / "pd_by_period.csv", index=False)
+    pd_period_leverage.to_csv(out_tables_dir / "pd_by_period_leverage.csv", index=False)
     pd_volatility.to_csv(out_tables_dir / "pd_by_volatility.csv", index=False)
     pd_period_vol.to_csv(out_tables_dir / "pd_by_period_volatility.csv", index=False)
     pd_firm.to_csv(out_tables_dir / "pd_by_company.csv", index=False)
@@ -1663,7 +1892,9 @@ def run_model_performance_paper(
         "pd_overall": out_tables_dir / "pd_overall.csv",
         "pd_leverage": out_tables_dir / "pd_by_leverage.csv",
         "pd_year": out_tables_dir / "pd_by_year.csv",
+        "pd_year_leverage": out_tables_dir / "pd_by_year_leverage.csv",
         "pd_period": out_tables_dir / "pd_by_period.csv",
+        "pd_period_leverage": out_tables_dir / "pd_by_period_leverage.csv",
         "pd_volatility": out_tables_dir / "pd_by_volatility.csv",
         "pd_period_volatility": out_tables_dir / "pd_by_period_volatility.csv",
         "pd_firm": out_tables_dir / "pd_by_company.csv",
